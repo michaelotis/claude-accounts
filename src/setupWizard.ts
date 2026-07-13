@@ -381,6 +381,10 @@ export class SetupWizard {
       ...dirsHoldingToken(email),
       ...allWorkingDirs().filter((d) => readIdentity(d)?.email === email),
     ];
+    // Kill any live session on these dirs before deleting the token: on a
+    // graceful shutdown Claude Code flushes its in-memory token back to disk,
+    // which would resurrect the credential we are signing out.
+    interruptSessions(dirs);
     for (const d of dirs) signOut(d);
     vscode.window.showInformationMessage(
       `Claude Accounts: you signed out of ${email}, so it was removed from the list — a logout ` +
