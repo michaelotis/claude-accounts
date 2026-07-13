@@ -1,5 +1,4 @@
 import * as path from 'path';
-import * as os from 'os';
 
 /**
  * Config-dir names / paths that must never be treated as multi-login accounts
