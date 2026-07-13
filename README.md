@@ -1,38 +1,71 @@
 # Claude Accounts + Usage
 
-Multi-account **Claude Code** for **Linux / WSL / Remote-SSH**, with live usage (5h / 7d / **Fable**) and optional **CLI failover** via a PATH orchestrator.
+Multi-account **Claude Code** for **Linux / WSL / Remote-SSH**, with live usage (5h / 7d / **Fable**), **per-window isolation**, **workspace → account auto-select**, and optional **CLI / panel failover**.
 
-## Why
+## What this is for
+
+| Need | How this helps |
+|------|----------------|
+| **Two Claude accounts at once** | Work in one VS Code window, personal in another — each host has its own `CLAUDE_CONFIG_DIR` and working copy of credentials |
+| **Open a folder → right account** | `workspaceRoutes` (or Switch Account once) pins a tree to an email; auto-select prefers that over “last used anywhere” |
+| **See usage live** | Status bar: 5h session, 7d all-models, Fable (and other model-scoped limits) |
+| **Failover when an account is hot** | Notify, CLI PATH orchestrator for **new** `claude` processes, and optional **post-turn** panel cutover (never mid-stream) |
+| **Keep one conversation history** | Shared history store so installing multi-account does not fragment or hide your past chats |
+
+Upstream credit: [Parallel Accounts](https://github.com/DercasDrol/claude-parallel-profiles) + usage patterns from [Claudemeter](https://github.com/hyperi-io/claudemeter) (both MIT). See `NOTICE`.
+
+## What this is **not** for
+
+| Not a goal | Why |
+|------------|-----|
+| **Context consolidation across accounts** | Each account is a separate Anthropic identity and billing subject. This extension does **not** merge chat context, memory, or “continue this thread” across work vs personal. History is **shared as files** so you do not *lose* conversations when switching windows — it is not a single Claude brain. |
+| **One panel, hot-swap accounts mid-turn** | Claude Code reads `CLAUDE_CONFIG_DIR` at startup. Changing account reloads the window (or only affects **new** CLI processes via the orch). Mid-stream agent turns are never interrupted by failover. |
+| **macOS / native Windows Claude** | Linux semantics only (files, `/proc`, symlinks). Use a **WSL or Linux remote** window. The extension stays inert on unsupported hosts. |
+| **Replacing Parallel Accounts’ dual-window UX on Windows UI host** | We are `extensionKind: workspace` on purpose (Claudemeter-style UI-host bugs under WSL). Install in the remote/WSL side. |
+| **OAuth token refresh / Anthropic API proxy** | Claude Code owns login and rotation. We copy credential files into per-window dirs; we do not mint or refresh tokens. |
+| **Project memory / CLAUDE.md / skills management** | Unrelated. Use Claude Code and your own repo docs. |
+| **Hiding usage from Anthropic** | The meter reads the same usage the product already exposes; failover only picks which **saved account** runs next work. |
+
+If you need “one continuous agent with more quota,” the supported model is: **finish the turn → cut over or open another window on a cool account** — not transparent context merge.
+
+## Why (vs other tools)
 
 | Tool | Problem |
 |------|---------|
 | Parallel Accounts | Multi-account OK; no usage |
 | Claudemeter | Usage OK; `extensionKind: ui` runs on **Windows** host under WSL remote → wrong binary, re-login thrash |
-| This extension | **workspace** only + usage + policy for CLI failover |
+| This extension | **workspace** only + usage + workspace pins + policy for CLI/panel failover |
 
-Upstream credit: [Parallel Accounts](https://github.com/DercasDrol/claude-parallel-profiles) + usage patterns from [Claudemeter](https://github.com/hyperi-io/claudemeter) (both MIT). See `NOTICE`.
+## Install / update (VSIX from GitHub)
 
-## Install extension (VSIX)
+Not on the VS Code Marketplace yet (on purpose — dogfood via Releases first). Updates are a short CLI step, not the Extensions “Update” button.
 
-**From GitHub Releases (recommended):**
+**Latest release (recommended):**
 
 ```bash
 cd ~/projects/claude-accounts && npm run install-latest
-# then: Extensions → ⋯ → Install from VSIX → the printed path
+# downloads the newest *.vsix and runs: code --install-extension …
+# then: Command Palette → Developer: Reload Window
 ```
+
+Needs `gh` auth. Uses `code`, `code-insiders`, or `cursor` if on PATH; otherwise prints the path for **Extensions → ⋯ → Install from VSIX**.  
+Download only: `CLAUDE_ACCOUNTS_SKIP_INSTALL=1 npm run install-latest`.
 
 **From source:**
 
 ```bash
 cd ~/projects/claude-accounts
 npm install && npm run compile && npm run package
+# then install the printed .vsix the same way
 ```
 
 In a **WSL** VS Code window:
 
-1. Disable **Claudemeter** and **Claude Parallel Accounts**
-2. Extensions → ⋯ → **Install from VSIX**
+1. Disable **Claudemeter** and **Claude Parallel Accounts** (avoid fighting over accounts)
+2. `npm run install-latest` (or Install from VSIX)
 3. Reload window
+
+**Later:** once this has been stable for a while in real use, publishing to the Marketplace (or Open VSX) would give one-click auto-update. Until then, Releases + `install-latest` is the update channel.
 
 ### Pushing updates (maintainers)
 
@@ -53,9 +86,22 @@ $(account) you · 5h 4% · 7d 89% · Fable 96%
 
 ## Workspace → account (work vs personal)
 
-Hard map directory trees to an email. **Longest matching prefix wins.**
+Hard map directory trees to an email. **Longest matching prefix wins.** Emails are matched **case-insensitively**.
 
-Under a match, the CLI orchestrator **always** uses that account (no failover to the other account). VS Code also auto-binds that account when you open the folder (reloads once if needed).
+Under a match:
+
+- CLI orchestrator **always** uses that account (no cross-account failover)
+- VS Code **auto-selects** that account when you open the folder
+- Panel cutover **will not** leave the pin
+
+### Multiple VS Code windows
+
+Each window has its own extension host, so you can run **work and personal at the same time**:
+
+1. Window A → open `/home/YOU/projects/work-client` → work Claude  
+2. Window B → open `/home/YOU/projects/side-project` → personal Claude  
+
+Pin trees in settings (or **Switch Account** once in a folder so it learns):
 
 ```json
 // settings.json (WSL / remote) — use your own paths and emails
@@ -72,8 +118,19 @@ Under a match, the CLI orchestrator **always** uses that account (no failover to
 }
 ```
 
-Longer prefixes win: a specific work tree uses **work**; other repos under `projects/` use **personal**.  
-You can also **Switch Account** once in a folder — that learns a route into the policy (settings still win on the same prefix).
+Longer prefixes win: a specific work tree uses **work**; other repos under `projects/` use **personal**.
+
+**How auto-select is chosen** for the open folder:
+
+1. `workspaceRoutes` (settings) **or** learned map from a prior **Switch Account** in that tree (longest prefix; **settings win** on the same prefix)  
+2. This window’s last choice for that workspace  
+3. Global “last used anywhere” — only for a brand-new window with **no** folder mapping and no working dir yet  
+
+So a mapped work folder never inherits personal just because you used personal last in another window.
+
+**Settings pins reassert.** If `workspaceRoutes` maps this folder to work, **Switch Account → personal** reloads once for this session, but the **next** window open applies the pin again. Change or remove the settings route to stick a different default. The Switch picker warns when a settings pin is active.
+
+**Reload behavior:** if the working dir already has the pin’s credentials, activation binds without reload. If the dir is empty (e.g. after `/logout`) or the wrong account, the extension force-stocks the pin and reloads once (metered).
 
 ## Failover modes (Settings → Claude Accounts)
 
@@ -156,7 +213,7 @@ Also for integrated terminals, in VS Code `settings.json`:
 }
 ```
 
-Set **failover.mode** to **`cli`**, set primary/secondary emails, let usage refresh once (or run **Claude Accounts: Refresh Usage**). Then:
+Set **failover.mode** to **`cli`**, set account order / strategy, let usage refresh once (or run **Claude Accounts: Refresh Usage**). Then:
 
 ```bash
 # with primary hot and secondary cool:
@@ -179,6 +236,7 @@ Verbose failover logs: `CLAUDE_ORCH_VERBOSE=1`.
 - Resolves Linux `claude` only for `auth status`
 - Does **not** refresh OAuth tokens (Claude Code owns rotation)
 - **Forget** still signs out that **email** everywhere — use carefully
+- Shared history is for **not losing chats**, not for consolidating identity/context across accounts
 
 ## Dev
 

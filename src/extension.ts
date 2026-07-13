@@ -2,7 +2,12 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { AccountRegistry } from './accounts';
+import {
+  AccountRegistry,
+  hasCredentials,
+  readIdentity,
+  type Account,
+} from './accounts';
 import { WindowBinding } from './binding';
 import { StatusBarManager } from './statusBar';
 import { SetupWizard, NOTICE_KEY } from './setupWizard';
@@ -18,7 +23,13 @@ import {
   type WorkspaceRoutePolicy,
 } from './usage';
 import { isSidecarConfigDir } from './sidecars';
-import { matchWorkspaceRoute, mergeRoutes, type WorkspaceRoute } from './workspaceRoutes';
+import {
+  emailsEqual,
+  matchWorkspaceRoute,
+  mergeRoutes,
+  normalizeEmail,
+  type WorkspaceRoute,
+} from './workspaceRoutes';
 import { IdleCutoverController, type PanelCutoverMode } from './cutover';
 
 /**
@@ -85,8 +96,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const wizard = new SetupWizard(registry, binding, context);
   const usage = new UsageMonitor(180_000);
 
-  const accountByEmail = (email: string) =>
-    registry.list().find((a) => (registry.emailOf(a) || a.email) === email);
+  const accountByEmail = (email: string) => {
+    const want = normalizeEmail(email);
+    if (!want) return undefined;
+    return registry
+      .list()
+      .find((a) => normalizeEmail(registry.emailOf(a) || a.email) === want);
+  };
 
   /** Settings routes + learned folder→account map (from prior Switch Account). */
   const buildWorkspaceRoutes = (): WorkspaceRoutePolicy[] => {
@@ -261,16 +277,55 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // we capture it.
   const resolveAccount = (name: string) => registry.get(name);
 
-  // Bind this window to its remembered account FIRST and synchronously, so
-  // process.env.CLAUDE_CONFIG_DIR is set before Claude Code spawns `claude`
-  // (both extensions activate on startup — minimise the race window).
-  let bound = binding.applyStored(resolveAccount);
+  /**
+   * Account for this window's folder: settings workspaceRoutes + learned
+   * Switch-Account map (longest prefix). Multi-window: open work tree in one
+   * VS Code window and personal in another — each host binds its own account.
+   */
+  const resolveFolderPreferred = ():
+    | { account: Account; email: string; folderPath: string }
+    | { account: undefined; email: string; folderPath: string }
+    | undefined => {
+    const folderPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!folderPath) return undefined;
+    const route = matchWorkspaceRoute(folderPath, buildWorkspaceRoutes());
+    if (!route) return undefined;
+    const acc = accountByEmail(route.email);
+    if (acc) return { account: acc, email: route.email, folderPath };
+    return { account: undefined, email: route.email, folderPath };
+  };
+
+  // Bind FIRST and synchronously so process.env.CLAUDE_CONFIG_DIR is set before
+  // Claude Code spawns `claude`. Prefer the folder route over global last-used
+  // so two windows (work + personal) each start on the right account without a
+  // wrong-bind-then-reload dance.
+  const preferredAtStart = resolveFolderPreferred();
+  const preferredName = preferredAtStart?.account?.name;
+  if (preferredAtStart?.account) {
+    log(
+      `workspace auto-select: ${preferredAtStart.folderPath} → ${preferredAtStart.email} (${preferredName})`
+    );
+  } else if (preferredAtStart && !preferredAtStart.account) {
+    log(
+      `workspace route ${preferredAtStart.email} has no saved account yet — sign in as it once`
+    );
+  }
+  const appliedStart = binding.applyStored(resolveAccount, preferredName);
+  // Healthy bind only when the working dir is stocked. Preferred + unstocked is
+  // escalated after override clear (force bind + metered reload).
+  let bound =
+    appliedStart?.stocked
+      ? appliedStart.account
+      : preferredName
+        ? undefined
+        : appliedStart?.account;
 
   // ── The critical fix ───────────────────────────────────────────────────────
   // The machine-scoped `claudeCode.environmentVariables` setting is shared by
   // every window on this host; if it defines CLAUDE_CONFIG_DIR it overrides our
   // per-window process.env and forces all windows onto one account. Clear it so
-  // isolation flows through process.env instead.
+  // isolation flows through process.env instead. Do this BEFORE remember() so
+  // state I/O does not widen the window where the machine override still wins.
   const cleared = await binding.clearMachineOverride();
 
   // A short-lived earlier design kept a "shadow vault" of credential copies. The
@@ -286,35 +341,41 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     log(`could not remove the obsolete vault: ${(err as Error).message}`);
   }
 
-  // Pick up any accounts already logged in on disk, then retry binding in case
-  // the remembered account was only discovered just now.
+  // Pick up any accounts already logged in on disk, then re-resolve the folder
+  // route (discovery may have added the mapped email) and bind again if needed.
   await registry.discoverAndMerge();
-  if (!bound) bound = binding.applyStored(resolveAccount);
-
-  // Workspace path pins: if this folder is mapped to an email, bind that account
-  // (work tree → work Claude, personal tree → personal). Uses switchTo so the
-  // panel reloads onto the correct token when the route disagrees with last-used.
-  const folderPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  if (folderPath) {
-    const route = matchWorkspaceRoute(folderPath, buildWorkspaceRoutes());
-    if (route) {
-      const acc = accountByEmail(route.email);
-      if (acc) {
-        const currentEmail = bound ? registry.emailOf(bound) : undefined;
-        if (currentEmail !== route.email) {
-          log(`workspace route: ${folderPath} → ${route.email} (${acc.name})`);
-          // switchTo binds + reloads (Claude Code only reads config at startup)
-          await wizard.switchTo(acc);
-          return; // activation continues after reload
-        }
-      } else {
-        log(`workspace route ${route.email} has no saved account yet — sign in as it once`);
-        void vscode.window.showWarningMessage(
-          `Claude Accounts: this folder is mapped to ${route.email}, but that account is not saved yet. ` +
-            `Sign in with /login as that email once, then reopen the folder.`
-        );
-      }
+  const preferredAfter = resolveFolderPreferred();
+  if (preferredAfter?.account) {
+    const workDir = binding.workingDir();
+    const dirEmail =
+      hasCredentials(workDir) ? readIdentity(workDir)?.email : undefined;
+    const routeOk = emailsEqual(dirEmail, preferredAfter.email);
+    if (!routeOk) {
+      // Dir not stocked with the pin (empty after logout, late discovery, or
+      // wrong account). Force bind + reload; metered so a bug cannot loop.
+      log(
+        `workspace route reload: ${preferredAfter.folderPath} → ${preferredAfter.email} (${preferredAfter.account.name}) ` +
+          `dirEmail=${dirEmail ?? '(none)'}`
+      );
+      await wizard.switchTo(preferredAfter.account, {
+        userInitiated: false,
+        notice: `This folder is pinned to ${preferredAfter.email}.`,
+      });
+      return; // activation continues after reload
     }
+    // Dir already correct — persist folder→account without reload.
+    if (binding.getActiveName() !== preferredAfter.account.name) {
+      await binding.remember(preferredAfter.account);
+    }
+    bound = preferredAfter.account;
+  } else if (preferredAfter && !preferredAfter.account) {
+    void vscode.window.showWarningMessage(
+      `Claude Accounts: this folder is mapped to ${preferredAfter.email}, but that account is not saved yet. ` +
+        `Sign in with /login as that email once, then reopen the folder.`
+    );
+  } else if (!bound) {
+    const again = binding.applyStored(resolveAccount);
+    bound = again?.stocked ? again.account : again?.account;
   }
   applyUsageSettings();
 
@@ -454,7 +515,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // the critical activation race with Claude Code.
   await wizard.reconcile({ atActivation: true });
   // reconcile() may have just bound this window to a freshly-saved account.
-  if (!bound) bound = binding.applyStored(resolveAccount);
+  if (!bound) {
+    const after = binding.applyStored(resolveAccount);
+    bound = after?.stocked ? after.account : after?.account;
+  }
 
   // An account handoff finishes with a reload, which kills any toast raised
   // before it — so the news of what happened is delivered here instead.

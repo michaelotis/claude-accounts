@@ -1,10 +1,21 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
-import * as path from 'path';
-import { Account } from './accounts';
+import { Account, hasCredentials, readIdentity } from './accounts';
 import { materialize, windowWorkingDir } from './workdir';
 import { ensureSharedHistory } from './sharedHistory';
 import { log } from './log';
+import { emailsEqual, pickStoredAccountName } from './workspaceRoutes';
+
+/** Result of a sync activation bind attempt. */
+export interface ApplyStoredResult {
+  account: Account;
+  /**
+   * Working dir has credentials after materialize. False means empty/logout dir
+   * (or store missing tokens) — callers must not treat this as a healthy bind
+   * for a folder route (escalate to force bind + reload).
+   */
+  stocked: boolean;
+}
 
 /**
  * Per-window binding of a Claude account.
@@ -229,25 +240,35 @@ export class WindowBinding {
    * synchronously, because Claude Code reads CLAUDE_CONFIG_DIR the moment IT
    * activates and we have to get there first.
    *
+   * Preference order:
+   *   1. `preferredName` — workspace route or learned folder→account (multi-window:
+   *      work tree vs personal tree; wins over global last-used)
+   *   2. This window's choice / exact repo map entry (`getActiveName`)
+   *   3. Global last-used — only when this window has never had a working dir
+   *
    * Stocking the working dir here doubles as the migration off the old model
    * (where a window pointed straight at the account's dir): the first activation
    * after the upgrade copies the account into the window's own dir, and from then
    * on nothing else can write to it.
    */
-  applyStored(resolve: (name: string) => Account | undefined): Account | undefined {
-    // This window's own choice, if it ever made one.
-    let name = this.getActiveName();
-    // Otherwise fall back to the last account used anywhere — but ONLY for a window
-    // that has never run at all (no working dir yet). An EXISTING working dir means
-    // this window has a past, and the two ways it can have lost its account —
-    // `/logout` here, or the account being forgotten elsewhere — both leave the dir
-    // behind, emptied. Adopting an account into it would resurrect a session the
-    // user deliberately ended, on a token the server has already revoked.
-    if (!name && !fs.existsSync(this.workingDir())) name = this.getLastName();
+  applyStored(
+    resolve: (name: string) => Account | undefined,
+    preferredName?: string
+  ): ApplyStoredResult | undefined {
+    const tryResolve = (name: string | undefined): Account | undefined =>
+      name ? resolve(name) : undefined;
+
+    const dir = this.workingDir();
+    const name = pickStoredAccountName({
+      preferredName,
+      activeName: this.getActiveName(),
+      lastName: this.getLastName(),
+      hasWorkingDir: fs.existsSync(dir),
+    });
     // A name that no longer resolves (forgotten account) falls through to "no
     // account" — never resurrected. That is what turned a stale name into a reload
     // loop in v1.2.1.
-    const account = name ? resolve(name) : undefined;
+    const account = tryResolve(name);
     if (!account) {
       // The terminal collection is persisted by VSCode across restarts, so a
       // forgotten account's dir can survive there and keep pointing terminals at
@@ -255,11 +276,50 @@ export class WindowBinding {
       this.applyTerminalEnv(undefined);
       return undefined;
     }
-    const dir = this.workingDir();
-    materialize(account, dir);
-    process.env[ENV_VAR] = dir;
-    this.applyTerminalEnv(dir);
-    return account;
+
+    // Folder route / learned pin: force-stock empty dirs. A real /logout forgets
+    // the account from the registry, so a still-resolvable preferred account is
+    // not resurrecting a revoked token — it is restocking a pin (or a different
+    // account than the one that emptied the dir). Non-preferred keeps the
+    // empty-dir guard so voluntary logout of the active account is not undone.
+    const fromPreferred = Boolean(preferredName && account.name === preferredName);
+    materialize(account, dir, fromPreferred);
+
+    const dirEmail = readIdentity(dir)?.email;
+    const accountEmail = account.email ?? readIdentity(account.dir)?.email;
+    const stocked =
+      hasCredentials(dir) &&
+      (!dirEmail || !accountEmail || emailsEqual(dirEmail, accountEmail));
+
+    if (stocked || !fromPreferred) {
+      // Always set env when stocked. For non-preferred empty logout, still point
+      // at the working dir so reconcile can handleLoggedOut.
+      process.env[ENV_VAR] = dir;
+      this.applyTerminalEnv(dir);
+    } else {
+      // Preferred failed to stock — do not claim a healthy env bind.
+      log(
+        `applyStored: preferred ${account.name} did not stock ${dir} (empty or missing store token)`
+      );
+      this.applyTerminalEnv(undefined);
+    }
+    return { account, stocked };
+  }
+
+  /**
+   * Persists which account this window/folder uses without reloading.
+   * Used when activation already pointed process.env at the right dir (race with
+   * Claude Code) and we only need workspaceState + the global repo map to match.
+   */
+  async remember(account: Account): Promise<void> {
+    await this.context.workspaceState.update(ACTIVE_KEY, account.name);
+    await this.context.globalState.update(LAST_KEY, account.name);
+    const repo = this.getRepoKey();
+    if (repo) {
+      const map = { ...this.getRepoMap(), [repo]: account.name };
+      await this.context.globalState.update(REPO_MAP_KEY, map);
+    }
+    this.onDidChange.fire();
   }
 
   /**

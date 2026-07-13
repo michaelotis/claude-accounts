@@ -2,7 +2,7 @@
   "name": "claude-accounts",
   "displayName": "Claude Accounts + Usage",
   "description": "Multi-account Claude Code for WSL/Linux (per-window isolation + shared history) with live usage: 5h, 7d, Fable/Opus/Sonnet — workspace extension, never binds to a Windows Claude binary.",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "publisher": "michaelotis",
   "icon": "images/icon.png",
   "repository": {
@@ -169,7 +169,7 @@
         "claudeAccounts.workspaceRoutes": {
           "type": "array",
           "default": [],
-          "description": "Hard map of directory trees to Claude account emails. Longest matching pathPrefix wins. Under a match, CLI orch and VS Code auto-bind always use that account (no cross-account failover). Example: work monorepos → work email; personal repos → personal email.",
+          "description": "Hard map of directory trees to Claude account emails. Longest matching pathPrefix wins. Under a match, CLI orch and VS Code auto-select that account when the folder opens (multi-window: work tree in one VS Code, personal in another). No cross-account failover under a match. Example: work monorepos → work email; personal repos → personal email.",
           "items": {
             "type": "object",
             "required": [

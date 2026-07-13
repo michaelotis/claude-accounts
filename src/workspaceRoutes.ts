@@ -21,6 +21,33 @@ export function normalizePrefix(p: string): string {
   return n;
 }
 
+/** Case-fold + trim emails so settings and OAuth identity compare reliably. */
+export function normalizeEmail(email: string | undefined | null): string {
+  return (email ?? '').trim().toLowerCase();
+}
+
+export function emailsEqual(a: string | undefined | null, b: string | undefined | null): boolean {
+  const na = normalizeEmail(a);
+  const nb = normalizeEmail(b);
+  return Boolean(na && nb && na === nb);
+}
+
+/**
+ * Pure preference order for which account name activation should bind.
+ * preferred (route) > active/repo memory > last-used only when no working dir.
+ */
+export function pickStoredAccountName(opts: {
+  preferredName?: string;
+  activeName?: string;
+  lastName?: string;
+  hasWorkingDir: boolean;
+}): string | undefined {
+  if (opts.preferredName) return opts.preferredName;
+  if (opts.activeName) return opts.activeName;
+  if (!opts.hasWorkingDir && opts.lastName) return opts.lastName;
+  return undefined;
+}
+
 /**
  * Find the best route for a filesystem path (cwd or workspace folder).
  * Returns null if nothing matches.
@@ -39,7 +66,7 @@ export function matchWorkspaceRoute(
     if (!prefix) continue;
     if (target === prefix || target.startsWith(prefix + path.sep)) {
       if (prefix.length > bestLen) {
-        best = { pathPrefix: prefix, email: r.email.trim() };
+        best = { pathPrefix: prefix, email: normalizeEmail(r.email) };
         bestLen = prefix.length;
       }
     }
@@ -57,12 +84,12 @@ export function mergeRoutes(
   for (const r of learned) {
     if (!r.pathPrefix || !r.email) continue;
     const p = normalizePrefix(r.pathPrefix);
-    byPrefix.set(p, { pathPrefix: p, email: r.email });
+    byPrefix.set(p, { pathPrefix: p, email: normalizeEmail(r.email) });
   }
   for (const r of settingsRoutes) {
     if (!r.pathPrefix || !r.email) continue;
     const p = normalizePrefix(r.pathPrefix);
-    byPrefix.set(p, { pathPrefix: p, email: r.email.trim() });
+    byPrefix.set(p, { pathPrefix: p, email: normalizeEmail(r.email) });
   }
   return [...byPrefix.values()].sort((a, b) => b.pathPrefix.length - a.pathPrefix.length);
 }

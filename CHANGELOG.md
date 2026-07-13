@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.0
+
+### Improved
+- **Per-workspace auto-select for multi-window**: folder routes + learned Switch-Account map bind **before** global last-used, so opening a work project and a personal project in two VS Code windows each get the right account without a wrong-bind + reload
+- Persist folder→account at activation when the working dir already has the pin’s credentials (no reload)
+- Force-stock + metered reload when the pin’s dir is empty/wrong (avoids empty-dir + reconcile wrongly forgetting a good account)
+- `clearMachineOverride` before `remember` (isolation-critical clear is not delayed by state I/O)
+- Case-insensitive email match for routes and account lookup
+- Switch Account warns when a **settings** pin will re-apply after reload
+- `npm run install-latest` downloads the GitHub Release VSIX **and** runs `code --install-extension` when a CLI is on PATH (Marketplace later, after dogfood)
+- README: what the extension is for / not for (no context consolidation across accounts, etc.)
+
+### Fixed
+- Preferred route + empty working dir no longer reports a healthy bind and can no longer cascade into `handleLoggedOut` forgetting the route account
+
 ## 0.7.0
 
 ### Fixed (review Top 5)

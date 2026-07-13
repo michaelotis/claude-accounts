@@ -10,6 +10,7 @@ import { ensureSharedHistory } from './sharedHistory';
 import { signOut, interruptSessions, dirsHoldingToken } from './reclaim';
 import { refreshStore, allWorkingDirs, materialize } from './workdir';
 import { log } from './log';
+import { matchWorkspaceRoute, type WorkspaceRoute } from './workspaceRoutes';
 
 /**
  * All the user-facing flows.
@@ -388,9 +389,21 @@ export class SetupWizard {
       account: a,
     }));
 
+    const folderPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const settingsRoutes = (
+      vscode.workspace.getConfiguration('claudeAccounts').get<WorkspaceRoute[]>('workspaceRoutes', []) ||
+      []
+    ).filter((r) => r?.pathPrefix && r?.email);
+    const settingsPin =
+      folderPath && settingsRoutes.length
+        ? matchWorkspaceRoute(folderPath, settingsRoutes)
+        : null;
+
     const picked = await vscode.window.showQuickPick(items, {
       title: 'Switch Claude account for this window (reloads the window)',
-      placeHolder: 'Pick the account this window should use',
+      placeHolder: settingsPin
+        ? `Settings pin this folder to ${settingsPin.email} (re-applies on reload)`
+        : 'Pick the account this window should use',
     });
     if (!picked) return;
     if (picked.account.name === activeName) {
@@ -400,7 +413,20 @@ export class SetupWizard {
       );
       return;
     }
-    await this.switchTo(picked.account);
+    if (settingsPin) {
+      const pickEmail = this.registry.emailOf(picked.account);
+      if (pickEmail && pickEmail.toLowerCase() !== settingsPin.email.toLowerCase()) {
+        const go = await vscode.window.showWarningMessage(
+          `This folder is pinned in settings to ${settingsPin.email}. ` +
+            `Switching to ${pickEmail} reloads once, but the pin re-applies the next time the window opens ` +
+            `(edit claudeAccounts.workspaceRoutes to change that).`,
+          { modal: true },
+          'Switch anyway'
+        );
+        if (go !== 'Switch anyway') return;
+      }
+    }
+    await this.switchTo(picked.account, { userInitiated: true });
   }
 
   /**
@@ -412,9 +438,19 @@ export class SetupWizard {
    * billed another. On reload this extension activates first (activation event
    * `*`) and the new account is already in place.
    */
-  async switchTo(account: Account): Promise<void> {
+  /**
+   * Bind + reload. Explicit user actions use userInitiated (bypass breaker).
+   * Automatic folder-route correction should pass userInitiated: false so a
+   * broken loop degrades to a manual "Reload window" button.
+   */
+  async switchTo(
+    account: Account,
+    opts: { userInitiated?: boolean; notice?: string } = {}
+  ): Promise<void> {
     await this.binding.bind(account);
-    await this.requestWindowReload(undefined, { userInitiated: true });
+    await this.requestWindowReload(opts.notice, {
+      userInitiated: opts.userInitiated !== false,
+    });
   }
 
   // ─── Forgetting an account ──────────────────────────────────────────────────

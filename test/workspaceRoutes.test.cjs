@@ -13,7 +13,14 @@ esbuild.buildSync({
   format: 'cjs',
   outfile: out,
 });
-const { matchWorkspaceRoute, mergeRoutes, normalizePrefix } = require(out);
+const {
+  matchWorkspaceRoute,
+  mergeRoutes,
+  normalizePrefix,
+  normalizeEmail,
+  emailsEqual,
+  pickStoredAccountName,
+} = require(out);
 
 describe('matchWorkspaceRoute', () => {
   const routes = [
@@ -36,6 +43,13 @@ describe('matchWorkspaceRoute', () => {
   it('returns null outside trees', () => {
     assert.equal(matchWorkspaceRoute('/tmp/other', routes), null);
   });
+
+  it('normalizes route email case', () => {
+    const m = matchWorkspaceRoute('/home/user/projects/work-client', [
+      { pathPrefix: '/home/user/projects/work-client', email: 'Work@Y.COM' },
+    ]);
+    assert.equal(m.email, 'work@y.com');
+  });
 });
 
 describe('mergeRoutes', () => {
@@ -46,6 +60,68 @@ describe('mergeRoutes', () => {
     );
     assert.equal(merged.length, 1);
     assert.equal(merged[0].email, 'work@new.com');
+  });
+});
+
+describe('normalizeEmail / emailsEqual', () => {
+  it('folds case and trims', () => {
+    assert.equal(normalizeEmail('  Work@Example.COM '), 'work@example.com');
+    assert.equal(emailsEqual('Work@Example.com', 'work@example.com'), true);
+    assert.equal(emailsEqual('a@x.com', 'b@x.com'), false);
+    assert.equal(emailsEqual('', 'a@x.com'), false);
+  });
+});
+
+describe('pickStoredAccountName', () => {
+  it('preferred wins over active and last', () => {
+    assert.equal(
+      pickStoredAccountName({
+        preferredName: 'work',
+        activeName: 'personal',
+        lastName: 'other',
+        hasWorkingDir: true,
+      }),
+      'work'
+    );
+  });
+
+  it('active wins over last when no preferred', () => {
+    assert.equal(
+      pickStoredAccountName({
+        activeName: 'personal',
+        lastName: 'other',
+        hasWorkingDir: true,
+      }),
+      'personal'
+    );
+  });
+
+  it('last only when no working dir and no active', () => {
+    assert.equal(
+      pickStoredAccountName({
+        lastName: 'other',
+        hasWorkingDir: false,
+      }),
+      'other'
+    );
+    assert.equal(
+      pickStoredAccountName({
+        lastName: 'other',
+        hasWorkingDir: true,
+      }),
+      undefined
+    );
+  });
+
+  it('suppresses last-used when preferred is set even with working dir', () => {
+    assert.equal(
+      pickStoredAccountName({
+        preferredName: 'work',
+        lastName: 'personal',
+        hasWorkingDir: true,
+      }),
+      'work'
+    );
   });
 });
 
