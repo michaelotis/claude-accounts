@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.1
+
+### Fixed
+- Usage fetch aligned with **camwatch / claudemeter**: refresh near-expiry tokens, 5‑minute disk cache, 429/network serves last good meter (not “sign in again”), one poll per email
+- Double-reload after Switch Account (reconcile no longer requests a second auto-reload within the cooldown)
+- Clearer usage error toasts when there is no cache to fall back on
+
 ## 0.8.0
 
 ### Improved

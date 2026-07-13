@@ -94,7 +94,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const registry = new AccountRegistry(context);
   const binding = new WindowBinding(context);
   const wizard = new SetupWizard(registry, binding, context);
-  const usage = new UsageMonitor(180_000);
+  // 5 min poll — matches camwatch cache TTL; faster polling just 429s the usage API.
+  const usage = new UsageMonitor(5 * 60_000);
 
   const accountByEmail = (email: string) => {
     const want = normalizeEmail(email);
@@ -450,11 +451,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     cmd('claudeProfiles.showLog', () => showLog()),
     cmd('claudeProfiles.refreshUsage', async () => {
       const dir = binding.getEnvDir() ?? defaultSourceDir();
-      const snap = await usage.refresh(dir);
+      // Force network so the button is not a pure cache read; still falls back
+      // to stale cache on 429 like camwatch.
+      const snap = await usage.refresh(dir, true);
       if (!snap) {
-        vscode.window.showWarningMessage(
-          'Could not fetch usage for this window (missing token or network). Sign in with Claude Code first.'
-        );
+        const detail =
+          usage.lastFailure?.message ??
+          'Could not fetch usage for this window (missing token or network). Sign in with Claude Code first.';
+        const pick = await vscode.window.showWarningMessage(detail, 'Show log');
+        if (pick === 'Show log') showLog();
         return;
       }
       const models = snap.modelLimits.map((m) => `${m.name} ${m.percent}%`).join(', ');

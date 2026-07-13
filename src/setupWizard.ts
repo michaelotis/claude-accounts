@@ -59,6 +59,12 @@ export class SetupWizard {
    * `userInitiated` bypasses the breaker (an explicit switch/forget must always
    * act) but still stamps, so a follow-up automatic reload is metered.
    */
+  /** True if this window reloaded itself within the auto-reload cooldown. */
+  private recentlyReloaded(withinMs = 60_000): boolean {
+    const last = this.context.workspaceState.get<number>(RELOAD_STAMP_KEY, 0);
+    return last > 0 && Date.now() - last < withinMs;
+  }
+
   private async requestWindowReload(
     notice: string | undefined,
     opts: { userInitiated?: boolean } = {}
@@ -67,10 +73,12 @@ export class SetupWizard {
     const last = this.context.workspaceState.get<number>(RELOAD_STAMP_KEY, 0);
     if (!opts.userInitiated && now - last < 60_000) {
       log(`auto-reload SUPPRESSED (${now - last}ms after the previous one): ${notice ?? ''}`);
+      // Do not claim "was reloaded" when we are skipping — that is the confusing
+      // toast after Switch Account (first reload already applied the account).
       void vscode.window
         .showWarningMessage(
-          `Claude Accounts: ${notice ?? 'this window needs a reload to pick up its account.'} ` +
-            `The automatic reload was skipped because one just happened.`,
+          `Claude Accounts: already reloaded this window a moment ago, so a second automatic ` +
+            `reload was skipped. If the account or usage still looks wrong, reload once more.`,
           'Reload window'
         )
         .then((pick) => {
@@ -302,19 +310,29 @@ export class SetupWizard {
     // so until a reload it keeps running there, where another window's sign-in
     // could still reach it. One reload moves it onto its own dir for good.
     if (onDefault) {
+      if (this.recentlyReloaded()) {
+        log(`reconcile: on default dir but already reloaded recently — skip second reload`);
+        return;
+      }
       await this.requestWindowReload(
         `${email} is set up. This window now runs it in a directory of its own — signing in to ` +
           `another account here will no longer disturb your other windows.`
       );
     } else if (changed && active) {
-      // The user signed in as a different account INSIDE this window. The bind
-      // above only updates our side; Claude Code read this dir at activation and
-      // won't look again — its panel still shows, and its running session still
-      // bills, the OLD account. Without this reload the window looks switched
-      // but isn't, and the Switch list marks the new account as "current" so
-      // picking it is a no-op: "switch does nothing until I reload by hand".
+      // Name/account drift (Switch Account, capture, or Claude Code /login).
+      // Switch Account already reloaded with userInitiated=true; after that
+      // reload, Claude Code has re-read CLAUDE_CONFIG_DIR. A second automatic
+      // reload only hits the circuit breaker and shows a scary "skipped" toast.
+      if (this.recentlyReloaded()) {
+        log(
+          `reconcile: active ${active} → ${account.name} (${email}) after recent reload — bind only, no second reload`
+        );
+        return;
+      }
+      // Mid-session sign-in without our switchTo: Claude Code still has the old
+      // process; reload so the panel matches the dir.
       await this.requestWindowReload(
-        `Signed in as ${email} — the window was reloaded so Claude Code fully switches to it.`
+        `Signed in as ${email} — reloading so Claude Code fully switches to it.`
       );
     }
   }
