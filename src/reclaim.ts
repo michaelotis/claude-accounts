@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { log } from './log';
 import { readIdentity } from './accounts';
+import { writeFileAtomic } from './fsSafe';
 
 /**
  * Reclaiming sensitive data from a forgotten account.
@@ -100,15 +101,45 @@ export function signOut(dir: string): boolean {
         touched = true;
       }
       if (!touched) continue;
-      const tmp = `${cfg}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), { mode: 0o600 });
-      fs.renameSync(tmp, cfg); // atomic: never leave a half-written config
+      // Unique-temp atomic write: never leave a half-written config.
+      writeFileAtomic(cfg, JSON.stringify(obj, null, 2), { mode: 0o600 });
       log(`signOut: cleared account state in ${cfg}`);
     } catch (err) {
       log(`signOut: could not clear ${cfg}: ${(err as Error).message}`);
     }
   }
   return removed;
+}
+
+const CLAUDE_CONFIG_DIR_PREFIX = 'CLAUDE_CONFIG_DIR=';
+
+/** Normalized config dir a live process is running against, or null if not claude. */
+function configDirForPid(pid: number | string): string | null {
+  const defaultDir = path.normalize(path.join(os.homedir(), '.claude'));
+  let comm: string;
+  try {
+    comm = fs.readFileSync(path.join('/proc', String(pid), 'comm'), 'utf-8').trim();
+  } catch {
+    return null; // process gone or not readable
+  }
+  if (comm !== 'claude') return null;
+  let environ: string;
+  try {
+    environ = fs.readFileSync(path.join('/proc', String(pid), 'environ'), 'utf-8');
+  } catch {
+    return null;
+  }
+  const entry = environ.split('\0').find((e) => e.startsWith(CLAUDE_CONFIG_DIR_PREFIX));
+  return entry ? path.normalize(entry.slice(CLAUDE_CONFIG_DIR_PREFIX.length)) : defaultDir;
+}
+
+/**
+ * True when `/proc/<pid>` still looks like a `claude` process bound to `dir`.
+ * Used right before SIGKILL so a recycled PID is not killed by mistake.
+ */
+function pidStillMapsToDir(pid: number, dir: string): boolean {
+  const mapped = configDirForPid(pid);
+  return mapped !== null && mapped === path.normalize(dir);
 }
 
 /**
@@ -125,24 +156,9 @@ export function claudeSessionsByDir(): Map<string, number[]> {
   } catch {
     return byDir; // no /proc on this platform
   }
-  const defaultDir = path.normalize(path.join(os.homedir(), '.claude'));
-  const PREFIX = 'CLAUDE_CONFIG_DIR=';
   for (const pid of pids) {
-    let comm: string;
-    try {
-      comm = fs.readFileSync(path.join('/proc', pid, 'comm'), 'utf-8').trim();
-    } catch {
-      continue; // process gone or not ours
-    }
-    if (comm !== 'claude') continue;
-    let environ: string;
-    try {
-      environ = fs.readFileSync(path.join('/proc', pid, 'environ'), 'utf-8');
-    } catch {
-      continue;
-    }
-    const entry = environ.split('\0').find((e) => e.startsWith(PREFIX));
-    const dir = entry ? path.normalize(entry.slice(PREFIX.length)) : defaultDir;
+    const dir = configDirForPid(pid);
+    if (!dir) continue;
     const list = byDir.get(dir) ?? [];
     list.push(Number(pid));
     byDir.set(dir, list);
@@ -165,6 +181,11 @@ export function interruptSessions(dirs: string[]): number {
   for (const [dir, pids] of byDir) {
     if (!targets.has(dir)) continue;
     for (const pid of pids) {
+      // Between scan and kill a PID can be recycled onto an unrelated process.
+      if (!pidStillMapsToDir(pid, dir)) {
+        log(`skipped pid=${pid} on ${dir}: recycled or no longer maps`);
+        continue;
+      }
       try {
         process.kill(pid, 'SIGKILL');
         killed++;

@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { isReservedClaudeDirName } from './sidecars';
+import { writeFileAtomic } from './fsSafe';
 
 /**
  * An account = a Claude Code data directory (CLAUDE_CONFIG_DIR) that has been
@@ -122,7 +123,7 @@ export class AccountRegistry {
       const stores = [...this.list(), ...this.listForgotten()].map((a) => path.normalize(a.dir));
       const file = manifestPath();
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-      fs.writeFileSync(file, JSON.stringify({ stores: [...new Set(stores)] }, null, 2), {
+      writeFileAtomic(file, JSON.stringify({ stores: [...new Set(stores)] }, null, 2), {
         mode: 0o600,
       });
     } catch {

@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { AuthStatus } from './cli';
 import { AccountIdentity } from './accounts';
+import { writeFileAtomic, copyFileAtomic } from './fsSafe';
 
 /**
  * Snapshots the account currently signed in inside `sourceDir` into a dedicated
@@ -33,12 +34,9 @@ export function snapshotAccount(
   // world-listable directory still leaks which accounts exist on the machine.
   fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
 
-  // 1) Credentials — copy atomically (temp + rename).
+  // 1) Credentials — unique-temp atomic copy (safe across windows).
   const dstCreds = path.join(targetDir, '.credentials.json');
-  const tmpCreds = `${dstCreds}.tmp`;
-  fs.copyFileSync(srcCreds, tmpCreds);
-  fs.chmodSync(tmpCreds, 0o600);
-  fs.renameSync(tmpCreds, dstCreds);
+  copyFileAtomic(srcCreds, dstCreds, 0o600);
 
   // 2) Identity (.claude.json). Prefer the real source file; the default
   //    ~/.claude keeps its identity in ~/.claude.json (home) instead.
@@ -48,10 +46,7 @@ export function snapshotAccount(
   ]);
   const dstIdentity = path.join(targetDir, '.claude.json');
   if (srcIdentity) {
-    const tmp = `${dstIdentity}.tmp`;
-    fs.copyFileSync(srcIdentity, tmp);
-    fs.chmodSync(tmp, 0o600);
-    fs.renameSync(tmp, dstIdentity);
+    copyFileAtomic(srcIdentity, dstIdentity, 0o600);
   } else {
     writeMinimalIdentity(dstIdentity, status);
   }
@@ -77,7 +72,7 @@ function ensureIdentity(dir: string, status: AuthStatus): void {
     emailAddress: status.email,
     organizationName: status.orgName ?? existing.organizationName,
   };
-  fs.writeFileSync(file, JSON.stringify(obj, null, 2), { mode: 0o600 });
+  writeFileAtomic(file, JSON.stringify(obj, null, 2), { mode: 0o600 });
 }
 
 function writeMinimalIdentity(file: string, status: AuthStatus): void {
@@ -88,7 +83,7 @@ function writeMinimalIdentity(file: string, status: AuthStatus): void {
       organizationName: status.orgName,
     },
   };
-  fs.writeFileSync(file, JSON.stringify(obj, null, 2), { mode: 0o600 });
+  writeFileAtomic(file, JSON.stringify(obj, null, 2), { mode: 0o600 });
 }
 
 function firstExisting(paths: string[]): string | null {
@@ -147,9 +142,8 @@ export function mirrorToDefault(sourceDir: string, identity: AccountIdentity | n
     // identical token would churn the file Claude Code watches.
     if (!fs.existsSync(dstToken) || !fs.readFileSync(dstToken).equals(incoming)) {
       fs.mkdirSync(defaultDir, { recursive: true, mode: 0o700 });
-      const tmp = `${dstToken}.tmp`;
-      fs.writeFileSync(tmp, incoming, { mode: 0o600 });
-      fs.renameSync(tmp, dstToken); // atomic: a half-written token is worse than none
+      // Unique-temp atomic write: a half-written token is worse than none.
+      writeFileAtomic(dstToken, incoming, { mode: 0o600 });
     }
     if (!identity) return;
 
@@ -168,9 +162,7 @@ export function mirrorToDefault(sourceDir: string, identity: AccountIdentity | n
       displayName: identity.displayName,
       organizationName: identity.organizationName,
     };
-    const tmp = `${cfg}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), { mode: 0o600 });
-    fs.renameSync(tmp, cfg);
+    writeFileAtomic(cfg, JSON.stringify(obj, null, 2), { mode: 0o600 });
   } catch {
     // Best-effort: a failed mirror only means the default dir lags behind. The
     // extension itself keeps working — this is insurance for its absence.
