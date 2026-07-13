@@ -187,7 +187,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       workspaceRoutes: routes,
       nameByEmail,
       snapshots: [],
-      retainEmails: usage.listAccountsToPoll().map((a) => a.email),
     });
   };
   applyUsageSettings();

@@ -7,7 +7,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { log } from './log';
-import { readIdentity } from './accounts';
+import { readIdentity, hasCredentials } from './accounts';
+import { writeFileAtomic, withLock } from './fsSafe';
 import {
   buildSnapshot,
   formatUsageBar,
@@ -81,6 +82,15 @@ function usageCachePath(): string {
   return path.join(policyDir(), 'usage-cache.json');
 }
 
+/**
+ * Advisory lock for a machine-wide file this extension fully owns. Every window
+ * read-modify-writes these, so the lock serializes those critical sections
+ * (unique temp names alone stop torn writes, not lost updates).
+ */
+function lockFor(file: string): string {
+  return `${file}.lock`;
+}
+
 interface CredsFile {
   claudeAiOauth?: {
     accessToken?: string;
@@ -124,9 +134,7 @@ function readCreds(configDir: string): CredsFile | null {
 function writeCredsAtomic(configDir: string, creds: CredsFile): void {
   const file = path.join(configDir, '.credentials.json');
   fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
-  const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(creds, null, 2), { mode: 0o600 });
-  fs.renameSync(tmp, file);
+  writeFileAtomic(file, JSON.stringify(creds, null, 2), { mode: 0o600 });
 }
 
 function cacheKeyForDir(configDir: string): string {
@@ -150,16 +158,20 @@ function readUsageCache(): UsageCacheFile {
 function writeUsageCache(cache: UsageCacheFile): void {
   try {
     fs.mkdirSync(policyDir(), { recursive: true, mode: 0o700 });
-    const tmp = `${usageCachePath()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(cache, null, 2), { mode: 0o600 });
-    fs.renameSync(tmp, usageCachePath());
+    writeFileAtomic(usageCachePath(), JSON.stringify(cache, null, 2), { mode: 0o600 });
   } catch (err) {
     log(`usage-cache write failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
 interface UsageMeta {
-  /** Wall clock of last poll HTTP 429 — drives network backoff. */
+  /**
+   * Per-account network backoff: cache-key (email:… / dir:…) → wall clock of its
+   * last poll HTTP 429. Per-account so one account's 429 does not freeze every
+   * other account's meter on stale data for the backoff window.
+   */
+  rateLimitAt?: Record<string, number>;
+  /** Legacy machine-wide stamp (pre per-account); ignored now, left to expire. */
   lastRateLimitAt?: number;
 }
 
@@ -178,29 +190,34 @@ function readMeta(): UsageMeta {
 function writeMeta(m: UsageMeta): void {
   try {
     fs.mkdirSync(policyDir(), { recursive: true, mode: 0o700 });
-    const tmp = `${metaPath()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(m, null, 2), { mode: 0o600 });
-    fs.renameSync(tmp, metaPath());
+    writeFileAtomic(metaPath(), JSON.stringify(m, null, 2), { mode: 0o600 });
   } catch {
     /* ignore */
   }
 }
 
-function inRateLimitBackoff(): boolean {
-  const at = readMeta().lastRateLimitAt || 0;
+function inRateLimitBackoff(key: string): boolean {
+  const at = readMeta().rateLimitAt?.[key] || 0;
   return at > 0 && Date.now() - at < RATE_LIMIT_BACKOFF_MS;
 }
 
-function stampRateLimitBackoff(): void {
-  writeMeta({ ...readMeta(), lastRateLimitAt: Date.now() });
+function stampRateLimitBackoff(key: string): void {
+  withLock(lockFor(metaPath()), () => {
+    const m = readMeta();
+    const map = m.rateLimitAt ?? {};
+    map[key] = Date.now();
+    writeMeta({ ...m, rateLimitAt: map });
+  });
 }
 
-function clearRateLimitBackoff(): void {
-  const m = readMeta();
-  if (m.lastRateLimitAt) {
+function clearRateLimitBackoff(key: string): void {
+  withLock(lockFor(metaPath()), () => {
+    const m = readMeta();
+    if (!m.rateLimitAt?.[key] && m.lastRateLimitAt === undefined) return;
+    if (m.rateLimitAt) delete m.rateLimitAt[key];
     delete m.lastRateLimitAt;
     writeMeta(m);
-  }
+  });
 }
 
 function getCachedSnap(key: string, maxAgeMs: number): UsageSnapshot | null {
@@ -216,9 +233,13 @@ function getStaleSnap(key: string): UsageSnapshot | null {
 }
 
 function putCachedSnap(key: string, snap: UsageSnapshot): void {
-  const cache = readUsageCache();
-  cache.entries[key] = { key, fetchedAt: Date.now(), snap };
-  writeUsageCache(cache);
+  // Lock the read-modify-write: another window caching a different key must not
+  // drop this entry (unique temp names stop torn writes, not lost updates).
+  withLock(lockFor(usageCachePath()), () => {
+    const cache = readUsageCache();
+    cache.entries[key] = { key, fetchedAt: Date.now(), snap };
+    writeUsageCache(cache);
+  });
 }
 
 /** Fall back to policy.json account rows (last successful poll from any version). */
@@ -308,7 +329,11 @@ const inflightTokenRefresh = new Map<string, Promise<string>>();
  * Writes the new pair back into this config dir only.
  */
 async function ensureFreshToken(configDir: string, force = false): Promise<string> {
-  const existing = inflightTokenRefresh.get(configDir);
+  // Key by force: a forced refresh (the 401-retry path) must NOT join an
+  // in-flight non-force refresh, which can resolve to the still-valid-looking
+  // OLD access token via the `!force` short-circuit below and defeat the retry.
+  const inflightKey = force ? `${configDir}#force` : configDir;
+  const existing = inflightTokenRefresh.get(inflightKey);
   if (existing) return existing;
 
   const run = (async () => {
@@ -399,10 +424,10 @@ async function ensureFreshToken(configDir: string, force = false): Promise<strin
       clearTimeout(timer);
     }
   })().finally(() => {
-    inflightTokenRefresh.delete(configDir);
+    inflightTokenRefresh.delete(inflightKey);
   });
 
-  inflightTokenRefresh.set(configDir, run);
+  inflightTokenRefresh.set(inflightKey, run);
   return run;
 }
 
@@ -534,7 +559,7 @@ export async function fetchUsageDetailed(
   }
 
   // (2) Backoff after poll 429 — camwatch stamps lastUsageCheckTs and skips re-poll
-  if (inRateLimitBackoff() && !opts.forceNetwork) {
+  if (inRateLimitBackoff(key) && !opts.forceNetwork) {
     const snap = bestEffortSnap(dir, key);
     log(`usage: rate-limit backoff active — serving best-effort for ${key}`);
     return { ok: true, snap: { ...snap, configDir: dir } };
@@ -609,7 +634,7 @@ export async function fetchUsageDetailed(
 
     // (6) 429 poll rate-limit — keep previous usage, stamp backoff (camwatch)
     if (status === 429) {
-      stampRateLimitBackoff();
+      stampRateLimitBackoff(key);
       const snap = bestEffortSnap(dir, key);
       log(
         `usage: HTTP 429 (poll rate-limit) — serving best-effort (5h ${snap.sessionPercent}% 7d ${snap.weeklyPercent}%), NOT treating as sign-out`
@@ -623,7 +648,7 @@ export async function fetchUsageDetailed(
     }
 
     // (7) Success
-    clearRateLimitBackoff();
+    clearRateLimitBackoff(key);
     const usage = data as Record<string, unknown>;
     // Identity from dir (no second profile HTTP call — avoids extra 429s)
     const identity = readIdentity(dir);
@@ -713,87 +738,88 @@ export function writePolicyCache(opts: {
   snapshots: UsageSnapshot[];
   /** Drop these emails entirely (e.g. after Forget). */
   removeEmails?: string[];
-  /**
-   * If set, policy.accounts becomes exactly this set of emails after merge
-   * (plus any successful snapshots). Drops forgotten / unknown entries.
-   */
-  retainEmails?: string[];
 }): void {
   try {
-    fs.mkdirSync(policyDir(), { recursive: true, mode: 0o700 });
-    let prev: Partial<OrchPolicy> = {};
-    if (fs.existsSync(policyPath())) {
-      try {
-        prev = JSON.parse(fs.readFileSync(policyPath(), 'utf-8')) as OrchPolicy;
-      } catch {
-        prev = {};
-      }
-    }
-    const byEmail = new Map<string, PolicyAccount>();
-    for (const a of prev.accounts || []) {
-      if (a.email) byEmail.set(a.email, a);
-    }
-    for (const e of opts.removeEmails || []) {
-      byEmail.delete(e);
-    }
-    for (const s of opts.snapshots) {
-      if (!s.email) continue;
-      const fable = s.modelLimits.find((m) => /fable/i.test(m.name))?.percent ?? null;
-      const prevDir = byEmail.get(s.email)?.dir;
-      let dir = s.configDir;
-      // Prefer durable account store over per-window workdir
-      if (dir.includes(`${path.sep}.claude-windows${path.sep}`)) {
-        if (prevDir && !prevDir.includes(`${path.sep}.claude-windows${path.sep}`)) {
-          dir = prevDir;
+    // Lock the whole read-modify-write: policy.json is one machine-wide file
+    // every window rewrites, so an unlocked RMW loses a concurrent window's
+    // update (and unique temp names only stop torn writes, not lost updates).
+    withLock(lockFor(policyPath()), () => {
+      fs.mkdirSync(policyDir(), { recursive: true, mode: 0o700 });
+      let prev: Partial<OrchPolicy> = {};
+      if (fs.existsSync(policyPath())) {
+        try {
+          prev = JSON.parse(fs.readFileSync(policyPath(), 'utf-8')) as OrchPolicy;
+        } catch {
+          prev = {};
         }
       }
-      const name = opts.nameByEmail?.[s.email] || byEmail.get(s.email)?.name;
-      byEmail.set(s.email, {
-        id: s.email,
-        email: s.email,
-        name,
-        dir,
-        sessionPercent: s.sessionPercent,
-        weeklyPercent: s.weeklyPercent,
-        fablePercent: fable,
-        hot: needsFailover(s, opts.thresholds, opts.triggers),
-        reasons: failoverReasons(s, opts.thresholds, opts.triggers),
-        planLabel: s.planLabel,
-        fetchedAt: s.fetchedAt,
-      });
-    }
-    if (opts.retainEmails) {
-      const keep = new Set(opts.retainEmails);
-      for (const em of [...byEmail.keys()]) {
-        if (!keep.has(em)) byEmail.delete(em);
+      const byEmail = new Map<string, PolicyAccount>();
+      for (const a of prev.accounts || []) {
+        if (a.email) byEmail.set(a.email, a);
       }
-    }
-    let accountOrder =
-      opts.accountOrder !== undefined ? opts.accountOrder : prev.accountOrder || [];
-    if (!accountOrder.length) {
-      const legacy: string[] = [];
-      const prevAny = prev as { primaryEmail?: string; secondaryEmail?: string };
-      if (prevAny.primaryEmail) legacy.push(prevAny.primaryEmail);
-      if (prevAny.secondaryEmail) legacy.push(prevAny.secondaryEmail);
-      accountOrder = legacy;
-    }
-    const policy: OrchPolicy = {
-      version: 3,
-      updatedAt: Date.now(),
-      mode: opts.mode,
-      thresholds: opts.thresholds,
-      triggers: opts.triggers,
-      strategy: opts.strategy || prev.strategy || DEFAULT_STRATEGY,
-      accountOrder,
-      workspaceRoutes:
-        opts.workspaceRoutes !== undefined
-          ? opts.workspaceRoutes
-          : prev.workspaceRoutes || [],
-      accounts: [...byEmail.values()],
-    };
-    const tmp = policyPath() + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(policy, null, 2), { mode: 0o600 });
-    fs.renameSync(tmp, policyPath());
+      for (const e of opts.removeEmails || []) {
+        byEmail.delete(e);
+      }
+      for (const s of opts.snapshots) {
+        if (!s.email) continue;
+        const fable = s.modelLimits.find((m) => /fable/i.test(m.name))?.percent ?? null;
+        const prevDir = byEmail.get(s.email)?.dir;
+        let dir = s.configDir;
+        // Prefer durable account store over per-window workdir
+        if (dir.includes(`${path.sep}.claude-windows${path.sep}`)) {
+          if (prevDir && !prevDir.includes(`${path.sep}.claude-windows${path.sep}`)) {
+            dir = prevDir;
+          }
+        }
+        const name = opts.nameByEmail?.[s.email] || byEmail.get(s.email)?.name;
+        byEmail.set(s.email, {
+          id: s.email,
+          email: s.email,
+          name,
+          dir,
+          sessionPercent: s.sessionPercent,
+          weeklyPercent: s.weeklyPercent,
+          fablePercent: fable,
+          hot: needsFailover(s, opts.thresholds, opts.triggers),
+          reasons: failoverReasons(s, opts.thresholds, opts.triggers),
+          planLabel: s.planLabel,
+          fetchedAt: s.fetchedAt,
+        });
+      }
+      // Membership is decided by disk, not by this window's globalState view of
+      // the account list (which does not propagate between windows): keep a row
+      // only while its store still holds a credential. A window that has not yet
+      // discovered an account — or forgot it locally — must not delete it out
+      // from under another window that is legitimately still polling it. Explicit
+      // Forget removes rows through removeEmails / prunePolicyEmails.
+      for (const [em, acc] of [...byEmail.entries()]) {
+        if (!acc.dir || !hasCredentials(acc.dir)) byEmail.delete(em);
+      }
+      let accountOrder =
+        opts.accountOrder !== undefined ? opts.accountOrder : prev.accountOrder || [];
+      if (!accountOrder.length) {
+        const legacy: string[] = [];
+        const prevAny = prev as { primaryEmail?: string; secondaryEmail?: string };
+        if (prevAny.primaryEmail) legacy.push(prevAny.primaryEmail);
+        if (prevAny.secondaryEmail) legacy.push(prevAny.secondaryEmail);
+        accountOrder = legacy;
+      }
+      const policy: OrchPolicy = {
+        version: 3,
+        updatedAt: Date.now(),
+        mode: opts.mode,
+        thresholds: opts.thresholds,
+        triggers: opts.triggers,
+        strategy: opts.strategy || prev.strategy || DEFAULT_STRATEGY,
+        accountOrder,
+        workspaceRoutes:
+          opts.workspaceRoutes !== undefined
+            ? opts.workspaceRoutes
+            : prev.workspaceRoutes || [],
+        accounts: [...byEmail.values()],
+      };
+      writeFileAtomic(policyPath(), JSON.stringify(policy, null, 2), { mode: 0o600 });
+    });
   } catch (err) {
     log(`policy write failed: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -803,14 +829,14 @@ export function writePolicyCache(opts: {
 export function prunePolicyEmails(emails: string[]): void {
   if (!emails.length || !fs.existsSync(policyPath())) return;
   try {
-    const prev = JSON.parse(fs.readFileSync(policyPath(), 'utf-8')) as OrchPolicy;
-    const drop = new Set(emails);
-    prev.accounts = (prev.accounts || []).filter((a) => !drop.has(a.email));
-    prev.accountOrder = (prev.accountOrder || []).filter((id) => !drop.has(id));
-    prev.updatedAt = Date.now();
-    const tmp = policyPath() + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(prev, null, 2), { mode: 0o600 });
-    fs.renameSync(tmp, policyPath());
+    withLock(lockFor(policyPath()), () => {
+      const prev = JSON.parse(fs.readFileSync(policyPath(), 'utf-8')) as OrchPolicy;
+      const drop = new Set(emails);
+      prev.accounts = (prev.accounts || []).filter((a) => !drop.has(a.email));
+      prev.accountOrder = (prev.accountOrder || []).filter((id) => !drop.has(id));
+      prev.updatedAt = Date.now();
+      writeFileAtomic(policyPath(), JSON.stringify(prev, null, 2), { mode: 0o600 });
+    });
     log(`policy: pruned ${emails.join(', ')}`);
   } catch (err) {
     log(`policy prune failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -820,6 +846,8 @@ export function prunePolicyEmails(emails: string[]): void {
 export class UsageMonitor {
   private cache = new Map<string, UsageSnapshot | null>();
   private inflight = new Map<string, Promise<UsageSnapshot | null>>();
+  /** Guards refreshAllAccounts against the interval re-entering a live run. */
+  private refreshingAll = false;
   private timer: NodeJS.Timeout | null = null;
   private listeners = new Set<() => void>();
   private currentDir: string | undefined;
@@ -903,7 +931,6 @@ export class UsageMonitor {
   }
 
   private policyWrite(snapshots: UsageSnapshot[]): void {
-    const listed = this.listAccountsToPoll?.() ?? [];
     writePolicyCache({
       mode: this.mode,
       thresholds: this.thresholds,
@@ -913,7 +940,6 @@ export class UsageMonitor {
       workspaceRoutes: this.workspaceRoutes,
       nameByEmail: this.nameByEmail,
       snapshots,
-      retainEmails: listed.length ? listed.map((a) => a.email) : undefined,
     });
   }
 
@@ -970,6 +996,19 @@ export class UsageMonitor {
 
   /** Poll every registered account store and refresh policy (for lowestUsage). */
   async refreshAllAccounts(): Promise<void> {
+    // The 5-min interval must not re-enter a run still in flight: sequential
+    // per-account fetches on a slow/429 network can exceed 5 min, and two runs
+    // would interleave policy.json read-modify-writes.
+    if (this.refreshingAll) return;
+    this.refreshingAll = true;
+    try {
+      await this.refreshAllAccountsOnce();
+    } finally {
+      this.refreshingAll = false;
+    }
+  }
+
+  private async refreshAllAccountsOnce(): Promise<void> {
     const listed = this.listAccountsToPoll?.() ?? [];
     if (!listed.length) {
       await this.refresh(this.currentDir);
