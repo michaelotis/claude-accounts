@@ -95,7 +95,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const registry = new AccountRegistry(context);
   const binding = new WindowBinding(context);
   const wizard = new SetupWizard(registry, binding, context);
-  // 5 min poll — matches camwatch cache TTL; faster polling just 429s the usage API.
+  // 5 min poll — matches the usage cache TTL; faster polling just 429s the usage API.
   const usage = new UsageMonitor(5 * 60_000);
 
   const accountByEmail = (email: string) => {
@@ -402,8 +402,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // used to copy the entire store into each of them.
   //
   // Active accounts + working dirs only. Forgotten / sidecar paths are NOT
-  // migrated into ~/.claude-shared (that rewired Scrypted CamWatch when it
-  // lived under ~/.claude-camwatch). History already in the shared store stays;
+  // migrated into ~/.claude-shared. History already in the shared store stays;
   // forgotten dirs simply keep whatever local or linked layout they already have.
   const allDirs = (): string[] =>
     [defaultSourceDir(), ...registry.list().map((a) => a.dir), ...allWorkingDirs()].filter(
@@ -460,7 +459,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     cmd('claudeProfiles.showLog', () => showLog()),
     cmd('claudeProfiles.refreshUsage', async () => {
       const dir = binding.getEnvDir() ?? defaultSourceDir();
-      // Prefer cache/backoff first (camwatch). Only force network if nothing fresh.
+      // Prefer cache/backoff first. Only force network if nothing fresh.
       let snap = await usage.refresh(dir, false);
       if (!snap || snap.fetchedAt === 0) {
         snap = await usage.refresh(dir, true);

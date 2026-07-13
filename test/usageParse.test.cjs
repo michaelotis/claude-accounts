@@ -120,7 +120,7 @@ describe('buildSnapshot + triggers', () => {
 });
 
 describe('sidecars', () => {
-  it('flags camwatch and reserved names', () => {
+  it('flags extension reserved names', () => {
     const out2 = path.join(os.tmpdir(), `sidecars-${process.pid}.cjs`);
     esbuild.buildSync({
       entryPoints: [path.join(__dirname, '../src/sidecars.ts')],
@@ -130,9 +130,9 @@ describe('sidecars', () => {
       outfile: out2,
     });
     const { isReservedClaudeDirName, isSidecarConfigDir } = require(out2);
-    assert.equal(isReservedClaudeDirName('.claude-camwatch'), true);
     assert.equal(isReservedClaudeDirName('.claude-windows'), true);
     assert.equal(isReservedClaudeDirName('.claude-shared'), true);
+    assert.equal(isReservedClaudeDirName('.claude-vault'), true);
     assert.equal(isReservedClaudeDirName('.claude-work'), false);
     assert.equal(isSidecarConfigDir('/mnt/c/Users/x/.claude'), true);
     fs.unlinkSync(out2);

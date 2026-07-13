@@ -48,24 +48,24 @@ const API_BASE = 'https://api.anthropic.com';
 const USAGE_PATH = '/api/oauth/usage';
 const USAGE_URL = `${API_BASE}${USAGE_PATH}`;
 const FETCH_TIMEOUT_MS = 15_000;
-/** Same public Claude Code OAuth client id camwatch / claude-code CLI use. */
+/** Same public Claude Code OAuth client id the claude-code CLI uses. */
 const CLAUDE_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const CLAUDE_OAUTH_TOKEN_URL = 'https://console.anthropic.com/v1/oauth/token';
-/** CamWatch-style usage cache TTL — avoid hammering /api/oauth/usage (429). */
+/** 5-min cache to avoid hammering /api/oauth/usage (429). */
 export const USAGE_CACHE_TTL_MS = 5 * 60_000;
-/** After a poll 429, do not hit the network again for this long (camwatch stamps lastUsageCheckTs). */
+/** After a poll 429, do not hit the network again for this long. */
 const RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
-/** Refresh access token this long before expiresAt (camwatch). */
+/** Refresh access token this long before expiresAt. */
 const TOKEN_HEADROOM_MS = 60_000;
 
 /**
- * Headers for GET /api/oauth/usage — match camwatch exactly.
- * (Camwatch does NOT send anthropic-version on the usage poll.)
+ * Headers for GET /api/oauth/usage.
+ * (Does not send anthropic-version on the usage poll.)
  */
 const USAGE_HEADERS: Record<string, string> = {
   'anthropic-beta': 'oauth-2025-04-20',
   Accept: 'application/json',
-  'User-Agent': 'claude-accounts/CamWatch-compat',
+  'User-Agent': 'claude-accounts',
 };
 
 /** Policy cache for the CLI orchestrator (JSON). */
@@ -286,7 +286,7 @@ function snapFromPolicy(dir: string, key: string): UsageSnapshot | null {
   }
 }
 
-/** Camwatch default when no prior sample: { session: 0, weekly: 0 }. */
+/** Default when no prior sample: { session: 0, weekly: 0 }. */
 function emptySnap(dir: string, email?: string | null): UsageSnapshot {
   return {
     sessionPercent: 0,
@@ -308,8 +308,8 @@ function emptySnap(dir: string, email?: string | null): UsageSnapshot {
 }
 
 /**
- * Best available meter without network — camwatch on 429 returns previous cache
- * (or zeros), never a hard error toast.
+ * Best available meter without network — on 429 serve the last good meter
+ * (or zeros), never a hard sign-in error.
  */
 function bestEffortSnap(dir: string, key: string): UsageSnapshot {
   return (
@@ -319,11 +319,11 @@ function bestEffortSnap(dir: string, key: string): UsageSnapshot {
   );
 }
 
-/** In-flight token refresh coalesced per config dir (camwatch). */
+/** In-flight token refresh coalesced per config dir. */
 const inflightTokenRefresh = new Map<string, Promise<string>>();
 
 /**
- * Ensure access token is usable before calling usage API — camwatch pattern.
+ * Ensure access token is usable before calling usage API.
  * Refreshes when expiresAt is missing/past or within TOKEN_HEADROOM_MS.
  * Writes the new pair back into this config dir only.
  */
@@ -493,8 +493,8 @@ function classifyHttpError(err: unknown): UsageFetchFailure {
 }
 
 /**
- * Camwatch-style usage poll: returns { status, data } for both success and
- * HTTP errors (does not throw on 429). Throws only on network/timeout.
+ * Usage poll: returns { status, data } for both success and HTTP errors
+ * (does not throw on 429). Throws only on network/timeout.
  */
 async function callUsageApi(token: string): Promise<{ status: number; data: unknown }> {
   const controller = new AbortController();
@@ -522,7 +522,7 @@ async function callUsageApi(token: string): Promise<{ status: number; data: unkn
 }
 
 /**
- * Camwatch checkClaudeUsage sequence:
+ * Usage poll sequence:
  *  1. If cache younger than 5 min → return it (no network)
  *  2. If recent poll 429 backoff → return best-effort (no network)
  *  3. PRELIMINARY: ensureFreshToken() — may POST console.anthropic.com/v1/oauth/token
@@ -531,7 +531,7 @@ async function callUsageApi(token: string): Promise<{ status: number; data: unkn
  *  6. 429 → stamp backoff, return previous cache / policy / zeros (never hard-fail)
  *  7. 200 → cache + return
  *
- * Profile is NOT called on this path (camwatch only hits /usage for the meter).
+ * Profile is NOT called on this path (only /usage for the meter).
  */
 export async function fetchUsageDetailed(
   configDir?: string,
@@ -557,7 +557,7 @@ export async function fetchUsageDetailed(
     }
   }
 
-  // (2) Backoff after poll 429 — camwatch stamps lastUsageCheckTs and skips re-poll
+  // (2) Backoff after poll 429 — skip re-poll until window expires
   if (inRateLimitBackoff(key) && !opts.forceNetwork) {
     const snap = bestEffortSnap(dir, key);
     log(`usage: rate-limit backoff active — serving best-effort for ${key}`);
@@ -593,7 +593,7 @@ export async function fetchUsageDetailed(
     // (4) Usage poll
     let { status, data } = await callUsageApi(token);
 
-    // (5) 401/403 → force refresh + one retry (camwatch)
+    // (5) 401/403 → force refresh + one retry
     if (status === 401 || status === 403) {
       log(`usage: HTTP ${status} after ensureFreshToken — forcing refresh + retry`);
       try {
@@ -631,7 +631,7 @@ export async function fetchUsageDetailed(
       }
     }
 
-    // (6) 429 poll rate-limit — keep previous usage, stamp backoff (camwatch)
+    // (6) 429 poll rate-limit — keep previous usage, stamp backoff
     if (status === 429) {
       stampRateLimitBackoff(key);
       const snap = bestEffortSnap(dir, key);
@@ -668,7 +668,7 @@ export async function fetchUsageDetailed(
     );
     return { ok: true, snap };
   } catch (err) {
-    // Network / timeout — same as camwatch transient: keep cache
+    // Network / timeout — keep last good cache
     log(`usage: network error — ${err instanceof Error ? err.message : String(err)}`);
     return { ok: true, snap: { ...bestEffortSnap(dir, key), configDir: dir } };
   }
@@ -861,7 +861,7 @@ export class UsageMonitor {
   private storeDirForEmail?: (email: string) => string | undefined;
   private lastNotifyKey = '';
 
-  /** Default 5 min — matches USAGE_CACHE_TTL and camwatch background refresh. */
+  /** Default 5 min — matches USAGE_CACHE_TTL. */
   constructor(private readonly intervalMs = USAGE_CACHE_TTL_MS) {}
 
   configure(opts: {
@@ -1014,7 +1014,7 @@ export class UsageMonitor {
       return;
     }
     // One network path per email — duplicate dirs with the same token were
-    // hammering /api/oauth/usage and tripping 429 (camwatch: single check + cache).
+    // hammering /api/oauth/usage and tripping 429.
     const byEmail = new Map<string, { email: string; dir: string; name?: string }>();
     for (const a of listed) {
       if (!a.dir || !fs.existsSync(a.dir)) continue;
