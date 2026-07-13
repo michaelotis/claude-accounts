@@ -46,11 +46,8 @@ describe('writePolicyCache membership (credentials on disk)', () => {
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'ca-policy-'));
     prevHome = process.env.HOME;
     process.env.HOME = tmpHome;
-    // Lock lives under policyDir; create it before first write (lock is mkdir-based).
-    fs.mkdirSync(path.join(tmpHome, '.config', 'claude-accounts'), {
-      recursive: true,
-      mode: 0o700,
-    });
+    // Intentionally do NOT pre-create ~/.config/claude-accounts: the first write
+    // must create it through the lock path, guarding the fresh-machine case.
     keepDir = path.join(tmpHome, '.claude-keep');
     dropDir = path.join(tmpHome, '.claude-drop');
     fs.mkdirSync(keepDir, { recursive: true, mode: 0o700 });

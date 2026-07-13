@@ -94,6 +94,14 @@ function readOwner(lockDir: string): LockOwner | null {
  * than `staleMs` when liveness can't be proven (owner on another host / unknown).
  */
 function tryAcquire(lockDir: string, staleMs: number): boolean {
+  // Ensure the parent exists first: the exclusive create below is NON-recursive
+  // (recursive mkdir does not throw on an existing dir, which would break mutual
+  // exclusion), so on a fresh machine the lock's parent may not exist yet.
+  try {
+    fs.mkdirSync(path.dirname(lockDir), { recursive: true, mode: 0o700 });
+  } catch {
+    /* parent already exists or cannot be created — the mkdir below reports it */
+  }
   try {
     fs.mkdirSync(lockDir); // atomic exclusive create
   } catch (err) {
