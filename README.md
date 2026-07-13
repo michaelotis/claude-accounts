@@ -11,6 +11,7 @@ Multi-account **Claude Code** for **Linux / WSL / Remote-SSH**: live usage (5h /
 | **See usage live** | Status bar: 5h session, 7d all-models, Fable (and other model-scoped limits) |
 | **Failover when an account is hot** | Notify, CLI PATH orchestrator for **new** `claude` processes, optional **post-turn** panel cutover (never mid-stream) |
 | **Keep one conversation history** | Shared history store so multi-account does not fragment or hide past chats |
+| **Keep your MCP servers** | User-scope `mcpServers` from `~/.claude.json` are copied into each per-window config, so they work under isolation |
 
 Upstream credit: [Parallel Accounts](https://github.com/DercasDrol/claude-parallel-profiles) + usage patterns from [Claudemeter](https://github.com/hyperi-io/claudemeter) (both MIT). See `NOTICE`.
 
