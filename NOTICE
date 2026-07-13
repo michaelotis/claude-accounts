@@ -1,0 +1,18 @@
+Claude Accounts + Usage
+======================
+
+This project combines and adapts:
+
+1. Claude Parallel Accounts / claude-parallel-profiles
+   Copyright (c) DercasDrol
+   https://github.com/DercasDrol/claude-parallel-profiles
+   License: MIT
+
+2. Usage OAuth fetch patterns inspired by Claudemeter
+   Copyright (c) 2026 HYPERI PTY LIMITED / hyperi-io
+   https://github.com/hyperi-io/claudemeter
+   License: MIT
+
+Local modifications: workspace-only activation (WSL/Linux), combined status bar
+with 5h/7d/Fable model-scoped limits, discovery denylist for sidecar configs
+(e.g. camwatch), refuse Windows CLAUDE_CONFIG_DIR paths, prefer Linux claude CLI.

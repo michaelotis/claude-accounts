@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# claude-orch — PATH shim: workspace path pins + optional usage failover.
+# CLAUDE_ACCOUNTS_ORCH
+set -euo pipefail
+
+POLICY="${CLAUDE_ACCOUNTS_POLICY:-$HOME/.config/claude-accounts/policy.json}"
+REAL="${CLAUDE_ACCOUNTS_REAL:-}"
+
+resolve_real() {
+  if [ -n "$REAL" ] && [ -x "$REAL" ]; then
+    echo "$REAL"
+    return
+  fi
+  local p
+  while IFS= read -r p; do
+    case "$p" in
+      "$HOME/bin/claude"|"$HOME/.local/bin/claude-orch"|*/claude-orch) continue ;;
+      /mnt/c/*|*/Windows/*) continue ;;
+    esac
+    if [ -x "$p" ]; then
+      if grep -q 'CLAUDE_ACCOUNTS_ORCH' "$p" 2>/dev/null; then continue; fi
+      echo "$p"
+      return
+    fi
+  done < <(type -a claude 2>/dev/null | sed -n 's/.* is //p; s/.* is hashed (\(.*\))/\1/p' || true)
+  for p in "$HOME/.npm-global/bin/claude" "$HOME/.local/bin/claude" /usr/local/bin/claude; do
+    if [ -x "$p" ] && ! grep -q 'CLAUDE_ACCOUNTS_ORCH' "$p" 2>/dev/null; then
+      echo "$p"
+      return
+    fi
+  done
+  echo "claude-orch: could not find real claude binary" >&2
+  exit 127
+}
+
+pick_dir() {
+  # Sticky (multi-invocation agent run)
+  if [ -n "${CLAUDE_ORCH_STICKY_DIR:-}" ] && [ -d "${CLAUDE_ORCH_STICKY_DIR}" ]; then
+    echo "$CLAUDE_ORCH_STICKY_DIR"
+    return
+  fi
+  if [ ! -f "$POLICY" ]; then
+    # No policy: honor existing CLAUDE_CONFIG_DIR if any
+    if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -d "${CLAUDE_CONFIG_DIR}" ]; then
+      echo "$CLAUDE_CONFIG_DIR"
+    fi
+    return
+  fi
+
+  # cwd + policy → chosen dir (node for JSON + longest-prefix match)
+  node -e '
+const fs = require("fs");
+const path = require("path");
+const policyPath = process.argv[1];
+const cwd = process.argv[2] || process.cwd();
+const envDir = process.env.CLAUDE_CONFIG_DIR || "";
+let p;
+try { p = JSON.parse(fs.readFileSync(policyPath, "utf8")); } catch { process.exit(0); }
+
+const accounts = Array.isArray(p.accounts) ? p.accounts : [];
+const thr = p.thresholds || { session: 90, weekly: 90, fable: 90 };
+// Which dimensions force account switch (default: session+weekly, not Fable)
+const trig = Object.assign({ session: true, weekly: true, fable: false }, p.triggers || {});
+const routes = Array.isArray(p.workspaceRoutes) ? p.workspaceRoutes : [];
+
+function byEmail(email) {
+  if (!email) return null;
+  return accounts.find(a => a.email === email) || null;
+}
+/** Account is usable if no *enabled* failover dimension is over threshold. */
+function cool(a) {
+  if (!a) return false;
+  if (trig.session && a.sessionPercent >= thr.session) return false;
+  if (trig.weekly && a.weeklyPercent >= thr.weekly) return false;
+  if (trig.fable && a.fablePercent != null && a.fablePercent >= thr.fable) return false;
+  return true;
+}
+function norm(p) {
+  let n = path.resolve(p || "");
+  while (n.length > 1 && (n.endsWith("/") || n.endsWith(path.sep))) n = n.slice(0, -1);
+  return n;
+}
+function matchRoute(fsPath) {
+  const target = norm(fsPath);
+  let best = null, bestLen = -1;
+  for (const r of routes) {
+    if (!r || !r.pathPrefix || !r.email) continue;
+    const prefix = norm(r.pathPrefix);
+    if (target === prefix || target.startsWith(prefix + path.sep)) {
+      if (prefix.length > bestLen) { best = r; bestLen = prefix.length; }
+    }
+  }
+  return best;
+}
+
+// 1) Hard workspace pin (work tree → work account, personal → personal)
+const route = matchRoute(cwd);
+if (route) {
+  const acc = byEmail(route.email);
+  if (acc && acc.dir && fs.existsSync(acc.dir)) {
+    if (process.env.CLAUDE_ORCH_VERBOSE) {
+      console.error("claude-orch: workspace", cwd, "→", route.email);
+    }
+    process.stdout.write(acc.dir);
+    process.exit(0);
+  }
+  if (process.env.CLAUDE_ORCH_VERBOSE) {
+    console.error("claude-orch: workspace route", route.email, "but no account dir in policy yet");
+  }
+}
+
+// 2) Honor CLAUDE_CONFIG_DIR from VS Code window / caller when no route
+if (envDir && fs.existsSync(envDir)) {
+  process.stdout.write(envDir);
+  process.exit(0);
+}
+
+// 3) Multi-account pick when mode=cli and no hard route
+if (p.mode !== "cli") process.exit(0);
+
+const strategy = p.strategy || "lowestUsage";
+// accountOrder: emails or names; legacy primary/secondary if order empty
+let order = Array.isArray(p.accountOrder) ? p.accountOrder.map(String) : [];
+if (!order.length) {
+  if (p.primaryEmail) order.push(p.primaryEmail);
+  if (p.secondaryEmail) order.push(p.secondaryEmail);
+}
+
+function idOf(a) {
+  return String(a.email || a.id || a.name || "").toLowerCase();
+}
+function usageScore(a) {
+  const parts = [];
+  if (trig.session) parts.push(a.sessionPercent || 0);
+  if (trig.weekly) parts.push(a.weeklyPercent || 0);
+  if (trig.fable) parts.push(a.fablePercent || 0);
+  if (!parts.length) return Math.max(a.sessionPercent || 0, a.weeklyPercent || 0, a.fablePercent || 0);
+  return Math.max(...parts);
+}
+function indexByIds() {
+  const m = new Map();
+  for (const a of accounts) {
+    if (!a || !a.dir) continue;
+    m.set(idOf(a), a);
+    if (a.email) m.set(String(a.email).toLowerCase(), a);
+    if (a.id) m.set(String(a.id).toLowerCase(), a);
+    if (a.name) m.set(String(a.name).toLowerCase(), a);
+  }
+  return m;
+}
+
+let pool = accounts.filter(a => a && a.dir && fs.existsSync(a.dir));
+const byId = indexByIds();
+if (order.length && strategy === "lowestUsage") {
+  const restricted = order.map(id => byId.get(String(id).toLowerCase())).filter(Boolean);
+  if (restricted.length) pool = restricted;
+}
+
+let chosen = null;
+if (strategy === "ordered" && order.length) {
+  for (const id of order) {
+    const a = byId.get(String(id).toLowerCase());
+    if (a && cool(a) && fs.existsSync(a.dir)) { chosen = a; break; }
+  }
+  if (!chosen) {
+    for (const id of order) {
+      const a = byId.get(String(id).toLowerCase());
+      if (a && fs.existsSync(a.dir)) { chosen = a; break; }
+    }
+  }
+}
+if (!chosen) {
+  const coolPool = pool.filter(cool);
+  const rank = (list) => list.slice().sort((a, b) => {
+    const d = usageScore(a) - usageScore(b);
+    return d !== 0 ? d : idOf(a).localeCompare(idOf(b));
+  });
+  const list = coolPool.length ? coolPool : pool;
+  chosen = rank(list)[0] || null;
+}
+
+if (chosen && chosen.dir && fs.existsSync(chosen.dir)) {
+  if (process.env.CLAUDE_ORCH_VERBOSE) {
+    console.error(
+      "claude-orch: pick",
+      strategy,
+      chosen.email || chosen.id,
+      "score=" + usageScore(chosen),
+      cool(chosen) ? "cool" : "hot",
+      (chosen.reasons || []).join(",")
+    );
+  }
+  process.stdout.write(chosen.dir);
+}
+' "$POLICY" "$(pwd -P 2>/dev/null || pwd)"
+}
+
+REAL_BIN="$(resolve_real)"
+DIR="$(pick_dir || true)"
+
+export CLAUDE_ACCOUNTS_ORCH=1
+
+if [ -n "${DIR:-}" ]; then
+  export CLAUDE_CONFIG_DIR="$DIR"
+  if [ "${CLAUDE_ORCH_STICKY:-}" = "1" ]; then
+    export CLAUDE_ORCH_STICKY_DIR="$DIR"
+  fi
+fi
+
+exec "$REAL_BIN" "$@"

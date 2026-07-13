@@ -1,0 +1,205 @@
+{
+  "name": "claude-accounts",
+  "displayName": "Claude Accounts + Usage",
+  "description": "Multi-account Claude Code for WSL/Linux (per-window isolation + shared history) with live usage: 5h, 7d, Fable/Opus/Sonnet — workspace extension, never binds to a Windows Claude binary.",
+  "version": "0.5.0",
+  "publisher": "michaelotis",
+  "icon": "images/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/michaelotis/claude-accounts"
+  },
+  "license": "MIT",
+  "author": {
+    "name": "michaelotis"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "claude",
+    "claude code",
+    "anthropic",
+    "accounts",
+    "multi-account",
+    "usage",
+    "fable",
+    "rate limit",
+    "wsl"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "main": "./dist/extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
+  "capabilities": {
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "Claude accounts live in data directories on the local file system, which virtual workspaces don't have."
+    },
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Works in Restricted Mode. The extension never reads or executes workspace content — it only uses the workspace folder path to tell windows apart."
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeProfiles.switchAccount",
+        "title": "Switch Account for This Window",
+        "category": "Claude Accounts"
+      },
+      {
+        "command": "claudeProfiles.captureAccount",
+        "title": "Save Current Account",
+        "category": "Claude Accounts"
+      },
+      {
+        "command": "claudeProfiles.showStatus",
+        "title": "Account Quick Action",
+        "category": "Claude Accounts"
+      },
+      {
+        "command": "claudeProfiles.removeProfile",
+        "title": "Forget a Saved Account",
+        "category": "Claude Accounts"
+      },
+      {
+        "command": "claudeProfiles.refreshUsage",
+        "title": "Refresh Usage",
+        "category": "Claude Accounts"
+      },
+      {
+        "command": "claudeProfiles.showLog",
+        "title": "Show Log",
+        "category": "Claude Accounts"
+      }
+    ],
+    "configuration": {
+      "title": "Claude Accounts",
+      "properties": {
+        "claudeAccounts.failover.mode": {
+          "type": "string",
+          "enum": [
+            "off",
+            "notify",
+            "cli"
+          ],
+          "default": "notify",
+          "description": "off = meter only. notify = toast when failover-enabled dimensions are hot. cli = PATH orchestrator picks among accounts on new claude invocations (does not reload the VS Code panel)."
+        },
+        "claudeAccounts.failover.strategy": {
+          "type": "string",
+          "enum": [
+            "lowestUsage",
+            "ordered"
+          ],
+          "default": "lowestUsage",
+          "description": "How to choose among N accounts when no workspace route applies. lowestUsage = coolest by max(enabled dimension %%). ordered = walk accountOrder and take the first cool account."
+        },
+        "claudeAccounts.failover.accountOrder": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Account ids (emails or registry names). For lowestUsage: optional pool (empty = all known accounts). For ordered: preference list. Legacy primaryEmail/secondaryEmail are merged into this list if empty."
+        },
+        "claudeAccounts.failover.sessionThreshold": {
+          "type": "number",
+          "default": 90,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "5-hour session usage % threshold (meter + optional failover)."
+        },
+        "claudeAccounts.failover.weeklyThreshold": {
+          "type": "number",
+          "default": 90,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "7-day all-models usage % threshold (meter + optional failover)."
+        },
+        "claudeAccounts.failover.fableThreshold": {
+          "type": "number",
+          "default": 90,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Fable model-scoped weekly % threshold (meter + optional failover)."
+        },
+        "claudeAccounts.failover.onSession": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true, 5h session pressure at/above sessionThreshold triggers account failover/notify. Tracked always in the meter either way."
+        },
+        "claudeAccounts.failover.onWeekly": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true, 7d all-models pressure triggers account failover/notify."
+        },
+        "claudeAccounts.failover.onFable": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, Fable-only pressure triggers account failover. Default false: leave the account alone so Claude Code can fall back to another model (Sonnet/Opus) when Fable is exhausted."
+        },
+        "claudeAccounts.failover.primaryEmail": {
+          "type": "string",
+          "default": "",
+          "description": "Deprecated: use failover.accountOrder. Still prepended to accountOrder when that list is empty."
+        },
+        "claudeAccounts.failover.secondaryEmail": {
+          "type": "string",
+          "default": "",
+          "description": "Deprecated: use failover.accountOrder. Still appended when accountOrder is empty."
+        },
+        "claudeAccounts.workspaceRoutes": {
+          "type": "array",
+          "default": [],
+          "description": "Hard map of directory trees to Claude account emails. Longest matching pathPrefix wins. Under a match, CLI orch and VS Code auto-bind always use that account (no cross-account failover). Example: work monorepos → work email; personal repos → personal email.",
+          "items": {
+            "type": "object",
+            "required": [
+              "pathPrefix",
+              "email"
+            ],
+            "properties": {
+              "pathPrefix": {
+                "type": "string",
+                "description": "Absolute directory path (e.g. /home/YOU/projects/work-client)"
+              },
+              "email": {
+                "type": "string",
+                "description": "Claude account email that must be used under this tree"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "check-types": "tsc --noEmit",
+    "compile": "npm run check-types && node esbuild.js",
+    "test": "node esbuild.js && node --test test/*.test.cjs",
+    "vscode:prepublish": "npm run check-types && node esbuild.js --production",
+    "vscode:uninstall": "node ./uninstall.js",
+    "package": "vsce package --no-dependencies --allow-star-activation",
+    "install-orch": "bash scripts/install-orch.sh",
+    "install-latest": "bash scripts/install-latest.sh",
+    "ship": "bash scripts/ship.sh",
+    "release": "vsce publish"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.0"
+  }
+}

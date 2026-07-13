@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Packaged extension
+*.vsix
+
+# TypeScript incremental compilation cache
+*.tsbuildinfo
+
+# VSCode Extension Host test runner
+.vscode-test/
+
+# Environment / secrets
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
