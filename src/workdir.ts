@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
+import { isDeepStrictEqual } from 'util';
 import { Account, readIdentity, hasCredentials } from './accounts';
 import { log } from './log';
 import { writeFileAtomic, copyFileAtomic } from './fsSafe';
@@ -152,4 +153,58 @@ export function allWorkingDirs(): string[] {
 
 function copyFile(src: string, dst: string): void {
   copyFileAtomic(src, dst, 0o600);
+}
+
+/**
+ * Merges user-scope MCP servers from `~/.claude.json` into a window working dir's
+ * `.claude.json`. Claude Code reads `mcpServers` from `$CLAUDE_CONFIG_DIR/.claude.json`,
+ * not from the home config, so servers configured only at user scope never reach
+ * managed windows unless we copy them in. Home is the source of truth on name clash;
+ * servers present only in the window are preserved. Local/project-scope servers
+ * (`projects[cwd].mcpServers`) are out of scope.
+ */
+export function syncMcpServers(workingDir: string): void {
+  try {
+    // Default dir already uses ~/.claude.json as its runtime config — merging into
+    // itself would be a no-op at best and a self-clobber risk at worst.
+    if (path.normalize(workingDir) === path.normalize(path.join(os.homedir(), '.claude'))) {
+      return;
+    }
+
+    const homeCfg = path.join(os.homedir(), '.claude.json');
+    let homeMcp: Record<string, unknown>;
+    try {
+      const home = JSON.parse(fs.readFileSync(homeCfg, 'utf-8')) as Record<string, unknown>;
+      const m = home.mcpServers;
+      // Only top-level user-scope servers — not projects[cwd].mcpServers.
+      if (!m || typeof m !== 'object' || Array.isArray(m) || Object.keys(m).length === 0) {
+        return;
+      }
+      homeMcp = m as Record<string, unknown>;
+    } catch {
+      return; // absent or unreadable home config — nothing to propagate
+    }
+
+    const file = path.join(workingDir, '.claude.json');
+    if (!fs.existsSync(file)) return;
+    let obj: Record<string, unknown>;
+    try {
+      obj = JSON.parse(fs.readFileSync(file, 'utf-8')) as Record<string, unknown>;
+    } catch {
+      return; // unparseable — dir isn't stocked
+    }
+
+    const existing =
+      obj.mcpServers && typeof obj.mcpServers === 'object' && !Array.isArray(obj.mcpServers)
+        ? (obj.mcpServers as Record<string, unknown>)
+        : {};
+    const merged = { ...existing, ...homeMcp };
+    // Skip the write when nothing changed — Claude Code watches this file.
+    if (isDeepStrictEqual(merged, existing)) return;
+
+    obj.mcpServers = merged;
+    writeFileAtomic(file, JSON.stringify(obj, null, 2), { mode: 0o600 });
+  } catch (err) {
+    log(`workdir: could not sync mcpServers into ${workingDir}: ${(err as Error).message}`);
+  }
 }

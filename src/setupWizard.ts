@@ -8,7 +8,7 @@ import { getAuthStatus, AuthStatus } from './cli';
 import { snapshotAccount, defaultSourceDir, mirrorToDefault } from './capture';
 import { ensureSharedHistory } from './sharedHistory';
 import { signOut, interruptSessions, dirsHoldingToken, looksLikeLogout } from './reclaim';
-import { refreshStore, allWorkingDirs, materialize } from './workdir';
+import { refreshStore, allWorkingDirs, materialize, syncMcpServers } from './workdir';
 import { log } from './log';
 import { matchWorkspaceRoute, type WorkspaceRoute } from './workspaceRoutes';
 
@@ -302,6 +302,8 @@ export class SetupWizard {
     // leaves the user with a signed-out Claude Code. The uninstall hook cannot
     // cover that: VSCode defers it to the next server start, and it may never run.
     mirrorToDefault(dir, readIdentity(dir));
+    // Propagate newly-added home MCP servers into already-stocked windows.
+    syncMcpServers(dir);
     const changed = active !== account.name;
     if (changed) await this.binding.bind(account);
 
