@@ -309,8 +309,9 @@ function restoreDefaultAccount(source, defaultDir, defaultConfig) {
     if (!fs.existsSync(token)) return;
     fs.mkdirSync(defaultDir, { recursive: true, mode: 0o700 });
     const dstToken = path.join(defaultDir, '.credentials.json');
-    fs.copyFileSync(token, dstToken);
-    fs.chmodSync(dstToken, 0o600);
+    const tmpToken = `${dstToken}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpToken, fs.readFileSync(token), { mode: 0o600 });
+    fs.renameSync(tmpToken, dstToken);
 
     const cfgFile = path.join(source, '.claude.json');
     if (!fs.existsSync(cfgFile)) return;
@@ -326,7 +327,7 @@ function restoreDefaultAccount(source, defaultDir, defaultConfig) {
       ...incoming,
       projects: { ...(existing.projects || {}), ...(incoming.projects || {}) },
     };
-    const tmp = `${defaultConfig}.tmp`;
+    const tmp = `${defaultConfig}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, defaultConfig); // atomic: a half-written config bricks Claude Code
   } catch {

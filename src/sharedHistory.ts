@@ -55,18 +55,21 @@ export async function ensureSharedHistory(accountDirs: string[]): Promise<string
 
   // linkDirEntry moves real directories into the store (unlink → rename → rm →
   // symlink); two windows doing that to the same path at once can move or
-  // duplicate a user's transcripts. Serialize behind a single-writer lock. The
-  // migration is idempotent, so a window that waited for the holder then runs it
-  // as a cheap no-op — which is why waiting (rather than skipping) is safe: a
-  // brand-new dir still ends up linked before its panel first reads it. A holder
-  // is only reclaimed when its process is gone, so a long first-time merge is
-  // never interrupted midway.
-  const { result } = await withLockAsync(
+  // duplicate a user's transcripts. Serialize behind a single-writer lock. A
+  // live holder is never reclaimed (its long first-time merge is safe), so a
+  // waiter blocks up to capMs; if the holder is STILL migrating we skip rather
+  // than run concurrently — the holder migrates every dir it saw, and anything
+  // it missed converges on this window's next activation. Never run the merge
+  // unlocked: overlapping movers is exactly the corruption the lock prevents.
+  const { result, locked } = await withLockAsync(
     migrateLockDir(),
     () => migrateAll(accountDirs, store),
-    { staleMs: 10 * 60_000, capMs: 5 * 60_000, stepMs: 500 }
+    { staleMs: 10 * 60_000, capMs: 60_000, stepMs: 500, skipIfUnacquired: true }
   );
-  return result;
+  if (!locked) {
+    return ['shared-history migration deferred: another window holds the migrate lock'];
+  }
+  return result ?? [];
 }
 
 /** Single-writer lock directory guarding the migration into the shared store. */

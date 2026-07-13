@@ -88,45 +88,91 @@ function readOwner(lockDir: string): LockOwner | null {
   }
 }
 
+/** A fresh lock dir has no owner.json for a moment; don't reclaim within this. */
+const OWNER_WRITE_GRACE_MS = 5_000;
+/** A reclaim token from a crashed reclaimer is itself reclaimable after this. */
+const RECLAIM_TOKEN_STALE_MS = 5_000;
+
 /**
- * One acquisition attempt. Returns true if this call now holds `lockDir`.
- * Reclaims a lock whose owner is a dead same-host PID, or (fallback) one older
- * than `staleMs` when liveness can't be proven (owner on another host / unknown).
+ * Whether an existing lock may be reclaimed. A same-host live PID is never stale
+ * (a first-time history merge can hold the lock for minutes); a dead same-host
+ * PID is. A cross-host holder's liveness is unknowable, so fall back to age. A
+ * missing owner.json is ALSO the momentary state of a live acquirer between
+ * creating the dir and writing its owner — so treat that as stale only once the
+ * dir is older than that write gap (i.e. the acquirer crashed). A vanished dir is
+ * NOT stale: the holder released it, so it is free — retry the plain mkdir rather
+ * than reclaim (reclaiming a since-freed path is what raced a fresh acquirer).
+ */
+function isLockStale(lockDir: string, staleMs: number): boolean {
+  const owner = readOwner(lockDir);
+  if (owner) {
+    if (owner.host === os.hostname()) return !processAlive(owner.pid);
+    return Date.now() - owner.at > staleMs;
+  }
+  try {
+    return Date.now() - fs.statSync(lockDir).mtimeMs > OWNER_WRITE_GRACE_MS;
+  } catch {
+    return false; // vanished → free, not stale; the next mkdir will take it cleanly
+  }
+}
+
+/**
+ * One acquisition attempt. Returns true if this call now holds `lockDir`. The
+ * exclusive `mkdir` is the ONLY gate — at most one process ever holds the dir.
+ *
+ * Reclaiming a crashed holder's lock is serialized behind an exclusive `O_EXCL`
+ * token so two reclaimers can never both rm+recreate it, and the reclaimer
+ * re-checks staleness under the token so it cannot delete a lock that turned
+ * live since the first check. A fresh acquirer would itself hit the still-present
+ * dir (and, if it judged it stale, need the token), so the rm+mkdir under the
+ * token cannot steal a live lock; the final mkdir stays exclusive regardless.
  */
 function tryAcquire(lockDir: string, staleMs: number): boolean {
-  // Ensure the parent exists first: the exclusive create below is NON-recursive
-  // (recursive mkdir does not throw on an existing dir, which would break mutual
-  // exclusion), so on a fresh machine the lock's parent may not exist yet.
+  // Parent must exist: the exclusive create below is NON-recursive (recursive
+  // mkdir would not throw on an existing dir, which would break mutual exclusion).
   try {
     fs.mkdirSync(path.dirname(lockDir), { recursive: true, mode: 0o700 });
   } catch {
     /* parent already exists or cannot be created — the mkdir below reports it */
   }
   try {
-    fs.mkdirSync(lockDir); // atomic exclusive create
+    fs.mkdirSync(lockDir); // atomic exclusive create — the one real gate
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-    const owner = readOwner(lockDir);
-    let stale: boolean;
-    if (!owner) {
-      stale = true; // missing / garbled metadata — reclaimable
-    } else if (owner.host === os.hostname()) {
-      // Same host: trust PID liveness and ignore age, so a live holder is never
-      // robbed mid-operation (a first-time history merge can run for minutes).
-      stale = !processAlive(owner.pid);
-    } else {
-      // A holder on another host over a shared $HOME: liveness is unknowable, so
-      // fall back to age.
-      stale = Date.now() - owner.at > staleMs;
-    }
-    if (!stale) return false; // held by a live owner — wait
-    // Reclaim: remove then re-create. The loser of a concurrent reclaim gets
-    // EEXIST on the mkdir below and simply keeps waiting.
+    if (!isLockStale(lockDir, staleMs)) return false; // live holder — wait
+    const token = `${lockDir}.reclaim`;
     try {
-      fs.rmSync(lockDir, { recursive: true, force: true });
-      fs.mkdirSync(lockDir);
+      fs.closeSync(fs.openSync(token, 'wx')); // exclusive: one reclaimer at a time
     } catch {
+      // Token busy — another reclaimer holds it, or one crashed. Clear a stale
+      // token and let a later round retry; never reclaim without the token.
+      try {
+        if (Date.now() - fs.statSync(token).mtimeMs > RECLAIM_TOKEN_STALE_MS) {
+          fs.rmSync(token, { force: true });
+        }
+      } catch {
+        /* ignore */
+      }
       return false;
+    }
+    try {
+      if (!isLockStale(lockDir, staleMs)) return false; // turned live since — abort
+      try {
+        fs.rmSync(lockDir, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+      try {
+        fs.mkdirSync(lockDir);
+      } catch {
+        return false; // a fresh holder took it between the rm and here — wait
+      }
+    } finally {
+      try {
+        fs.rmSync(token, { force: true });
+      } catch {
+        /* ignore */
+      }
     }
   }
   try {
@@ -193,16 +239,19 @@ function delay(ms: number): Promise<void> {
 /**
  * Runs `fn` holding an advisory lock on `<lockDir>`, awaiting the event loop
  * between attempts so a long critical section (e.g. a first-time history merge)
- * never freezes the extension host. Waits up to `capMs` for a live holder, then
- * — because the guarded operation is idempotent and a waiter that never runs
- * would be worse than a rare overlap — proceeds. Returns whether the lock was
- * actually held, so callers can log a best-effort fallback.
+ * never freezes the extension host. Waits up to `capMs` for a live holder.
+ *
+ * If the lock is still not acquired after `capMs`: with `skipIfUnacquired` the
+ * function is NOT run and `{ locked: false }` is returned (use this when running
+ * `fn` concurrently with the real holder would be unsafe, e.g. a filesystem
+ * migration); otherwise `fn` runs unlocked as a best-effort fallback. Returns
+ * whether the lock was actually held.
  */
 export async function withLockAsync<T>(
   lockDir: string,
   fn: () => T | Promise<T>,
-  opts: { staleMs?: number; capMs?: number; stepMs?: number } = {}
-): Promise<{ result: T; locked: boolean }> {
+  opts: { staleMs?: number; capMs?: number; stepMs?: number; skipIfUnacquired?: boolean } = {}
+): Promise<{ result: T | undefined; locked: boolean }> {
   const staleMs = opts.staleMs ?? 5 * 60_000;
   const capMs = opts.capMs ?? 60_000;
   const stepMs = opts.stepMs ?? 250;
@@ -215,6 +264,9 @@ export async function withLockAsync<T>(
     }
     await delay(stepMs);
     waited += stepMs;
+  }
+  if (!held && opts.skipIfUnacquired) {
+    return { result: undefined, locked: false };
   }
   try {
     return { result: await fn(), locked: held };
