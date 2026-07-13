@@ -14,6 +14,7 @@ import { log, showLog } from './log';
 import { UsageMonitor, writePolicyCache, type WorkspaceRoutePolicy } from './usage';
 import { isSidecarConfigDir } from './sidecars';
 import { matchWorkspaceRoute, mergeRoutes, type WorkspaceRoute } from './workspaceRoutes';
+import { IdleCutoverController, type PanelCutoverMode } from './cutover';
 
 /**
  * Everything this extension does rests on Linux semantics that we verified:
@@ -155,17 +156,68 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     });
   };
   applyUsageSettings();
+
+  const cutover = new IdleCutoverController(
+    context,
+    registry,
+    binding,
+    wizard,
+    () => binding.getEnvDir() ?? defaultSourceDir()
+  );
+  // configure cutover from same settings block
+  const syncCutover = () => {
+    const cfg = vscode.workspace.getConfiguration('claudeAccounts');
+    cutover.configure({
+      panelMode: cfg.get<PanelCutoverMode>('failover.panelCutover', 'notify'),
+      thresholds: {
+        session: cfg.get<number>('failover.sessionThreshold', 90),
+        weekly: cfg.get<number>('failover.weeklyThreshold', 90),
+        fable: cfg.get<number>('failover.fableThreshold', 90),
+      },
+      triggers: {
+        session: cfg.get<boolean>('failover.onSession', true),
+        weekly: cfg.get<boolean>('failover.onWeekly', true),
+        fable: cfg.get<boolean>('failover.onFable', false),
+      },
+      strategy: cfg.get<'lowestUsage' | 'ordered'>('failover.strategy', 'lowestUsage'),
+      accountOrder: (cfg.get<string[]>('failover.accountOrder', []) || []).map(String),
+      workspaceRoutes: buildWorkspaceRoutes(),
+    });
+  };
+  syncCutover();
+  cutover.start();
+
   usage.onHot = (snap, reasons) => {
     const mode = usage.getMode();
-    if (mode === 'off') return;
-    const msg = `Claude usage high on ${snap.email ?? 'this account'}: ${reasons.join(', ')}`;
+    const panelMode = vscode.workspace
+      .getConfiguration('claudeAccounts')
+      .get<PanelCutoverMode>('failover.panelCutover', 'notify');
+
+    // Always feed the turn-aware cutover controller (may defer until idle)
+    cutover.notePressure(snap, reasons);
+
+    if (mode === 'off' && panelMode === 'off') return;
+
+    // Immediate toast only when not using idleReload (that path handles messaging)
+    if (panelMode === 'idleReload') {
+      log(`usage hot — idleReload will cut over after turn: ${reasons.join(', ')}`);
+      return;
+    }
     if (mode === 'cli') {
       void vscode.window.showWarningMessage(
-        `${msg}. CLI orchestrator will pick another account on new \`claude\` invocations (unmapped paths only; workspace pins stay put).`
+        `Claude usage high on ${snap.email ?? 'this account'}: ${reasons.join(', ')}. ` +
+          `CLI orch will pick another account on new invocations; panel waits until the turn is idle.`
       );
-    } else {
+      return;
+    }
+    if (panelMode === 'notify' || mode === 'notify') {
       void vscode.window
-        .showWarningMessage(msg, 'Switch account', 'Dismiss')
+        .showWarningMessage(
+          `Claude usage high on ${snap.email ?? 'this account'}: ${reasons.join(', ')}. ` +
+            `Switch after this turn finishes for a clean cutover.`,
+          'Switch account',
+          'Dismiss'
+        )
         .then((pick) => {
           if (pick === 'Switch account') {
             void vscode.commands.executeCommand('claudeProfiles.switchAccount');
@@ -176,8 +228,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const statusBar = new StatusBarManager(registry, binding, usage);
   context.subscriptions.push(
+    { dispose: () => cutover.dispose() },
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('claudeAccounts')) applyUsageSettings();
+      if (e.affectsConfiguration('claudeAccounts')) {
+        applyUsageSettings();
+        syncCutover();
+      }
     })
   );
 

@@ -82,8 +82,20 @@ Applies when **no** workspace route matched the cwd (unmapped paths only). Suppo
 | `failover.mode` | Behavior |
 |-----------------|----------|
 | **`notify`** (default) | Toast when a failover-enabled dimension is hot |
-| **`cli`** | PATH shim picks an account via `failover.strategy` |
-| **`off`** | Meter only |
+| **`cli`** | PATH shim picks an account via `failover.strategy` on **new** CLI processes |
+| **`off`** | Meter only for CLI/policy side |
+
+### Panel cutover (after the turn finishes)
+
+Never switches mid-stream. Watches session file activity + `claude` processes; when settled (~4s quiet):
+
+| `failover.panelCutover` | Behavior |
+|-------------------------|----------|
+| **`notify`** (default) | After idle, offer Switch (or toast while deferred during a turn) |
+| **`idleReload`** | After idle, auto-pick next account (`strategy` / `accountOrder`) and `switchTo` (bind + window reload). **Not** mid-turn. |
+| **`off`** | No panel cutover |
+
+Workspace routes still **block** auto panel cutover (work folder stays on work account).
 
 ### Strategy (how to pick among many accounts)
 

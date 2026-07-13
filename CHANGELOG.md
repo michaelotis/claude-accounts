@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.0
+
+### Added
+- **Post-turn panel cutover**: `failover.panelCutover` = `off` | `notify` | `idleReload`
+- Turn watcher infers IN_TURN from session/project writes + live `claude` processes
+- Pressure during a turn is deferred; cutover only after settle (~4s idle)
+- `idleReload` auto-selects next account (same strategy as CLI) then bind+reload
+- Workspace pins never auto-left by panel cutover
+
 ## 0.5.0
 
 ### Changed

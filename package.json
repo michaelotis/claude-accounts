@@ -2,7 +2,7 @@
   "name": "claude-accounts",
   "displayName": "Claude Accounts + Usage",
   "description": "Multi-account Claude Code for WSL/Linux (per-window isolation + shared history) with live usage: 5h, 7d, Fable/Opus/Sonnet — workspace extension, never binds to a Windows Claude binary.",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publisher": "michaelotis",
   "icon": "images/icon.png",
   "repository": {
@@ -91,7 +91,17 @@
             "cli"
           ],
           "default": "notify",
-          "description": "off = meter only. notify = toast when failover-enabled dimensions are hot. cli = PATH orchestrator picks among accounts on new claude invocations (does not reload the VS Code panel)."
+          "description": "CLI/policy side: off = meter only. notify = toast when hot. cli = PATH orchestrator for new claude processes. Panel cutover is separate (failover.panelCutover)."
+        },
+        "claudeAccounts.failover.panelCutover": {
+          "type": "string",
+          "enum": [
+            "off",
+            "notify",
+            "idleReload"
+          ],
+          "default": "notify",
+          "description": "Panel failover timing: never mid-turn. off = no panel action. notify = after turn settles, offer Switch. idleReload = after turn settles, auto switchTo (bind + window reload) to the next account by strategy. Workspace path pins are never auto-left."
         },
         "claudeAccounts.failover.strategy": {
           "type": "string",
