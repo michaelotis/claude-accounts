@@ -451,22 +451,36 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     cmd('claudeProfiles.showLog', () => showLog()),
     cmd('claudeProfiles.refreshUsage', async () => {
       const dir = binding.getEnvDir() ?? defaultSourceDir();
-      // Force network so the button is not a pure cache read; still falls back
-      // to stale cache on 429 like camwatch.
-      const snap = await usage.refresh(dir, true);
+      // Prefer cache/backoff first (camwatch). Only force network if nothing fresh.
+      let snap = await usage.refresh(dir, false);
+      if (!snap || snap.fetchedAt === 0) {
+        snap = await usage.refresh(dir, true);
+      }
       if (!snap) {
         const detail =
           usage.lastFailure?.message ??
-          'Could not fetch usage for this window (missing token or network). Sign in with Claude Code first.';
+          'Could not fetch usage for this window. Sign in with Claude Code first (/login).';
+        // Never toast bare 429 — fetch layer returns best-effort on poll rate limits.
+        if (usage.lastFailure?.kind === 'rate_limited') {
+          void vscode.window.showInformationMessage(
+            'Usage API is rate-limiting polls; showing last known meter. Try again in a few minutes.'
+          );
+          return;
+        }
         const pick = await vscode.window.showWarningMessage(detail, 'Show log');
         if (pick === 'Show log') showLog();
         return;
       }
       const models = snap.modelLimits.map((m) => `${m.name} ${m.percent}%`).join(', ');
+      const age =
+        snap.fetchedAt > 0
+          ? ` · updated ${Math.max(0, Math.round((Date.now() - snap.fetchedAt) / 1000))}s ago`
+          : ' · cached/placeholder';
       vscode.window.showInformationMessage(
         `Usage: 5h ${snap.sessionPercent}% · 7d ${snap.weeklyPercent}%` +
           (models ? ` · ${models}` : '') +
-          (snap.planLabel ? ` (${snap.planLabel})` : '')
+          (snap.planLabel ? ` (${snap.planLabel})` : '') +
+          age
       );
     }),
     // Only the focused window repairs a dir whose account was replaced by a

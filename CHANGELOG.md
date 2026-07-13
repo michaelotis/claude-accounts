@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.2
+
+### Fixed
+- Usage poll matches **camwatch `checkClaudeUsage` exactly**: (1) 5‑min cache (2) **preliminary `ensureFreshToken`** → `console.anthropic.com/v1/oauth/token` when near expiry (3) single `GET /api/oauth/usage` with camwatch headers (4) 401 → force-refresh once (5) **429 → backoff + last cache / policy / zeros**, never a hard “sign in” toast
+- No parallel `/profile` call on the usage path (was doubling request pressure)
+- Refresh Usage prefers cache; falls back to policy.json account rows when usage-cache is empty
+
 ## 0.8.1
 
 ### Fixed

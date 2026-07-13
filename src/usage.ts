@@ -45,22 +45,27 @@ export {
 };
 
 const API_BASE = 'https://api.anthropic.com';
-const USAGE_URL = `${API_BASE}/api/oauth/usage`;
-const PROFILE_URL = `${API_BASE}/api/oauth/profile`;
+const USAGE_PATH = '/api/oauth/usage';
+const USAGE_URL = `${API_BASE}${USAGE_PATH}`;
 const FETCH_TIMEOUT_MS = 15_000;
 /** Same public Claude Code OAuth client id camwatch / claude-code CLI use. */
 const CLAUDE_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const CLAUDE_OAUTH_TOKEN_URL = 'https://console.anthropic.com/v1/oauth/token';
 /** CamWatch-style usage cache TTL — avoid hammering /api/oauth/usage (429). */
 export const USAGE_CACHE_TTL_MS = 5 * 60_000;
+/** After a poll 429, do not hit the network again for this long (camwatch stamps lastUsageCheckTs). */
+const RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
 /** Refresh access token this long before expiresAt (camwatch). */
 const TOKEN_HEADROOM_MS = 60_000;
 
-const OAUTH_HEADERS: Record<string, string> = {
+/**
+ * Headers for GET /api/oauth/usage — match camwatch exactly.
+ * (Camwatch does NOT send anthropic-version on the usage poll.)
+ */
+const USAGE_HEADERS: Record<string, string> = {
   'anthropic-beta': 'oauth-2025-04-20',
-  'anthropic-version': '2023-06-01',
   Accept: 'application/json',
-  'User-Agent': 'claude-accounts (oauth-usage)',
+  'User-Agent': 'claude-accounts/CamWatch-compat',
 };
 
 /** Policy cache for the CLI orchestrator (JSON). */
@@ -153,6 +158,51 @@ function writeUsageCache(cache: UsageCacheFile): void {
   }
 }
 
+interface UsageMeta {
+  /** Wall clock of last poll HTTP 429 — drives network backoff. */
+  lastRateLimitAt?: number;
+}
+
+function metaPath(): string {
+  return path.join(policyDir(), 'usage-meta.json');
+}
+
+function readMeta(): UsageMeta {
+  try {
+    return JSON.parse(fs.readFileSync(metaPath(), 'utf-8')) as UsageMeta;
+  } catch {
+    return {};
+  }
+}
+
+function writeMeta(m: UsageMeta): void {
+  try {
+    fs.mkdirSync(policyDir(), { recursive: true, mode: 0o700 });
+    const tmp = `${metaPath()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(m, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, metaPath());
+  } catch {
+    /* ignore */
+  }
+}
+
+function inRateLimitBackoff(): boolean {
+  const at = readMeta().lastRateLimitAt || 0;
+  return at > 0 && Date.now() - at < RATE_LIMIT_BACKOFF_MS;
+}
+
+function stampRateLimitBackoff(): void {
+  writeMeta({ ...readMeta(), lastRateLimitAt: Date.now() });
+}
+
+function clearRateLimitBackoff(): void {
+  const m = readMeta();
+  if (m.lastRateLimitAt) {
+    delete m.lastRateLimitAt;
+    writeMeta(m);
+  }
+}
+
 function getCachedSnap(key: string, maxAgeMs: number): UsageSnapshot | null {
   const entry = readUsageCache().entries[key];
   if (!entry?.snap || typeof entry.fetchedAt !== 'number') return null;
@@ -169,6 +219,84 @@ function putCachedSnap(key: string, snap: UsageSnapshot): void {
   const cache = readUsageCache();
   cache.entries[key] = { key, fetchedAt: Date.now(), snap };
   writeUsageCache(cache);
+}
+
+/** Fall back to policy.json account rows (last successful poll from any version). */
+function snapFromPolicy(dir: string, key: string): UsageSnapshot | null {
+  try {
+    if (!fs.existsSync(policyPath())) return null;
+    const pol = JSON.parse(fs.readFileSync(policyPath(), 'utf-8')) as {
+      accounts?: Array<{
+        email?: string;
+        sessionPercent?: number;
+        weeklyPercent?: number;
+        fablePercent?: number | null;
+        planLabel?: string | null;
+        fetchedAt?: number;
+      }>;
+    };
+    const email =
+      key.startsWith('email:') ? key.slice('email:'.length) : readIdentity(dir)?.email?.toLowerCase();
+    if (!email || !pol.accounts?.length) return null;
+    const row = pol.accounts.find((a) => (a.email || '').toLowerCase() === email);
+    if (!row) return null;
+    const modelLimits =
+      row.fablePercent != null
+        ? [{ name: 'Fable', percent: row.fablePercent, resetsAt: null, kind: 'fable' }]
+        : [];
+    return {
+      sessionPercent: row.sessionPercent ?? 0,
+      sessionResetsAt: null,
+      weeklyPercent: row.weeklyPercent ?? 0,
+      weeklyResetsAt: null,
+      opusPercent: null,
+      opusResetsAt: null,
+      sonnetPercent: null,
+      sonnetResetsAt: null,
+      modelLimits,
+      overagePercent: null,
+      email: row.email ?? email,
+      orgName: null,
+      planLabel: row.planLabel ?? null,
+      fetchedAt: row.fetchedAt ?? 0,
+      configDir: dir,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Camwatch default when no prior sample: { session: 0, weekly: 0 }. */
+function emptySnap(dir: string, email?: string | null): UsageSnapshot {
+  return {
+    sessionPercent: 0,
+    sessionResetsAt: null,
+    weeklyPercent: 0,
+    weeklyResetsAt: null,
+    opusPercent: null,
+    opusResetsAt: null,
+    sonnetPercent: null,
+    sonnetResetsAt: null,
+    modelLimits: [],
+    overagePercent: null,
+    email: email ?? readIdentity(dir)?.email ?? null,
+    orgName: null,
+    planLabel: null,
+    fetchedAt: 0,
+    configDir: dir,
+  };
+}
+
+/**
+ * Best available meter without network — camwatch on 429 returns previous cache
+ * (or zeros), never a hard error toast.
+ */
+function bestEffortSnap(dir: string, key: string): UsageSnapshot {
+  return (
+    getStaleSnap(key) ||
+    snapFromPolicy(dir, key) ||
+    emptySnap(dir, key.startsWith('email:') ? key.slice(6) : undefined)
+  );
 }
 
 /** In-flight token refresh coalesced per config dir (camwatch). */
@@ -340,40 +468,46 @@ function classifyHttpError(err: unknown): UsageFetchFailure {
   return { kind: 'unknown', message: `Usage fetch failed: ${msg}`, status };
 }
 
-async function getJson(url: string, token: string): Promise<unknown> {
+/**
+ * Camwatch-style usage poll: returns { status, data } for both success and
+ * HTTP errors (does not throw on 429). Throws only on network/timeout.
+ */
+async function callUsageApi(token: string): Promise<{ status: number; data: unknown }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch(url, {
+    const res = await fetch(USAGE_URL, {
       method: 'GET',
-      headers: { ...OAUTH_HEADERS, Authorization: `Bearer ${token}` },
+      headers: { ...USAGE_HEADERS, Authorization: `Bearer ${token}` },
       redirect: 'error',
       signal: controller.signal,
     });
-    if (res.status === 401 || res.status === 403) {
-      const err = new Error('TOKEN_REJECTED');
-      (err as Error & { status: number }).status = res.status;
-      throw err;
+    const text = await res.text();
+    const status = res.status;
+    if (status === 200) {
+      try {
+        return { status, data: JSON.parse(text) };
+      } catch {
+        throw new Error('Invalid JSON from usage API');
+      }
     }
-    if (res.status === 429) {
-      const err = new Error('RATE_LIMITED');
-      (err as Error & { status: number }).status = 429;
-      throw err;
-    }
-    if (!res.ok) throw new Error(`API_ERROR_${res.status}`);
-    return res.json();
+    return { status, data: text.slice(0, 200) };
   } finally {
     clearTimeout(timer);
   }
 }
 
 /**
- * Fetch usage the camwatch/claudemeter way:
- *  1. Serve disk cache if younger than USAGE_CACHE_TTL_MS (no network)
- *  2. ensureFreshToken (refresh when near expiry — camwatch)
- *  3. GET /api/oauth/usage (profile is secondary; failure does not sink usage)
- *  4. On 401, force-refresh once and retry
- *  5. On 429/network, return previous cached usage (not “signed out”)
+ * Camwatch checkClaudeUsage sequence:
+ *  1. If cache younger than 5 min → return it (no network)
+ *  2. If recent poll 429 backoff → return best-effort (no network)
+ *  3. PRELIMINARY: ensureFreshToken() — may POST console.anthropic.com/v1/oauth/token
+ *  4. GET api.anthropic.com/api/oauth/usage
+ *  5. 401/403 → force token refresh once, retry usage
+ *  6. 429 → stamp backoff, return previous cache / policy / zeros (never hard-fail)
+ *  7. 200 → cache + return
+ *
+ * Profile is NOT called on this path (camwatch only hits /usage for the meter).
  */
 export async function fetchUsageDetailed(
   configDir?: string,
@@ -389,29 +523,32 @@ export async function fetchUsageDetailed(
   }
 
   const key = cacheKeyForDir(dir);
+
+  // (1) Fresh cache
   if (!opts.forceNetwork) {
     const fresh = getCachedSnap(key, USAGE_CACHE_TTL_MS);
     if (fresh) {
-      log(`usage: cache hit ${key} (age ok)`);
+      log(`usage: cache hit ${key}`);
       return { ok: true, snap: { ...fresh, configDir: dir } };
     }
   }
 
+  // (2) Backoff after poll 429 — camwatch stamps lastUsageCheckTs and skips re-poll
+  if (inRateLimitBackoff() && !opts.forceNetwork) {
+    const snap = bestEffortSnap(dir, key);
+    log(`usage: rate-limit backoff active — serving best-effort for ${key}`);
+    return { ok: true, snap: { ...snap, configDir: dir } };
+  }
+
+  // (3) PRELIMINARY call path: ensureFreshToken (OAuth refresh when near expiry)
   let token: string;
   try {
     token = await ensureFreshToken(dir, false);
   } catch (err) {
-    const f = classifyHttpError(err);
     const kind =
       typeof err === 'object' && err && 'kind' in err
         ? (err as { kind: UsageFetchKind }).kind
-        : f.kind;
-    // Prefer stale meter over blank gauges (camwatch / claudemeter).
-    const stale = getStaleSnap(key);
-    if (stale && kind !== 'token_rejected' && kind !== 'no_token') {
-      log(`usage: token ensure failed (${kind}) — serving stale cache for ${key}`);
-      return { ok: true, snap: { ...stale, configDir: dir } };
-    }
+        : 'unknown';
     if (kind === 'no_token') {
       return failure(
         'no_token',
@@ -421,82 +558,83 @@ export async function fetchUsageDetailed(
     if (kind === 'token_rejected') {
       return failure(
         'token_rejected',
-        'Claude rejected this window’s token. Sign in again with Claude Code (/login).'
+        'Claude rejected this window’s refresh token. Sign in again with Claude Code (/login).'
       );
     }
-    log(`usage: ensureFreshToken failed: ${err instanceof Error ? err.message : String(err)}`);
-    return { ok: false, failure: f };
+    log(`usage: ensureFreshToken failed — ${err instanceof Error ? err.message : String(err)}`);
+    return { ok: true, snap: { ...bestEffortSnap(dir, key), configDir: dir } };
   }
 
-  /** Usage first only (camwatch) — do not double-hit the quota with parallel profile. */
-  const callUsageOnly = async (tok: string) => {
-    try {
-      return { ok: true as const, usage: await getJson(USAGE_URL, tok) };
-    } catch (reason) {
-      return { ok: false as const, reason };
-    }
-  };
-
   try {
-    let usageCall = await callUsageOnly(token);
+    // (4) Usage poll
+    let { status, data } = await callUsageApi(token);
 
-    if (!usageCall.ok) {
-      const f = classifyHttpError(usageCall.reason);
-      if (f.kind === 'token_rejected') {
-        // Camwatch: force refresh once, then retry.
-        log(`usage: ${f.status} — forcing token refresh and retry`);
-        try {
-          const creds = readCreds(dir);
-          if (creds?.claudeAiOauth) {
-            creds.claudeAiOauth.expiresAt = 0;
-            writeCredsAtomic(dir, creds);
-          }
-          token = await ensureFreshToken(dir, true);
-          usageCall = await callUsageOnly(token);
-        } catch (retryErr) {
-          const rf = classifyHttpError(retryErr);
-          const stale = getStaleSnap(key);
-          if (stale && rf.kind !== 'token_rejected') {
-            return { ok: true, snap: { ...stale, configDir: dir } };
-          }
-          return {
-            ok: false,
-            failure:
-              rf.kind === 'token_rejected'
-                ? {
-                    kind: 'token_rejected',
-                    message:
-                      'Claude rejected this window’s token after refresh. Sign in again with Claude Code (/login).',
-                    status: rf.status,
-                  }
-                : rf,
-          };
+    // (5) 401/403 → force refresh + one retry (camwatch)
+    if (status === 401 || status === 403) {
+      log(`usage: HTTP ${status} after ensureFreshToken — forcing refresh + retry`);
+      try {
+        const creds = readCreds(dir);
+        if (creds?.claudeAiOauth) {
+          creds.claudeAiOauth.expiresAt = 0;
+          writeCredsAtomic(dir, creds);
         }
+        token = await ensureFreshToken(dir, true);
+        ({ status, data } = await callUsageApi(token));
+      } catch (retryErr) {
+        log(
+          `usage: forced refresh failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`
+        );
+        return {
+          ok: false,
+          failure: {
+            kind: 'token_rejected',
+            message:
+              'Claude rejected this window’s token after refresh. Sign in again with Claude Code (/login).',
+            status,
+          },
+        };
+      }
+      if (status === 401 || status === 403) {
+        return {
+          ok: false,
+          failure: {
+            kind: 'token_rejected',
+            message:
+              'Claude rejected this window’s token after refresh. Sign in again with Claude Code (/login).',
+            status,
+          },
+        };
       }
     }
 
-    if (!usageCall.ok) {
-      const f = classifyHttpError(usageCall.reason);
-      log(`usage: fetch failed (${f.kind}): ${f.message}`);
-      // 429 / timeout / network → keep previous meter (camwatch).
-      if (f.kind === 'rate_limited' || f.kind === 'network' || f.kind === 'api_error') {
-        const stale = getStaleSnap(key);
-        if (stale) {
-          log(`usage: ${f.kind} — serving stale cache for ${key}`);
-          return { ok: true, snap: { ...stale, configDir: dir } };
-        }
-      }
-      return { ok: false, failure: f };
+    // (6) 429 poll rate-limit — keep previous usage, stamp backoff (camwatch)
+    if (status === 429) {
+      stampRateLimitBackoff();
+      const snap = bestEffortSnap(dir, key);
+      log(
+        `usage: HTTP 429 (poll rate-limit) — serving best-effort (5h ${snap.sessionPercent}% 7d ${snap.weeklyPercent}%), NOT treating as sign-out`
+      );
+      return { ok: true, snap: { ...snap, configDir: dir } };
     }
 
-    const usage = usageCall.usage as Record<string, unknown>;
-    // Profile is secondary (claudemeter): only after usage succeeds; never sink gauges.
-    let profile: unknown = null;
-    try {
-      profile = await getJson(PROFILE_URL, token);
-    } catch {
-      /* optional */
+    if (status !== 200) {
+      log(`usage: HTTP ${status} — serving best-effort`);
+      return { ok: true, snap: { ...bestEffortSnap(dir, key), configDir: dir } };
     }
+
+    // (7) Success
+    clearRateLimitBackoff();
+    const usage = data as Record<string, unknown>;
+    // Identity from dir (no second profile HTTP call — avoids extra 429s)
+    const identity = readIdentity(dir);
+    const profile = identity
+      ? {
+          account: { email: identity.email, display_name: identity.displayName },
+          organization: identity.organizationName
+            ? { name: identity.organizationName }
+            : undefined,
+        }
+      : null;
     const snap = buildSnapshot(usage, profile, dir);
     putCachedSnap(key, snap);
     log(
@@ -506,13 +644,9 @@ export async function fetchUsageDetailed(
     );
     return { ok: true, snap };
   } catch (err) {
-    const f = classifyHttpError(err);
-    log(`usage: error (${f.kind}): ${f.message}`);
-    const stale = getStaleSnap(key);
-    if (stale && f.kind !== 'token_rejected' && f.kind !== 'no_token') {
-      return { ok: true, snap: { ...stale, configDir: dir } };
-    }
-    return { ok: false, failure: f };
+    // Network / timeout — same as camwatch transient: keep cache
+    log(`usage: network error — ${err instanceof Error ? err.message : String(err)}`);
+    return { ok: true, snap: { ...bestEffortSnap(dir, key), configDir: dir } };
   }
 }
 
