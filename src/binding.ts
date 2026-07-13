@@ -5,6 +5,7 @@ import { materialize, windowWorkingDir } from './workdir';
 import { ensureSharedHistory } from './sharedHistory';
 import { log } from './log';
 import { emailsEqual, pickStoredAccountName } from './workspaceRoutes';
+import { looksLikeLogout } from './reclaim';
 
 /** Result of a sync activation bind attempt. */
 export interface ApplyStoredResult {
@@ -221,7 +222,7 @@ export class WindowBinding {
     // account — and fail to resume/fork any conversation recorded before the
     // bind ("Session … not found", the v1.2.0/1.2.1 incident). The activation
     // pass only covers dirs that exist at activation; this covers the gap.
-    ensureSharedHistory([dir]);
+    await ensureSharedHistory([dir]);
     log(`bind: ${account.name} → ${dir} (was ${process.env[ENV_VAR] ?? '(default)'})`);
     process.env[ENV_VAR] = dir;
     this.applyTerminalEnv(dir);
@@ -277,13 +278,14 @@ export class WindowBinding {
       return undefined;
     }
 
-    // Folder route / learned pin: force-stock empty dirs. A real /logout forgets
-    // the account from the registry, so a still-resolvable preferred account is
-    // not resurrecting a revoked token — it is restocking a pin (or a different
-    // account than the one that emptied the dir). Non-preferred keeps the
-    // empty-dir guard so voluntary logout of the active account is not undone.
+    // Folder route / learned pin: force-stock an empty dir — EXCEPT when that dir
+    // is the fingerprint of a real /logout, where refilling it from the store
+    // would resurrect a token the server has revoked. In that case leave it empty
+    // and still point env at it, so reconcile concludes the logout and forgets the
+    // account rather than silently signing back in.
+    const isLogout = looksLikeLogout(dir);
     const fromPreferred = Boolean(preferredName && account.name === preferredName);
-    materialize(account, dir, fromPreferred);
+    materialize(account, dir, fromPreferred && !isLogout);
 
     const dirEmail = readIdentity(dir)?.email;
     const accountEmail = account.email ?? readIdentity(account.dir)?.email;
@@ -291,9 +293,9 @@ export class WindowBinding {
       hasCredentials(dir) &&
       (!dirEmail || !accountEmail || emailsEqual(dirEmail, accountEmail));
 
-    if (stocked || !fromPreferred) {
-      // Always set env when stocked. For non-preferred empty logout, still point
-      // at the working dir so reconcile can handleLoggedOut.
+    if (stocked || !fromPreferred || isLogout) {
+      // Set env when stocked; also for an empty non-preferred dir or a logged-out
+      // preferred dir, so reconcile sees this dir and can handleLoggedOut.
       process.env[ENV_VAR] = dir;
       this.applyTerminalEnv(dir);
     } else {

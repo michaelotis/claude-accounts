@@ -107,10 +107,19 @@ function tryAcquire(lockDir: string, staleMs: number): boolean {
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
     const owner = readOwner(lockDir);
-    const sameHost = owner?.host === os.hostname();
-    const dead = owner ? sameHost && !processAlive(owner.pid) : true;
-    const old = owner ? Date.now() - owner.at > staleMs : true;
-    if (!dead && !old) return false; // held by a live/recent owner — wait
+    let stale: boolean;
+    if (!owner) {
+      stale = true; // missing / garbled metadata — reclaimable
+    } else if (owner.host === os.hostname()) {
+      // Same host: trust PID liveness and ignore age, so a live holder is never
+      // robbed mid-operation (a first-time history merge can run for minutes).
+      stale = !processAlive(owner.pid);
+    } else {
+      // A holder on another host over a shared $HOME: liveness is unknowable, so
+      // fall back to age.
+      stale = Date.now() - owner.at > staleMs;
+    }
+    if (!stale) return false; // held by a live owner — wait
     // Reclaim: remove then re-create. The loser of a concurrent reclaim gets
     // EEXIST on the mkdir below and simply keeps waiting.
     try {

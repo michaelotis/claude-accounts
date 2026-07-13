@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { log } from './log';
-import { readIdentity } from './accounts';
+import { readIdentity, hasCredentials } from './accounts';
 import { writeFileAtomic } from './fsSafe';
 
 /**
@@ -24,6 +24,24 @@ import { writeFileAtomic } from './fsSafe';
 /** The one sensitive file inside an account dir: the OAuth token. */
 export function tokenPath(dir: string): string {
   return path.join(dir, '.credentials.json');
+}
+
+/**
+ * The fingerprint a real `/logout` leaves in a dir: the token is gone and the
+ * identity has been cleared from the config, but the config file itself is still
+ * there. Distinguishes a genuine logout from a never-stocked dir (no config at
+ * all) and from an interrupted copy (identity still present). Only decisive at
+ * activation, where an in-flight OAuth sign-in — which also leaves the dir
+ * tokenless — cannot be mistaken for it, because a sign-in cannot survive the
+ * window reload. Restocking a dir in this state would resurrect a token the
+ * server has already revoked.
+ */
+export function looksLikeLogout(dir: string): boolean {
+  return (
+    !hasCredentials(dir) &&
+    !readIdentity(dir) &&
+    fs.existsSync(path.join(dir, '.claude.json'))
+  );
 }
 
 /**

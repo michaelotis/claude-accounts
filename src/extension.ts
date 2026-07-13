@@ -31,6 +31,7 @@ import {
   type WorkspaceRoute,
 } from './workspaceRoutes';
 import { IdleCutoverController, type PanelCutoverMode } from './cutover';
+import { looksLikeLogout } from './reclaim';
 
 /**
  * Everything this extension does rests on Linux semantics that we verified:
@@ -350,8 +351,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const dirEmail =
       hasCredentials(workDir) ? readIdentity(workDir)?.email : undefined;
     const routeOk = emailsEqual(dirEmail, preferredAfter.email);
-    if (!routeOk) {
-      // Dir not stocked with the pin (empty after logout, late discovery, or
+    if (!routeOk && looksLikeLogout(workDir)) {
+      // The pinned account was logged out in this window. Do NOT restock it —
+      // refilling from the store would resurrect a token the server revoked.
+      // Leave the dir empty; reconcile (at activation, below) concludes the
+      // logout, forgets the account, and prompts a fresh sign-in.
+      log(
+        `workspace route ${preferredAfter.folderPath}: pinned ${preferredAfter.email} was logged out here — not restocking`
+      );
+    } else if (!routeOk) {
+      // Dir not stocked with the pin (empty first stock, late discovery, or
       // wrong account). Force bind + reload; metered so a bug cannot loop.
       log(
         `workspace route reload: ${preferredAfter.folderPath} → ${preferredAfter.email} (${preferredAfter.account.name}) ` +
@@ -362,12 +371,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         notice: `This folder is pinned to ${preferredAfter.email}.`,
       });
       return; // activation continues after reload
+    } else {
+      // Dir already correct — persist folder→account without reload.
+      if (binding.getActiveName() !== preferredAfter.account.name) {
+        await binding.remember(preferredAfter.account);
+      }
+      bound = preferredAfter.account;
     }
-    // Dir already correct — persist folder→account without reload.
-    if (binding.getActiveName() !== preferredAfter.account.name) {
-      await binding.remember(preferredAfter.account);
-    }
-    bound = preferredAfter.account;
   } else if (preferredAfter && !preferredAfter.account) {
     void vscode.window.showWarningMessage(
       `Claude Accounts: this folder is mapped to ${preferredAfter.email}, but that account is not saved yet. ` +
@@ -399,7 +409,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     [defaultSourceDir(), ...registry.list().map((a) => a.dir), ...allWorkingDirs()].filter(
       (d) => !isSidecarConfigDir(d)
     );
-  const warnings = ensureSharedHistory(allDirs());
+  const warnings = await ensureSharedHistory(allDirs());
   if (warnings.length > 0) {
     vscode.window.showWarningMessage(
       `Claude Accounts: shared history migration hit ${warnings.length} issue(s); ` +

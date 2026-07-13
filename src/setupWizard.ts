@@ -7,7 +7,7 @@ import { WindowBinding } from './binding';
 import { getAuthStatus, AuthStatus } from './cli';
 import { snapshotAccount, defaultSourceDir, mirrorToDefault } from './capture';
 import { ensureSharedHistory } from './sharedHistory';
-import { signOut, interruptSessions, dirsHoldingToken } from './reclaim';
+import { signOut, interruptSessions, dirsHoldingToken, looksLikeLogout } from './reclaim';
 import { refreshStore, allWorkingDirs, materialize } from './workdir';
 import { log } from './log';
 import { matchWorkspaceRoute, type WorkspaceRoute } from './workspaceRoutes';
@@ -190,7 +190,7 @@ export class SetupWizard {
       vscode.window.showErrorMessage(`Could not save account: ${(err as Error).message}`);
       return undefined;
     }
-    ensureSharedHistory([target.dir]);
+    await ensureSharedHistory([target.dir]);
     target.email = status.email;
     await this.registry.add(target);
     await this.binding.bind(target);
@@ -357,9 +357,7 @@ export class SetupWizard {
     // a logout but a working copy that failed to stock (an interrupted copy, a
     // full disk). The store is intact, so restock it; concluding "logout" here
     // would forget — and sign out — a perfectly good account over an IO hiccup.
-    const looksLikeRealLogout =
-      !readIdentity(dir) && fs.existsSync(path.join(dir, '.claude.json'));
-    if (!looksLikeRealLogout && hasCredentials(account.dir)) {
+    if (!looksLikeLogout(dir) && hasCredentials(account.dir)) {
       log(`working dir ${dir} lost its token but kept its identity — restocking from ${account.name}`);
       materialize(account, dir, true);
       await this.requestWindowReload(
