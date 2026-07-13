@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.0
+
+### Fixed (review Top 5)
+- Panel cutover pressure no longer gated on `failover.mode` (works with mode=off)
+- `idleReload` only switches to a **cool** target; 5-minute auto-reload cooldown
+- Turn detection: file activity on **this** config dir only (not shared store / process-alone)
+- Poll **all** registry accounts into policy; prune on Forget; fetch-fail ≠ 100%
+- Shared `selectFailoverAccount` via `scripts/pick-account.cjs` + built `usageParse.cjs`
+- `syncCutover` uses same accountOrder merge as usage settings
+
 ## 0.6.0
 
 ### Added

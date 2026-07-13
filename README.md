@@ -92,10 +92,11 @@ Never switches mid-stream. Watches session file activity + `claude` processes; w
 | `failover.panelCutover` | Behavior |
 |-------------------------|----------|
 | **`notify`** (default) | After idle, offer Switch (or toast while deferred during a turn) |
-| **`idleReload`** | After idle, auto-pick next account (`strategy` / `accountOrder`) and `switchTo` (bind + window reload). **Not** mid-turn. |
+| **`idleReload`** | After idle, auto-pick next **cool** account and `switchTo` (bind + window reload). 5‑min cooldown. **Not** mid-turn. |
 | **`off`** | No panel cutover |
 
-Workspace routes still **block** auto panel cutover (work folder stays on work account).
+Workspace routes still **block** auto panel cutover (work folder stays on work account).  
+Turn idle is inferred from **this window’s** session/project file activity (not other windows; process-alone is not “busy”).
 
 ### Strategy (how to pick among many accounts)
 

@@ -463,6 +463,14 @@ export class SetupWizard {
       await this.binding.forget(copy);
     }
 
+    // Drop forgotten email from CLI policy cache so orch cannot pick it
+    try {
+      const { prunePolicyEmails } = await import('./usage');
+      prunePolicyEmails([email]);
+    } catch {
+      /* non-fatal */
+    }
+
     // Sign the account out of EVERY dir holding it: its store, the default dir
     // (where a sign-in may have left the original), and every window's working
     // copy. Missing any one of them leaves the account still signed in somewhere,

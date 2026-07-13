@@ -5,6 +5,15 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${HOME}/bin"
 mkdir -p "$BIN"
 install -m 755 "$ROOT/scripts/claude-orch" "$BIN/claude-orch"
+mkdir -p "$BIN/claude-accounts-lib"
+# Shared pick + pure selection (built by npm run compile)
+if [ -f "$ROOT/scripts/pick-account.cjs" ]; then
+  install -m 644 "$ROOT/scripts/pick-account.cjs" "$BIN/claude-accounts-lib/pick-account.cjs"
+fi
+if [ -f "$ROOT/scripts/lib/usageParse.cjs" ]; then
+  mkdir -p "$BIN/claude-accounts-lib/lib"
+  install -m 644 "$ROOT/scripts/lib/usageParse.cjs" "$BIN/claude-accounts-lib/lib/usageParse.cjs"
+fi
 # Thin wrapper named `claude` that always goes through orch
 cat > "$BIN/claude" <<'EOF'
 #!/usr/bin/env bash
@@ -12,6 +21,9 @@ cat > "$BIN/claude" <<'EOF'
 exec "$(dirname "$0")/claude-orch" "$@"
 EOF
 chmod 755 "$BIN/claude"
+# Point orch at installed pick-account when run from ~/bin
+# (claude-orch searches fixed paths; also symlink for discovery)
+ln -sfn "$BIN/claude-accounts-lib/pick-account.cjs" "$BIN/pick-account.cjs" 2>/dev/null || true
 
 # Ensure ~/bin is first on PATH for interactive shells
 MARKER='# claude-accounts orch'

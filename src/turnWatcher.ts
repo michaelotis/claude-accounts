@@ -1,19 +1,19 @@
 /**
  * Approximate "Claude turn" activity for the current window.
  *
- * We cannot subscribe to Claude Code's internal stream events, so we infer
- * IN_TURN from:
- *   • recent writes under the active config dir / shared history (sessions, projects)
- *   • live `claude` processes whose CLAUDE_CONFIG_DIR matches this window
- *
- * After activity stops for `settleMs`, we fire onIdle. While activity is
- * recent we fire onBusy (edge-triggered once).
+ * Heuristic (deliberately conservative about declaring idle):
+ *   • IN_TURN requires recent writes under THIS window's config dir
+ *     (projects / sessions / history). Live process alone is NOT enough —
+ *     the Claude Code panel keeps a process alive between turns.
+ *   • We do NOT watch ~/.claude-shared (other windows would keep us "busy").
+ *   • settleMs defaults high enough that a silent multi-minute tool run with
+ *     occasional flushes still usually looks busy; pure CPU without flushes
+ *     can still false-idle (inherent limit without Claude Code events).
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { log } from './log';
-import { sharedStoreDir } from './sharedHistory';
 
 export type TurnPhase = 'idle' | 'in_turn';
 
@@ -24,21 +24,29 @@ export class TurnWatcher {
   private getConfigDir: () => string | undefined;
   private settleMs: number;
   private pollMs: number;
+  private activityWindowMs: number;
 
   onBusy?: () => void;
   onIdle?: () => void;
 
   constructor(
     getConfigDir: () => string | undefined,
-    opts: { settleMs?: number; pollMs?: number } = {}
+    opts: { settleMs?: number; pollMs?: number; activityWindowMs?: number } = {}
   ) {
     this.getConfigDir = getConfigDir;
-    this.settleMs = opts.settleMs ?? 4_000;
-    this.pollMs = opts.pollMs ?? 1_500;
+    // Long tools can go silent for a while; 12s settle reduces mid-turn reloads.
+    this.settleMs = opts.settleMs ?? 12_000;
+    this.pollMs = opts.pollMs ?? 2_000;
+    this.activityWindowMs = opts.activityWindowMs ?? 8_000;
   }
 
   getPhase(): TurnPhase {
     return this.phase;
+  }
+
+  /** Force re-check after restore (e.g. pending cutover on already-idle window). */
+  poke(): void {
+    this.tick();
   }
 
   start(): void {
@@ -61,11 +69,11 @@ export class TurnWatcher {
 
   private tick(): void {
     const now = Date.now();
-    if (this.detectActivity(now)) {
+    if (this.detectFileActivity(now)) {
       this.lastActivityAt = now;
       if (this.phase !== 'in_turn') {
         this.phase = 'in_turn';
-        log('turn: IN_TURN (activity detected)');
+        log('turn: IN_TURN (config-dir file activity)');
         this.onBusy?.();
       }
       return;
@@ -77,30 +85,25 @@ export class TurnWatcher {
     }
   }
 
-  private detectActivity(now: number): boolean {
+  private detectFileActivity(now: number): boolean {
     const dir = this.getConfigDir();
-    const roots = [dir, sharedStoreDir()].filter(Boolean) as string[];
-    const windowMs = Math.max(this.settleMs, 3_000);
-    for (const root of roots) {
-      if (this.recentWriteUnder(root, now, windowMs)) return true;
-    }
-    if (dir && this.claudeProcessOnDir(dir)) return true;
-    return false;
+    if (!dir) return false;
+    // Only this window's CLAUDE_CONFIG_DIR — never shared store (cross-window).
+    return this.recentWriteUnder(dir, now, this.activityWindowMs);
   }
 
-  /** Shallow-ish walk: projects + sessions under a config/shared root. */
   private recentWriteUnder(root: string, now: number, windowMs: number): boolean {
     const candidates = [
       path.join(root, 'sessions'),
       path.join(root, 'projects'),
       path.join(root, 'session-env'),
       path.join(root, 'file-history'),
+      path.join(root, 'shell-snapshots'),
     ];
     for (const c of candidates) {
       if (!fs.existsSync(c)) continue;
-      if (this.walkRecent(c, now, windowMs, 0, 4)) return true;
+      if (this.walkRecent(c, now, windowMs, 0, 3)) return true;
     }
-    // history.jsonl at root
     try {
       const h = path.join(root, 'history.jsonl');
       if (fs.existsSync(h)) {
@@ -133,54 +136,12 @@ export class TurnWatcher {
         if (e.isDirectory()) {
           if (this.walkRecent(p, now, windowMs, depth + 1, maxDepth)) return true;
         } else if (e.isFile()) {
-          // transcripts and agent state
-          if (!/\.(jsonl|json|txt|md)$/i.test(e.name) && !e.name.includes('session')) {
-            continue;
-          }
+          if (!/\.(jsonl|json)$/i.test(e.name)) continue;
           const st = fs.statSync(p);
           if (now - st.mtimeMs < windowMs) return true;
         }
       } catch {
         /* ignore */
-      }
-    }
-    return false;
-  }
-
-  /** Linux/WSL: any `claude` process with CLAUDE_CONFIG_DIR=dir. */
-  private claudeProcessOnDir(dir: string): boolean {
-    if (process.platform !== 'linux') return false;
-    const target = path.normalize(dir);
-    let proc: string[];
-    try {
-      proc = fs.readdirSync('/proc').filter((n) => /^\d+$/.test(n));
-    } catch {
-      return false;
-    }
-    for (const pid of proc) {
-      try {
-        const comm = fs.readFileSync(`/proc/${pid}/comm`, 'utf-8').trim();
-        if (comm !== 'claude' && comm !== 'node') continue;
-        const env = fs.readFileSync(`/proc/${pid}/environ`, 'utf-8');
-        const match = env.split('\0').find((x) => x.startsWith('CLAUDE_CONFIG_DIR='));
-        if (!match) {
-          // default dir processes: only count if our dir is ~/.claude
-          if (comm === 'claude' && target === path.normalize(path.join(require('os').homedir(), '.claude'))) {
-            // ambiguous — don't treat as busy solely on default
-            continue;
-          }
-          continue;
-        }
-        const d = path.normalize(match.slice('CLAUDE_CONFIG_DIR='.length));
-        if (d === target) {
-          // Prefer actual claude binary; node may be extension host
-          if (comm === 'claude') return true;
-          // node with CLAUDE_CONFIG_DIR might be claude's runtime
-          const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf-8');
-          if (cmdline.includes('claude')) return true;
-        }
-      } catch {
-        /* permission / raced exit */
       }
     }
     return false;

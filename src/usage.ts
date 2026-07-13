@@ -198,6 +198,13 @@ export function writePolicyCache(opts: {
   /** Optional name map email → registry name */
   nameByEmail?: Record<string, string>;
   snapshots: UsageSnapshot[];
+  /** Drop these emails entirely (e.g. after Forget). */
+  removeEmails?: string[];
+  /**
+   * If set, policy.accounts becomes exactly this set of emails after merge
+   * (plus any successful snapshots). Drops forgotten / unknown entries.
+   */
+  retainEmails?: string[];
 }): void {
   try {
     fs.mkdirSync(policyDir(), { recursive: true, mode: 0o700 });
@@ -213,13 +220,19 @@ export function writePolicyCache(opts: {
     for (const a of prev.accounts || []) {
       if (a.email) byEmail.set(a.email, a);
     }
+    for (const e of opts.removeEmails || []) {
+      byEmail.delete(e);
+    }
     for (const s of opts.snapshots) {
       if (!s.email) continue;
       const fable = s.modelLimits.find((m) => /fable/i.test(m.name))?.percent ?? null;
       const prevDir = byEmail.get(s.email)?.dir;
       let dir = s.configDir;
-      if (s.configDir.includes(`${path.sep}.claude-windows${path.sep}`) && prevDir) {
-        dir = prevDir;
+      // Prefer durable account store over per-window workdir
+      if (dir.includes(`${path.sep}.claude-windows${path.sep}`)) {
+        if (prevDir && !prevDir.includes(`${path.sep}.claude-windows${path.sep}`)) {
+          dir = prevDir;
+        }
       }
       const name = opts.nameByEmail?.[s.email] || byEmail.get(s.email)?.name;
       byEmail.set(s.email, {
@@ -236,7 +249,12 @@ export function writePolicyCache(opts: {
         fetchedAt: s.fetchedAt,
       });
     }
-    // Migrate legacy primary/secondary into accountOrder if order empty
+    if (opts.retainEmails) {
+      const keep = new Set(opts.retainEmails);
+      for (const em of [...byEmail.keys()]) {
+        if (!keep.has(em)) byEmail.delete(em);
+      }
+    }
     let accountOrder =
       opts.accountOrder !== undefined ? opts.accountOrder : prev.accountOrder || [];
     if (!accountOrder.length) {
@@ -265,6 +283,24 @@ export function writePolicyCache(opts: {
     fs.renameSync(tmp, policyPath());
   } catch (err) {
     log(`policy write failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Remove one or more emails from the policy cache (Forget). */
+export function prunePolicyEmails(emails: string[]): void {
+  if (!emails.length || !fs.existsSync(policyPath())) return;
+  try {
+    const prev = JSON.parse(fs.readFileSync(policyPath(), 'utf-8')) as OrchPolicy;
+    const drop = new Set(emails);
+    prev.accounts = (prev.accounts || []).filter((a) => !drop.has(a.email));
+    prev.accountOrder = (prev.accountOrder || []).filter((id) => !drop.has(id));
+    prev.updatedAt = Date.now();
+    const tmp = policyPath() + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(prev, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, policyPath());
+    log(`policy: pruned ${emails.join(', ')}`);
+  } catch (err) {
+    log(`policy prune failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -328,8 +364,16 @@ export class UsageMonitor {
     };
   }
 
-  /** Optional hook for UI notify (set by extension). */
+  /**
+   * Fired when the *active* account needs failover — independent of mode.
+   * Extension uses this for panel cutover; gate toasts separately.
+   */
+  onPressure?: (snap: UsageSnapshot, reasons: string[]) => void;
+  /** Optional CLI/notify toast hook (extension gates on mode). */
   onHot?: (snap: UsageSnapshot, reasons: string[]) => void;
+
+  /** Resolve all account stores to poll (email + durable dir). */
+  listAccountsToPoll?: () => { email: string; dir: string; name?: string }[];
 
   private emit(): void {
     for (const fn of this.listeners) fn();
@@ -344,6 +388,38 @@ export class UsageMonitor {
     this.currentDir = dir;
   }
 
+  private policyWrite(snapshots: UsageSnapshot[]): void {
+    const listed = this.listAccountsToPoll?.() ?? [];
+    writePolicyCache({
+      mode: this.mode,
+      thresholds: this.thresholds,
+      triggers: this.triggers,
+      strategy: this.strategy,
+      accountOrder: this.accountOrder,
+      workspaceRoutes: this.workspaceRoutes,
+      nameByEmail: this.nameByEmail,
+      snapshots,
+      retainEmails: listed.length ? listed.map((a) => a.email) : undefined,
+    });
+  }
+
+  private emitPressure(snap: UsageSnapshot): void {
+    if (!needsFailover(snap, this.thresholds, this.triggers)) {
+      if (snap.email && this.lastNotifyKey.startsWith(`${snap.email}:`)) {
+        this.lastNotifyKey = '';
+      }
+      return;
+    }
+    const reasons = failoverReasons(snap, this.thresholds, this.triggers);
+    const key = `${snap.email}:${reasons.join(',')}`;
+    // Always notify cutover path
+    this.onPressure?.(snap, reasons);
+    if (key !== this.lastNotifyKey) {
+      this.lastNotifyKey = key;
+      this.onHot?.(snap, reasons);
+    }
+  }
+
   async refresh(dir?: string): Promise<UsageSnapshot | null> {
     const d = resolveConfigDir(dir ?? this.currentDir);
     const existing = this.inflight.get(d);
@@ -352,30 +428,10 @@ export class UsageMonitor {
       .then((snap) => {
         this.cache.set(d, snap);
         if (snap) {
-          // Rewrite configDir to durable store path when known (CLI orch needs this)
           const store = snap.email ? this.storeDirForEmail?.(snap.email) : undefined;
           const forPolicy = store ? { ...snap, configDir: store } : snap;
-          writePolicyCache({
-            mode: this.mode,
-            thresholds: this.thresholds,
-            triggers: this.triggers,
-            strategy: this.strategy,
-            accountOrder: this.accountOrder,
-            workspaceRoutes: this.workspaceRoutes,
-            nameByEmail: this.nameByEmail,
-            snapshots: [forPolicy],
-          });
-          // Notify only when a failover-enabled dimension is hot
-          if (this.mode !== 'off' && needsFailover(snap, this.thresholds, this.triggers)) {
-            const reasons = failoverReasons(snap, this.thresholds, this.triggers);
-            const key = `${snap.email}:${reasons.join(',')}`;
-            if (key !== this.lastNotifyKey) {
-              this.lastNotifyKey = key;
-              this.onHot?.(snap, reasons);
-            }
-          } else if (snap.email) {
-            if (this.lastNotifyKey.startsWith(`${snap.email}:`)) this.lastNotifyKey = '';
-          }
+          this.policyWrite([forPolicy]);
+          this.emitPressure(snap);
         }
         this.emit();
         return snap;
@@ -387,12 +443,49 @@ export class UsageMonitor {
     return p;
   }
 
+  /** Poll every registered account store and refresh policy (for lowestUsage). */
+  async refreshAllAccounts(): Promise<void> {
+    const listed = this.listAccountsToPoll?.() ?? [];
+    if (!listed.length) {
+      await this.refresh(this.currentDir);
+      return;
+    }
+    const snaps: UsageSnapshot[] = [];
+    let activeSnap: UsageSnapshot | null = null;
+    const activeDir = this.currentDir ? path.normalize(this.currentDir) : '';
+    for (const a of listed) {
+      if (!a.dir || !fs.existsSync(a.dir)) continue;
+      const snap = await fetchUsage(a.dir);
+      if (!snap) continue;
+      const forPolicy = { ...snap, configDir: a.dir, email: snap.email || a.email };
+      if (!forPolicy.email) forPolicy.email = a.email;
+      snaps.push(forPolicy);
+      if (path.normalize(a.dir) === activeDir || forPolicy.configDir === this.currentDir) {
+        activeSnap = forPolicy;
+      }
+    }
+    // Also poll active window dir if different (workdir)
+    if (this.currentDir) {
+      const cur = await fetchUsage(this.currentDir);
+      if (cur) {
+        const store = cur.email ? this.storeDirForEmail?.(cur.email) : undefined;
+        activeSnap = store ? { ...cur, configDir: store } : cur;
+        if (activeSnap.email && !snaps.some((s) => s.email === activeSnap!.email)) {
+          snaps.push(activeSnap);
+        }
+      }
+    }
+    if (snaps.length) this.policyWrite(snaps);
+    if (activeSnap) this.emitPressure(activeSnap);
+    this.emit();
+  }
+
   start(getDir: () => string | undefined): void {
     this.stop();
     const tick = () => {
       const d = getDir();
       this.currentDir = d;
-      void this.refresh(d);
+      void this.refreshAllAccounts();
     };
     tick();
     this.timer = setInterval(tick, this.intervalMs);

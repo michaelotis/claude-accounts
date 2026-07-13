@@ -11,7 +11,12 @@ import { defaultSourceDir } from './capture';
 import { AccountWatcher } from './accountWatcher';
 import { allWorkingDirs, workingRoot } from './workdir';
 import { log, showLog } from './log';
-import { UsageMonitor, writePolicyCache, type WorkspaceRoutePolicy } from './usage';
+import {
+  UsageMonitor,
+  writePolicyCache,
+  prunePolicyEmails,
+  type WorkspaceRoutePolicy,
+} from './usage';
 import { isSidecarConfigDir } from './sidecars';
 import { matchWorkspaceRoute, mergeRoutes, type WorkspaceRoute } from './workspaceRoutes';
 import { IdleCutoverController, type PanelCutoverMode } from './cutover';
@@ -99,6 +104,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return mergeRoutes(settingsRoutes, learned);
   };
 
+  /** Shared accountOrder merge (settings + legacy primary/secondary). */
+  const resolveAccountOrder = (): string[] => {
+    const cfg = vscode.workspace.getConfiguration('claudeAccounts');
+    let accountOrder = (cfg.get<string[]>('failover.accountOrder', []) || [])
+      .map((s) => String(s).trim())
+      .filter(Boolean);
+    if (!accountOrder.length) {
+      const primary = cfg.get<string>('failover.primaryEmail', '') || '';
+      const secondary = cfg.get<string>('failover.secondaryEmail', '') || '';
+      accountOrder = [primary, secondary].map((s) => s.trim()).filter(Boolean);
+    }
+    return accountOrder;
+  };
+
   const applyUsageSettings = () => {
     const cfg = vscode.workspace.getConfiguration('claudeAccounts');
     const mode = cfg.get<'off' | 'notify' | 'cli'>('failover.mode', 'notify');
@@ -108,22 +127,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       weekly: cfg.get<number>('failover.weeklyThreshold', 90),
       fable: cfg.get<number>('failover.fableThreshold', 90),
     };
-    // Which buckets trigger account failover (vs meter-only / model switch).
-    // Defaults: session+weekly yes; Fable no (leave model fallback to Claude Code).
     const triggers = {
       session: cfg.get<boolean>('failover.onSession', true),
       weekly: cfg.get<boolean>('failover.onWeekly', true),
       fable: cfg.get<boolean>('failover.onFable', false),
     };
-    let accountOrder = (cfg.get<string[]>('failover.accountOrder', []) || [])
-      .map((s) => String(s).trim())
-      .filter(Boolean);
-    // Legacy primary/secondary → ordered list if accountOrder empty
-    if (!accountOrder.length) {
-      const primary = cfg.get<string>('failover.primaryEmail', '') || '';
-      const secondary = cfg.get<string>('failover.secondaryEmail', '') || '';
-      accountOrder = [primary, secondary].map((s) => s.trim()).filter(Boolean);
-    }
+    const accountOrder = resolveAccountOrder();
     const strategy = cfg.get<'lowestUsage' | 'ordered'>(
       'failover.strategy',
       'lowestUsage'
@@ -133,6 +142,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const em = registry.emailOf(a);
       if (em) nameByEmail[em] = a.name;
     }
+    usage.listAccountsToPoll = () =>
+      registry
+        .listUniqueByEmail()
+        .map((a) => {
+          const email = registry.emailOf(a);
+          if (!email || !a.dir) return null;
+          return { email, dir: a.dir, name: a.name };
+        })
+        .filter((x): x is { email: string; dir: string; name: string } => Boolean(x));
     usage.configure({
       mode,
       thresholds,
@@ -143,7 +161,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       nameByEmail,
       storeDirForEmail: (email) => accountByEmail(email)?.dir,
     });
-    // Persist routes/triggers even without a fresh usage poll
     writePolicyCache({
       mode,
       thresholds,
@@ -153,6 +170,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       workspaceRoutes: routes,
       nameByEmail,
       snapshots: [],
+      retainEmails: usage.listAccountsToPoll().map((a) => a.email),
     });
   };
   applyUsageSettings();
@@ -164,7 +182,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     wizard,
     () => binding.getEnvDir() ?? defaultSourceDir()
   );
-  // configure cutover from same settings block
   const syncCutover = () => {
     const cfg = vscode.workspace.getConfiguration('claudeAccounts');
     cutover.configure({
@@ -180,41 +197,41 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         fable: cfg.get<boolean>('failover.onFable', false),
       },
       strategy: cfg.get<'lowestUsage' | 'ordered'>('failover.strategy', 'lowestUsage'),
-      accountOrder: (cfg.get<string[]>('failover.accountOrder', []) || []).map(String),
+      accountOrder: resolveAccountOrder(),
       workspaceRoutes: buildWorkspaceRoutes(),
     });
   };
   syncCutover();
   cutover.start();
 
+  // Panel cutover always gets pressure (even if failover.mode is off)
+  usage.onPressure = (snap, reasons) => {
+    cutover.notePressure(snap, reasons);
+  };
+
+  // Toasts only — gated by mode / panelCutover (not by cutover itself)
   usage.onHot = (snap, reasons) => {
     const mode = usage.getMode();
     const panelMode = vscode.workspace
       .getConfiguration('claudeAccounts')
       .get<PanelCutoverMode>('failover.panelCutover', 'notify');
 
-    // Always feed the turn-aware cutover controller (may defer until idle)
-    cutover.notePressure(snap, reasons);
-
-    if (mode === 'off' && panelMode === 'off') return;
-
-    // Immediate toast only when not using idleReload (that path handles messaging)
     if (panelMode === 'idleReload') {
-      log(`usage hot — idleReload will cut over after turn: ${reasons.join(', ')}`);
+      log(`usage hot — idleReload after turn: ${reasons.join(', ')}`);
       return;
     }
     if (mode === 'cli') {
       void vscode.window.showWarningMessage(
         `Claude usage high on ${snap.email ?? 'this account'}: ${reasons.join(', ')}. ` +
-          `CLI orch will pick another account on new invocations; panel waits until the turn is idle.`
+          `CLI orch uses policy for new invocations; panel cutover waits until the turn is idle.`
       );
       return;
     }
-    if (panelMode === 'notify' || mode === 'notify') {
+    if (mode === 'notify' || panelMode === 'notify') {
       void vscode.window
         .showWarningMessage(
           `Claude usage high on ${snap.email ?? 'this account'}: ${reasons.join(', ')}. ` +
-            `Switch after this turn finishes for a clean cutover.`,
+            `Prefer switching after this turn finishes.`,
           'Switch account',
           'Dismiss'
         )
