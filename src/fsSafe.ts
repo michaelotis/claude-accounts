@@ -140,15 +140,18 @@ function tryAcquire(lockDir: string, staleMs: number): boolean {
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
     if (!isLockStale(lockDir, staleMs)) return false; // live holder — wait
+    // Exclusive mkdir sentinel — same primitive as the lock itself, so it is
+    // exclusive on the same filesystems (incl. a networked $HOME, where O_EXCL
+    // can be weaker). One reclaimer at a time.
     const token = `${lockDir}.reclaim`;
     try {
-      fs.closeSync(fs.openSync(token, 'wx')); // exclusive: one reclaimer at a time
+      fs.mkdirSync(token);
     } catch {
       // Token busy — another reclaimer holds it, or one crashed. Clear a stale
       // token and let a later round retry; never reclaim without the token.
       try {
         if (Date.now() - fs.statSync(token).mtimeMs > RECLAIM_TOKEN_STALE_MS) {
-          fs.rmSync(token, { force: true });
+          fs.rmSync(token, { recursive: true, force: true });
         }
       } catch {
         /* ignore */
@@ -169,7 +172,7 @@ function tryAcquire(lockDir: string, staleMs: number): boolean {
       }
     } finally {
       try {
-        fs.rmSync(token, { force: true });
+        fs.rmSync(token, { recursive: true, force: true });
       } catch {
         /* ignore */
       }
