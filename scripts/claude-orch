@@ -68,6 +68,11 @@ if [ -n "${DIR:-}" ]; then
   if [ "${CLAUDE_ORCH_STICKY:-}" = "1" ]; then
     export CLAUDE_ORCH_STICKY_DIR="$DIR"
   fi
+else
+  # Picker prints ambient env when it means to honor it. Empty output is
+  # fail-closed (e.g. workspace route matched but account missing) — do not
+  # let an inherited CLAUDE_CONFIG_DIR run claude under the wrong account.
+  unset CLAUDE_CONFIG_DIR
 fi
 
 exec "$REAL_BIN" "$@"

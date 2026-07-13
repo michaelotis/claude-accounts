@@ -44,6 +44,7 @@ export class IdleCutoverController {
   private pending = false;
   private busy = false;
   private evaluating = false;
+  private startupTimer: ReturnType<typeof setTimeout> | undefined;
 
   private panelMode: PanelCutoverMode = 'off';
   private thresholds: FailoverThresholds = { ...DEFAULT_THRESHOLDS };
@@ -89,11 +90,13 @@ export class IdleCutoverController {
     this.pending = Boolean(this.context.workspaceState.get(PENDING_KEY));
     this.watcher.start();
     // If we restored pending and already idle, evaluate (no busy→idle edge)
-    setTimeout(() => {
+    this.startupTimer = setTimeout(() => {
+      this.startupTimer = undefined;
       if (this.pending && this.watcher.getPhase() === 'idle' && !this.busy) {
         void this.evaluateAndMaybeCutover(['startup-pending']);
       }
     }, 2_000);
+    if (typeof this.startupTimer.unref === 'function') this.startupTimer.unref();
   }
 
   /** Call when usage sees failover pressure — independent of failover.mode. */
@@ -161,6 +164,13 @@ export class IdleCutoverController {
           'Dismiss'
         );
         if (pick === 'Switch now') {
+          // A new turn may have started while the dialog was open.
+          if (this.busy || this.watcher.getPhase() === 'in_turn') {
+            this.pending = true;
+            await this.context.workspaceState.update(PENDING_KEY, true);
+            log('cutover: turn resumed before switch — defer');
+            return;
+          }
           await this.wizard.switchTo(next);
         }
         return;
@@ -178,10 +188,26 @@ export class IdleCutoverController {
             'Dismiss'
           )
           .then((pick) => {
-            if (pick === 'Switch now') void this.wizard.switchTo(next);
+            if (pick === 'Switch now') {
+              if (this.busy || this.watcher.getPhase() === 'in_turn') {
+                this.pending = true;
+                void this.context.workspaceState.update(PENDING_KEY, true);
+                log('cutover: turn resumed before switch — defer');
+                return;
+              }
+              void this.wizard.switchTo(next);
+            }
           });
         this.pending = false;
         await this.context.workspaceState.update(PENDING_KEY, false);
+        return;
+      }
+
+      // Async fetch/pick may have raced a new turn — never cut over mid-stream.
+      if (this.busy || this.watcher.getPhase() === 'in_turn') {
+        this.pending = true;
+        await this.context.workspaceState.update(PENDING_KEY, true);
+        log('cutover: turn resumed before switch — defer');
         return;
       }
 
@@ -257,6 +283,10 @@ export class IdleCutoverController {
   }
 
   dispose(): void {
+    if (this.startupTimer !== undefined) {
+      clearTimeout(this.startupTimer);
+      this.startupTimer = undefined;
+    }
     this.watcher.dispose();
   }
 }

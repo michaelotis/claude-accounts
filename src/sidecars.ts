@@ -17,6 +17,19 @@ export function isReservedClaudeDirName(dirName: string): boolean {
   return false;
 }
 
+/**
+ * True for Windows or Windows-mounted paths that must never be treated as a
+ * Linux/WSL Claude account store (any drive letter under /mnt, drive: prefix,
+ * or Windows system path segments).
+ */
+export function isWindowsPath(p: string): boolean {
+  if (!p) return false;
+  if (/^\/mnt\/[A-Za-z]\//.test(p)) return true;
+  if (/^[A-Za-z]:/.test(p)) return true;
+  if (p.includes('/Windows/') || p.includes('/System32/')) return true;
+  return false;
+}
+
 /** True if this absolute path should never be managed as an account store. */
 export function isSidecarConfigDir(dir: string): boolean {
   const norm = path.normalize(dir);
@@ -27,6 +40,6 @@ export function isSidecarConfigDir(dir: string): boolean {
   if (norm === path.normalize(path.join(home, '.camwatch', 'claude'))) return true;
   if (norm.startsWith(path.normalize(path.join(home, '.camwatch')) + path.sep)) return true;
   // Never migrate Windows-mounted paths
-  if (norm.startsWith('/mnt/c/') || /^[A-Za-z]:/.test(norm)) return true;
+  if (isWindowsPath(norm)) return true;
   return false;
 }

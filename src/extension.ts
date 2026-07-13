@@ -487,7 +487,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // unfocused while that happened must reconcile when focus comes back —
     // otherwise a handoff nobody was around to finish would sit unrepaired.
     vscode.window.onDidChangeWindowState((s) => {
-      if (s.focused) void wizard.reconcile().finally(() => statusBar.reconfirm());
+      if (s.focused)
+        void wizard
+          .reconcile()
+          .catch((e) => log(`reconcile failed: ${e instanceof Error ? e.message : String(e)}`))
+          .finally(() => statusBar.reconfirm());
     }),
     statusBar
   );
@@ -500,7 +504,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // of the account this dir held — move the new account into a dir of its own and
   // restore the displaced one. Then repaint the bar so it never lags behind.
   const watcher = new AccountWatcher(binding, () => {
-    void wizard.reconcile().finally(() => statusBar.reconfirm());
+    void wizard
+      .reconcile()
+      .catch((e) => log(`reconcile failed: ${e instanceof Error ? e.message : String(e)}`))
+      .finally(() => statusBar.reconfirm());
   });
   watcher.start();
   context.subscriptions.push(watcher);

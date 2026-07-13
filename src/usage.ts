@@ -9,6 +9,7 @@ import * as os from 'os';
 import { log } from './log';
 import { readIdentity, hasCredentials } from './accounts';
 import { writeFileAtomic, withLock } from './fsSafe';
+import { isWindowsPath } from './sidecars';
 import {
   buildSnapshot,
   formatUsageBar,
@@ -24,7 +25,6 @@ import {
   needsFailover,
   failoverReasons,
   pressureReasons,
-  hotReasons,
   selectFailoverAccount,
   usageScore,
 } from './usageParse';
@@ -40,7 +40,6 @@ export {
   needsFailover,
   failoverReasons,
   pressureReasons,
-  hotReasons,
   selectFailoverAccount,
   usageScore,
 };
@@ -191,8 +190,8 @@ function writeMeta(m: UsageMeta): void {
   try {
     fs.mkdirSync(policyDir(), { recursive: true, mode: 0o700 });
     writeFileAtomic(metaPath(), JSON.stringify(m, null, 2), { mode: 0o600 });
-  } catch {
-    /* ignore */
+  } catch (err) {
+    log(`usage-meta write failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -539,7 +538,7 @@ export async function fetchUsageDetailed(
   opts: { forceNetwork?: boolean } = {}
 ): Promise<UsageFetchResult> {
   const dir = resolveConfigDir(configDir);
-  if (dir.startsWith('/mnt/c/') || dir.startsWith('C:') || dir.startsWith('c:')) {
+  if (isWindowsPath(dir)) {
     log(`usage: refusing Windows path ${dir}`);
     return failure(
       'windows_path',

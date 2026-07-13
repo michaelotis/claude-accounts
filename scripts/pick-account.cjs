@@ -17,7 +17,20 @@ if (!lib) {
   console.error('pick-account: usageParse.cjs not found — run npm run compile in claude-accounts');
   process.exit(1);
 }
+const routesCandidates = [
+  path.join(__dirname, 'lib', 'workspaceRoutes.cjs'),
+  path.join(__dirname, 'claude-accounts-lib', 'lib', 'workspaceRoutes.cjs'),
+  path.join(__dirname, '..', 'scripts', 'lib', 'workspaceRoutes.cjs'),
+];
+const routesLib = routesCandidates.find((p) => fs.existsSync(p));
+if (!routesLib) {
+  console.error(
+    'pick-account: workspaceRoutes.cjs not found — run npm run compile in claude-accounts'
+  );
+  process.exit(1);
+}
 const { selectFailoverAccount, accountIsCool } = require(lib);
+const { matchWorkspaceRoute } = require(routesLib);
 
 const policyPath = process.argv[2];
 const cwd = process.argv[3] || process.cwd();
@@ -46,35 +59,16 @@ if (!order.length) {
   if (p.secondaryEmail) order.push(p.secondaryEmail);
 }
 
-function norm(p0) {
-  let n = path.resolve(p0 || '');
-  while (n.length > 1 && (n.endsWith('/') || n.endsWith(path.sep))) n = n.slice(0, -1);
-  return n;
-}
-
-function matchRoute(fsPath) {
-  const target = norm(fsPath);
-  let best = null;
-  let bestLen = -1;
-  for (const r of routes) {
-    if (!r || !r.pathPrefix || !r.email) continue;
-    const prefix = norm(r.pathPrefix);
-    if (target === prefix || target.startsWith(prefix + path.sep)) {
-      if (prefix.length > bestLen) {
-        best = r;
-        bestLen = prefix.length;
-      }
-    }
-  }
-  return best;
-}
-
 function byEmail(email) {
-  return accounts.find((a) => a && a.email === email) || null;
+  const want = (email || '').trim().toLowerCase();
+  if (!want) return null;
+  return (
+    accounts.find((a) => a && (a.email || '').trim().toLowerCase() === want) || null
+  );
 }
 
 // 1) Workspace hard pin
-const route = matchRoute(cwd);
+const route = matchWorkspaceRoute(cwd, routes);
 if (route) {
   const acc = byEmail(route.email);
   if (acc && acc.dir && fs.existsSync(acc.dir)) {
