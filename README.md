@@ -4,14 +4,14 @@ Multi-account **Claude Code** for **Linux / WSL / Remote-SSH**: live usage (5h /
 
 ## What this is for
 
-| Need                                | How this helps                                                                                                        |
-| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| **Two Claude accounts at once**     | Work in one VS Code window, personal in another — each has its own `CLAUDE_CONFIG_DIR` and credential copy            |
-| **Open a folder → right account**   | `workspaceRoutes` (or Switch Account once) pins a tree to an email; preferred over “last used anywhere”               |
-| **See usage live**                  | Status bar: 5h session, 7d all-models, Fable (and other model-scoped limits)                                          |
-| **Failover when an account is hot** | Notify, CLI PATH orchestrator for **new** `claude` processes, optional **post-turn** panel cutover (never mid-stream) |
-| **Keep one conversation history**   | Shared history store so multi-account does not fragment or hide past chats                                            |
-| **Keep your MCP servers**           | User-scope `mcpServers` from `~/.claude.json` are copied into each per-window config, so they work under isolation    |
+| Need                                 | How this helps                                                                                                                                                                                                        |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Two Claude accounts at once**      | Work in one VS Code window, personal in another — each has its own `CLAUDE_CONFIG_DIR` and credential copy                                                                                                            |
+| **Open a folder → right account**    | `workspaceRoutes` (or Switch Account once) pins a tree to an email; preferred over “last used anywhere”                                                                                                               |
+| **See usage live**                   | Status bar: 5h session, 7d all-models, Fable (and other model-scoped limits)                                                                                                                                          |
+| **Failover when an account is hot**  | Notify, CLI PATH orchestrator for **new** `claude` processes, optional **post-turn** panel cutover (never mid-stream)                                                                                                 |
+| **Keep one conversation history**    | Shared history store so multi-account does not fragment or hide past chats                                                                                                                                            |
+| **Keep your MCP servers & settings** | User-scope `mcpServers` (from `~/.claude.json`) are merged into each window, and your `~/.claude/settings.json` (auto-compact, model, hooks, …) is shared into every window, so both apply under per-window isolation |
 
 Upstream credit: [Parallel Accounts](https://github.com/DercasDrol/claude-parallel-profiles) + usage patterns from [Claudemeter](https://github.com/hyperi-io/claudemeter) (both MIT). See `NOTICE`.
 

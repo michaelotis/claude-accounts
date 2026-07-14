@@ -212,3 +212,42 @@ export function syncMcpServers(workingDir: string): void {
     log(`workdir: could not sync mcpServers into ${workingDir}: ${(err as Error).message}`);
   }
 }
+
+/**
+ * Points a window's settings.json at the user's own ~/.claude/settings.json, so a
+ * managed window uses the same Claude Code settings (auto-compact threshold and
+ * message, model, hooks, permissions, …) as the default account. Without it,
+ * CLAUDE_CONFIG_DIR makes Claude Code read a settings.json that isn't in the window
+ * dir and fall back to defaults — the reported "my auto-compact settings aren't
+ * applied". A symlink (not a copy) keeps every window on one shared settings file,
+ * so a change made anywhere applies everywhere. A real per-window settings.json is
+ * backed up to `settings.json.bak` before we take over, so nothing is lost.
+ */
+export function linkUserSettings(workingDir: string): void {
+  try {
+    const src = path.join(os.homedir(), '.claude', 'settings.json');
+    if (!fs.existsSync(src)) return; // no user settings to propagate
+    // The default dir IS the source — never link it to itself.
+    if (path.normalize(workingDir) === path.normalize(path.join(os.homedir(), '.claude'))) return;
+    const dst = path.join(workingDir, 'settings.json');
+    const st = fs.lstatSync(dst, { throwIfNoEntry: false });
+    if (st?.isSymbolicLink() && path.normalize(fs.readlinkSync(dst)) === path.normalize(src)) {
+      return; // already our link
+    }
+    if (st) {
+      // A real per-window settings.json (or a foreign link): back it up once, then
+      // take over so this window uses the shared user settings.
+      if (!st.isSymbolicLink()) {
+        try {
+          fs.copyFileSync(dst, `${dst}.bak`);
+        } catch {
+          /* best effort */
+        }
+      }
+      fs.unlinkSync(dst);
+    }
+    fs.symlinkSync(src, dst);
+  } catch (err) {
+    log(`workdir: could not link user settings into ${workingDir}: ${(err as Error).message}`);
+  }
+}

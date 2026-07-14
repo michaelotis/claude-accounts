@@ -8,7 +8,13 @@ import { getAuthStatus, AuthStatus } from './cli';
 import { snapshotAccount, defaultSourceDir, mirrorToDefault } from './capture';
 import { ensureSharedHistory } from './sharedHistory';
 import { signOut, interruptSessions, dirsHoldingToken, looksLikeLogout } from './reclaim';
-import { refreshStore, allWorkingDirs, materialize, syncMcpServers } from './workdir';
+import {
+  refreshStore,
+  allWorkingDirs,
+  materialize,
+  syncMcpServers,
+  linkUserSettings,
+} from './workdir';
 import { log } from './log';
 import { matchWorkspaceRoute, type WorkspaceRoute } from './workspaceRoutes';
 
@@ -307,6 +313,7 @@ export class SetupWizard {
     mirrorToDefault(dir, readIdentity(dir));
     // Propagate newly-added home MCP servers into already-stocked windows.
     syncMcpServers(dir);
+    linkUserSettings(dir);
     const changed = active !== account.name;
     if (changed) await this.binding.bind(account);
 

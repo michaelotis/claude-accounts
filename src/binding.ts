@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import { Account, hasCredentials, readIdentity } from './accounts';
-import { materialize, windowWorkingDir, syncMcpServers } from './workdir';
+import { materialize, windowWorkingDir, syncMcpServers, linkUserSettings } from './workdir';
 import { ensureSharedHistory } from './sharedHistory';
 import { log } from './log';
 import { emailsEqual, pickStoredAccountName } from './workspaceRoutes';
@@ -223,6 +223,7 @@ export class WindowBinding {
     await ensureSharedHistory([dir]);
     // Propagate user-scope MCP servers from ~/.claude.json into this window dir.
     syncMcpServers(dir);
+    linkUserSettings(dir);
     log(`bind: ${account.name} → ${dir} (was ${process.env[ENV_VAR] ?? '(default)'})`);
     process.env[ENV_VAR] = dir;
     this.applyTerminalEnv(dir);
