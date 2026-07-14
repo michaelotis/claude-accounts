@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.9.3
+
+### Fixed
+- **Self-healing token when two windows share an account.** Each window kept its own
+  copy of the account's OAuth grant; because Anthropic rotates the refresh token on
+  refresh, the window that refreshed kept working while the others were left on the
+  dead copy and signed out. Now the account store always holds the newest grant (a
+  window can't overwrite it with an older copy — the flap behind the sign-out churn),
+  and a window left on a stale grant re-stocks its token from the store and reloads
+  once its turn is idle (never mid-stream) so Claude Code picks up the live token. Only
+  the credential is refreshed — the window's per-project state is kept — and the reload
+  is metered. Windows also heal proactively on focus.
+
+### Internal
+- `refreshStore` is a newest-wins compare-and-set under the same per-store credentials
+  lock the token refresh uses (async — never blocks the extension host), fail-closed on
+  an unparseable/older grant while still able to repair a corrupt store. The `~/.claude`
+  fallback mirror is no longer regressed to a stale grant, and a heal can no longer race
+  a usage-driven account switch.
+
 ## 0.9.2
 
 ### Fixed

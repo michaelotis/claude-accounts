@@ -486,7 +486,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         void wizard
           .reconcile()
           .catch((e) => log(`reconcile failed: ${e instanceof Error ? e.message : String(e)}`))
-          .finally(() => statusBar.reconfirm());
+          .finally(() => {
+            statusBar.reconfirm();
+            // Focus is the "about to use this window" signal and the turn is idle
+            // then — heal a stale shared-account grant now (idle-gated) so the first
+            // turn runs on the live token instead of failing once, then healing.
+            cutover.maybeHeal();
+          });
     }),
     statusBar
   );
