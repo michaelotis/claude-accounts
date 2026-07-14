@@ -180,7 +180,9 @@ export class IdleCutoverController {
       const last = this.context.workspaceState.get<number>(AUTO_COOLDOWN_KEY, 0);
       const now = Date.now();
       if (now - last < AUTO_COOLDOWN_MS) {
-        log(`cutover: auto-reload cooldown (${Math.round((AUTO_COOLDOWN_MS - (now - last)) / 1000)}s left)`);
+        log(
+          `cutover: auto-reload cooldown (${Math.round((AUTO_COOLDOWN_MS - (now - last)) / 1000)}s left)`
+        );
         void vscode.window
           .showWarningMessage(
             `Claude Accounts: ${msg} (auto-switch on cooldown)`,
@@ -261,14 +263,10 @@ export class IdleCutoverController {
     }
 
     // Only cool targets for auto cutover (no least-bad hot fallback)
-    const coolOnly = rows.filter((r) =>
-      accountIsCool(r, this.thresholds, this.triggers)
-    );
+    const coolOnly = rows.filter((r) => accountIsCool(r, this.thresholds, this.triggers));
     if (!coolOnly.length) return null;
 
-    const others = currentEmail
-      ? coolOnly.filter((r) => r.email !== currentEmail)
-      : coolOnly;
+    const others = currentEmail ? coolOnly.filter((r) => r.email !== currentEmail) : coolOnly;
     const pool = others.length ? others : coolOnly;
 
     const picked = selectFailoverAccount(pool, {

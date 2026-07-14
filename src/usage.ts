@@ -255,8 +255,9 @@ function snapFromPolicy(dir: string, key: string): UsageSnapshot | null {
         fetchedAt?: number;
       }>;
     };
-    const email =
-      key.startsWith('email:') ? key.slice('email:'.length) : readIdentity(dir)?.email?.toLowerCase();
+    const email = key.startsWith('email:')
+      ? key.slice('email:'.length)
+      : readIdentity(dir)?.email?.toLowerCase();
     if (!email || !pol.accounts?.length) return null;
     const row = pol.accounts.find((a) => (a.email || '').toLowerCase() === email);
     if (!row) return null;
@@ -431,8 +432,7 @@ async function ensureFreshToken(configDir: string, force = false): Promise<strin
             accessToken: parsed.access_token,
             refreshToken: parsed.refresh_token || refreshToken,
             expiresAt: Date.now() + (parsed.expires_in || 3600) * 1000,
-            scopes:
-              typeof parsed.scope === 'string' ? parsed.scope.split(' ') : oauth?.scopes,
+            scopes: typeof parsed.scope === 'string' ? parsed.scope.split(' ') : oauth?.scopes,
             subscriptionType: parsed.subscription_type || oauth?.subscriptionType,
           };
           writeCredsAtomic(configDir, { ...(creds || {}), claudeAiOauth: nextOauth });
@@ -470,8 +470,7 @@ export interface UsageFetchFailure {
 }
 
 export type UsageFetchResult =
-  | { ok: true; snap: UsageSnapshot }
-  | { ok: false; failure: UsageFetchFailure };
+  { ok: true; snap: UsageSnapshot } | { ok: false; failure: UsageFetchFailure };
 
 function failure(kind: UsageFetchKind, message: string, status?: number): UsageFetchResult {
   return { ok: false, failure: { kind, message, status } };
@@ -639,9 +638,7 @@ export async function fetchUsageDetailed(
     const profile = identity
       ? {
           account: { email: identity.email, display_name: identity.displayName },
-          organization: identity.organizationName
-            ? { name: identity.organizationName }
-            : undefined,
+          organization: identity.organizationName ? { name: identity.organizationName } : undefined,
         }
       : null;
     const snap = buildSnapshot(usage, profile, dir);
@@ -797,9 +794,7 @@ export function writePolicyCache(opts: {
         strategy: opts.strategy || prev.strategy || DEFAULT_STRATEGY,
         accountOrder,
         workspaceRoutes:
-          opts.workspaceRoutes !== undefined
-            ? opts.workspaceRoutes
-            : prev.workspaceRoutes || [],
+          opts.workspaceRoutes !== undefined ? opts.workspaceRoutes : prev.workspaceRoutes || [],
         accounts: [...byEmail.values()],
       };
       writeFileAtomic(policyPath(), JSON.stringify(policy, null, 2), { mode: 0o600 });

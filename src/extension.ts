@@ -2,12 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import {
-  AccountRegistry,
-  hasCredentials,
-  readIdentity,
-  type Account,
-} from './accounts';
+import { AccountRegistry, hasCredentials, readIdentity, type Account } from './accounts';
 import { WindowBinding } from './binding';
 import { StatusBarManager } from './statusBar';
 import { SetupWizard, NOTICE_KEY } from './setupWizard';
@@ -16,11 +11,7 @@ import { defaultSourceDir } from './capture';
 import { AccountWatcher } from './accountWatcher';
 import { allWorkingDirs } from './workdir';
 import { log, showLog } from './log';
-import {
-  UsageMonitor,
-  writePolicyCache,
-  type WorkspaceRoutePolicy,
-} from './usage';
+import { UsageMonitor, writePolicyCache, type WorkspaceRoutePolicy } from './usage';
 import { isSidecarConfigDir } from './sidecars';
 import {
   emailsEqual,
@@ -49,12 +40,18 @@ import { looksLikeLogout } from './reclaim';
  */
 function activateUnsupported(context: vscode.ExtensionContext): void {
   const label =
-    process.platform === 'darwin' ? 'macOS' : process.platform === 'win32' ? 'native Windows' : process.platform;
+    process.platform === 'darwin'
+      ? 'macOS'
+      : process.platform === 'win32'
+        ? 'native Windows'
+        : process.platform;
   const msg =
     `Claude Accounts + Usage supports Linux only (workspace extension) — desktop Linux, WSL, Remote-SSH ` +
     `to a Linux host, or a dev container. On ${label} it stays inactive so it never attaches to a ` +
     `Windows Claude binary. No files are read or written.` +
-    (process.platform === 'win32' ? ' Tip: open your folder in a WSL window and install it there.' : '');
+    (process.platform === 'win32'
+      ? ' Tip: open your folder in a WSL window and install it there.'
+      : '');
   log(`platform ${process.platform} is unsupported — inert mode, nothing will be touched`);
 
   const item = vscode.window.createStatusBarItem(
@@ -100,9 +97,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const accountByEmail = (email: string) => {
     const want = normalizeEmail(email);
     if (!want) return undefined;
-    return registry
-      .list()
-      .find((a) => normalizeEmail(registry.emailOf(a) || a.email) === want);
+    return registry.list().find((a) => normalizeEmail(registry.emailOf(a) || a.email) === want);
   };
 
   /** Settings routes + learned folder→account map (from prior Switch Account). */
@@ -150,10 +145,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       fable: cfg.get<boolean>('failover.onFable', false),
     };
     const accountOrder = resolveAccountOrder();
-    const strategy = cfg.get<'lowestUsage' | 'ordered'>(
-      'failover.strategy',
-      'lowestUsage'
-    );
+    const strategy = cfg.get<'lowestUsage' | 'ordered'>('failover.strategy', 'lowestUsage');
     const nameByEmail: Record<string, string> = {};
     for (const a of registry.list()) {
       const em = registry.emailOf(a);
@@ -306,19 +298,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       `workspace auto-select: ${preferredAtStart.folderPath} → ${preferredAtStart.email} (${preferredName})`
     );
   } else if (preferredAtStart && !preferredAtStart.account) {
-    log(
-      `workspace route ${preferredAtStart.email} has no saved account yet — sign in as it once`
-    );
+    log(`workspace route ${preferredAtStart.email} has no saved account yet — sign in as it once`);
   }
   const appliedStart = binding.applyStored(resolveAccount, preferredName);
   // Healthy bind only when the working dir is stocked. Preferred + unstocked is
   // escalated after override clear (force bind + metered reload).
-  let bound =
-    appliedStart?.stocked
-      ? appliedStart.account
-      : preferredName
-        ? undefined
-        : appliedStart?.account;
+  let bound = appliedStart?.stocked
+    ? appliedStart.account
+    : preferredName
+      ? undefined
+      : appliedStart?.account;
 
   // ── The critical fix ───────────────────────────────────────────────────────
   // The machine-scoped `claudeCode.environmentVariables` setting is shared by
@@ -347,8 +336,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const preferredAfter = resolveFolderPreferred();
   if (preferredAfter?.account) {
     const workDir = binding.workingDir();
-    const dirEmail =
-      hasCredentials(workDir) ? readIdentity(workDir)?.email : undefined;
+    const dirEmail = hasCredentials(workDir) ? readIdentity(workDir)?.email : undefined;
     const routeOk = emailsEqual(dirEmail, preferredAfter.email);
     if (!routeOk && looksLikeLogout(workDir)) {
       // The pinned account was logged out in this window. Do NOT restock it —
@@ -530,7 +518,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       )
       .then((pick) => {
         if (pick === 'Show extensions') {
-          void vscode.commands.executeCommand('workbench.extensions.search', 'claude parallel accounts');
+          void vscode.commands.executeCommand(
+            'workbench.extensions.search',
+            'claude parallel accounts'
+          );
         }
       });
   }
@@ -538,7 +529,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   if (cleared) {
     vscode.window.showInformationMessage(
       'Claude Accounts: removed CLAUDE_CONFIG_DIR from the shared machine setting. ' +
-        'Isolation now works per-window. Pick this window\'s account from the status bar.'
+        "Isolation now works per-window. Pick this window's account from the status bar."
     );
   }
 
@@ -563,7 +554,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // the news must come with the way out attached, not read as a dead end.
     const canSwitch = !binding.getActiveName() && registry.listUniqueByEmail().length > 0;
     void vscode.window
-      .showInformationMessage(`Claude Accounts: ${notice}`, ...(canSwitch ? ['Switch account'] : []))
+      .showInformationMessage(
+        `Claude Accounts: ${notice}`,
+        ...(canSwitch ? ['Switch account'] : [])
+      )
       .then((pick) => {
         if (pick === 'Switch account') {
           void vscode.commands.executeCommand('claudeProfiles.switchAccount');

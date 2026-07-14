@@ -82,13 +82,15 @@ function anotherCopyInstalled() {
     } catch {
       // no .obsolete → nothing is pending removal → any sibling is a live install
     }
-    return fs.readdirSync(root, { withFileTypes: true }).some(
-      (e) =>
-        e.isDirectory() &&
-        e.name !== me &&
-        e.name.toLowerCase().startsWith(prefix) &&
-        !obsolete[e.name]
-    );
+    return fs
+      .readdirSync(root, { withFileTypes: true })
+      .some(
+        (e) =>
+          e.isDirectory() &&
+          e.name !== me &&
+          e.name.toLowerCase().startsWith(prefix) &&
+          !obsolete[e.name]
+      );
   } catch {
     // Cannot tell. Assume there IS one: leaving files behind is a nuisance,
     // deleting a live install's accounts is a catastrophe.

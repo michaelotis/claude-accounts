@@ -4,12 +4,7 @@ import { log } from './log';
 import { WindowBinding } from './binding';
 import { getAuthStatus, AuthStatus } from './cli';
 import { defaultSourceDir } from './capture';
-import {
-  UsageMonitor,
-  formatUsageBar,
-  formatUsageTooltip,
-  type UsageSnapshot,
-} from './usage';
+import { UsageMonitor, formatUsageBar, formatUsageTooltip, type UsageSnapshot } from './usage';
 
 /** Marketplace / local id — hover links to the extension page when published. */
 const EXTENSION_ID = 'michaelotis.claude-accounts';
@@ -135,7 +130,7 @@ export class StatusBarManager implements vscode.Disposable {
     const cliSaysOut = status !== undefined && status !== null && status.loggedIn !== true;
     const signedOut = cliSaysOut || (!hasCredentials(dir) && !cliSaysIn);
     return {
-      email: signedOut ? undefined : status?.email ?? readIdentity(dir)?.email,
+      email: signedOut ? undefined : (status?.email ?? readIdentity(dir)?.email),
       signedOut,
       confirmed: cliSaysIn,
       unreachable,
@@ -164,10 +159,7 @@ export class StatusBarManager implements vscode.Disposable {
   }
 
   /** Background for one metric from its own percent only. */
-  private metricBackground(
-    percent: number,
-    warnAt: number
-  ): vscode.ThemeColor | undefined {
+  private metricBackground(percent: number, warnAt: number): vscode.ThemeColor | undefined {
     if (percent >= 80) return ERROR_BG;
     if (percent >= warnAt) return WARN_BG;
     return undefined;

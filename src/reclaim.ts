@@ -38,9 +38,7 @@ export function tokenPath(dir: string): string {
  */
 export function looksLikeLogout(dir: string): boolean {
   return (
-    !hasCredentials(dir) &&
-    !readIdentity(dir) &&
-    fs.existsSync(path.join(dir, '.claude.json'))
+    !hasCredentials(dir) && !readIdentity(dir) && fs.existsSync(path.join(dir, '.claude.json'))
   );
 }
 
@@ -236,7 +234,5 @@ export function dirsHoldingToken(email: string): string[] {
   } catch {
     /* home unreadable — fall back to whatever we have */
   }
-  return candidates.filter(
-    (d) => fs.existsSync(tokenPath(d)) && readIdentity(d)?.email === email
-  );
+  return candidates.filter((d) => fs.existsSync(tokenPath(d)) && readIdentity(d)?.email === email);
 }

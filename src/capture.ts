@@ -14,11 +14,7 @@ import { writeFileAtomic, copyFileAtomic } from './fsSafe';
  *
  * Returns the paths written. Throws if the source has no credentials.
  */
-export function snapshotAccount(
-  sourceDir: string,
-  targetDir: string,
-  status: AuthStatus
-): void {
+export function snapshotAccount(sourceDir: string, targetDir: string, status: AuthStatus): void {
   const srcCreds = path.join(sourceDir, '.credentials.json');
   if (!fs.existsSync(srcCreds)) {
     throw new Error(`No credentials found in ${sourceDir} — sign in first.`);

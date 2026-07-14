@@ -103,10 +103,7 @@ function runClaude(args: string[], dir: string, timeoutMs: number): Promise<stri
  * Returns the authenticated account for a config dir, or null if the CLI call
  * fails or the dir isn't logged in. Never throws.
  */
-export async function getAuthStatus(
-  dir: string,
-  timeoutMs = 15000
-): Promise<AuthStatus | null> {
+export async function getAuthStatus(dir: string, timeoutMs = 15000): Promise<AuthStatus | null> {
   try {
     const out = await runClaude(['auth', 'status', '--json'], dir, timeoutMs);
     const parsed = JSON.parse(out) as AuthStatus;

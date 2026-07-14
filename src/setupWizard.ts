@@ -143,7 +143,10 @@ export class SetupWizard {
       opts.silent && identity && hasCredentials(sourceDir)
         ? { loggedIn: true, email: identity.email, orgName: identity.organizationName }
         : await vscode.window.withProgress(
-            { location: vscode.ProgressLocation.Notification, title: 'Reading current Claude account…' },
+            {
+              location: vscode.ProgressLocation.Notification,
+              title: 'Reading current Claude account…',
+            },
             () => getAuthStatus(sourceDir)
           );
 
@@ -360,7 +363,9 @@ export class SetupWizard {
     // full disk). The store is intact, so restock it; concluding "logout" here
     // would forget — and sign out — a perfectly good account over an IO hiccup.
     if (!looksLikeLogout(dir) && hasCredentials(account.dir)) {
-      log(`working dir ${dir} lost its token but kept its identity — restocking from ${account.name}`);
+      log(
+        `working dir ${dir} lost its token but kept its identity — restocking from ${account.name}`
+      );
       materialize(account, dir, true);
       await this.requestWindowReload(
         `Restored ${this.registry.emailOf(account) ?? account.name} for this window.`
@@ -413,13 +418,12 @@ export class SetupWizard {
 
     const folderPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const settingsRoutes = (
-      vscode.workspace.getConfiguration('claudeAccounts').get<WorkspaceRoute[]>('workspaceRoutes', []) ||
-      []
+      vscode.workspace
+        .getConfiguration('claudeAccounts')
+        .get<WorkspaceRoute[]>('workspaceRoutes', []) || []
     ).filter((r) => r?.pathPrefix && r?.email);
     const settingsPin =
-      folderPath && settingsRoutes.length
-        ? matchWorkspaceRoute(folderPath, settingsRoutes)
-        : null;
+      folderPath && settingsRoutes.length ? matchWorkspaceRoute(folderPath, settingsRoutes) : null;
 
     const picked = await vscode.window.showQuickPick(items, {
       title: 'Switch Claude account for this window (reloads the window)',
@@ -572,10 +576,14 @@ export class SetupWizard {
  */
 function suggestName(email: string, available: (n: string) => boolean): string {
   const slug = (s: string) =>
-    s.replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'account';
+    s
+      .replace(/[^a-z0-9]+/gi, '-')
+      .replace(/^-+|-+$/g, '')
+      .toLowerCase() || 'account';
   const [local = 'account', domain = ''] = email.split('@');
   const candidates = [slug(local), domain ? slug(`${local}-${domain}`) : ''].filter(Boolean);
   for (const c of candidates) if (available(c)) return c;
-  for (let i = 2; i < 100; i++) if (available(`${candidates[0]}${i}`)) return `${candidates[0]}${i}`;
+  for (let i = 2; i < 100; i++)
+    if (available(`${candidates[0]}${i}`)) return `${candidates[0]}${i}`;
   return candidates[0];
 }

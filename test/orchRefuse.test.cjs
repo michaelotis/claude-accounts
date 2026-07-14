@@ -26,11 +26,7 @@ describe('claude-orch refuse on matched-but-missing pin', () => {
     );
 
     const stub = path.join(tmp, 'fake-claude');
-    fs.writeFileSync(
-      stub,
-      '#!/usr/bin/env bash\necho "RAN:$CLAUDE_CONFIG_DIR"\n',
-      { mode: 0o755 }
-    );
+    fs.writeFileSync(stub, '#!/usr/bin/env bash\necho "RAN:$CLAUDE_CONFIG_DIR"\n', { mode: 0o755 });
 
     const result = spawnSync('bash', [orch], {
       cwd: tmp,
@@ -106,11 +102,7 @@ describe('pick-account prefers metered over unmetered 0%', () => {
       encoding: 'utf8',
     });
 
-    assert.equal(
-      stdout.trim(),
-      meteredDir,
-      `expected metered dir, got: ${JSON.stringify(stdout)}`
-    );
+    assert.equal(stdout.trim(), meteredDir, `expected metered dir, got: ${JSON.stringify(stdout)}`);
 
     try {
       fs.rmSync(tmp, { recursive: true, force: true });

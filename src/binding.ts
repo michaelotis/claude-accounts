@@ -108,9 +108,7 @@ export class WindowBinding {
       this.applyTerminalEnv(undefined);
     }
     const map = this.getRepoMap();
-    const filtered = Object.fromEntries(
-      Object.entries(map).filter(([, v]) => v !== account.name)
-    );
+    const filtered = Object.fromEntries(Object.entries(map).filter(([, v]) => v !== account.name));
     if (Object.keys(filtered).length !== Object.keys(map).length) {
       await this.context.globalState.update(REPO_MAP_KEY, filtered);
     }
@@ -292,8 +290,7 @@ export class WindowBinding {
     const dirEmail = readIdentity(dir)?.email;
     const accountEmail = account.email ?? readIdentity(account.dir)?.email;
     const stocked =
-      hasCredentials(dir) &&
-      (!dirEmail || !accountEmail || emailsEqual(dirEmail, accountEmail));
+      hasCredentials(dir) && (!dirEmail || !accountEmail || emailsEqual(dirEmail, accountEmail));
 
     if (stocked || !fromPreferred || isLogout) {
       // Set env when stocked; also for an empty non-preferred dir or a logged-out

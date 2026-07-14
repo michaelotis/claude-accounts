@@ -8,10 +8,7 @@ const path = require('path');
  * Parse both arrays textually so drift fails the suite.
  */
 function parseStringArray(src, name) {
-  const re = new RegExp(
-    `(?:const|let|var)\\s+${name}\\s*=\\s*\\[([\\s\\S]*?)\\];`,
-    'm'
-  );
+  const re = new RegExp(`(?:const|let|var)\\s+${name}\\s*=\\s*\\[([\\s\\S]*?)\\];`, 'm');
   const m = re.exec(src);
   if (!m) throw new Error(`could not find ${name} array`);
   const body = m[1];

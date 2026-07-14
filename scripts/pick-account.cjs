@@ -62,9 +62,7 @@ if (!order.length) {
 function byEmail(email) {
   const want = (email || '').trim().toLowerCase();
   if (!want) return null;
-  return (
-    accounts.find((a) => a && (a.email || '').trim().toLowerCase() === want) || null
-  );
+  return accounts.find((a) => a && (a.email || '').trim().toLowerCase() === want) || null;
 }
 
 // 1) Workspace hard pin

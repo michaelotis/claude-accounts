@@ -64,7 +64,8 @@ export function workingRoot(): string {
  */
 export function windowWorkingDir(context: vscode.ExtensionContext): string {
   const identity =
-    vscode.workspace.workspaceFile?.toString() ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    vscode.workspace.workspaceFile?.toString() ??
+    vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (identity) {
     const id = crypto.createHash('sha1').update(identity).digest('hex').slice(0, 12);
     return path.join(workingRoot(), id);
@@ -99,7 +100,10 @@ export function materialize(account: Account, workingDir: string, force = false)
   if (hasCredentials(workingDir) && readIdentity(workingDir)?.email === account.email) return false;
   try {
     fs.mkdirSync(workingDir, { recursive: true, mode: 0o700 });
-    copyFile(path.join(account.dir, '.credentials.json'), path.join(workingDir, '.credentials.json'));
+    copyFile(
+      path.join(account.dir, '.credentials.json'),
+      path.join(workingDir, '.credentials.json')
+    );
     // The config carries the account's identity AND its per-project state (folder
     // trust, allowed tools, MCP servers), so an account keeps those wherever it runs.
     copyFile(path.join(account.dir, '.claude.json'), path.join(workingDir, '.claude.json'));

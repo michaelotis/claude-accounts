@@ -97,6 +97,10 @@ describe('syncMcpServers', () => {
     const contentAfterSecond = fs.readFileSync(cfgPath);
     const mtimeAfterSecond = fs.statSync(cfgPath).mtimeMs;
     assert.ok(contentAfterFirst.equals(contentAfterSecond), 'second call leaves content unchanged');
-    assert.equal(mtimeAfterSecond, mtimeAfterFirst, 'second call is a no-op write (mtime unchanged)');
+    assert.equal(
+      mtimeAfterSecond,
+      mtimeAfterFirst,
+      'second call is a no-op write (mtime unchanged)'
+    );
   });
 });

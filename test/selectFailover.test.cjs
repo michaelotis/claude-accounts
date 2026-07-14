@@ -13,12 +13,7 @@ esbuild.buildSync({
   format: 'cjs',
   outfile: out,
 });
-const {
-  selectFailoverAccount,
-  usageScore,
-  DEFAULT_THRESHOLDS,
-  DEFAULT_TRIGGERS,
-} = require(out);
+const { selectFailoverAccount, usageScore, DEFAULT_THRESHOLDS, DEFAULT_TRIGGERS } = require(out);
 
 const thr = DEFAULT_THRESHOLDS;
 const trig = DEFAULT_TRIGGERS; // session+weekly, not fable
@@ -71,10 +66,11 @@ describe('selectFailoverAccount lowestUsage', () => {
   });
 
   it('when all hot, picks least bad', () => {
-    const chosen = selectFailoverAccount(
-      [acc('a@x.com', 99, 99), acc('b@x.com', 91, 95)],
-      { strategy: 'lowestUsage', thresholds: thr, triggers: trig }
-    );
+    const chosen = selectFailoverAccount([acc('a@x.com', 99, 99), acc('b@x.com', 91, 95)], {
+      strategy: 'lowestUsage',
+      thresholds: thr,
+      triggers: trig,
+    });
     assert.equal(chosen.email, 'b@x.com');
   });
 });
@@ -94,15 +90,12 @@ describe('selectFailoverAccount ordered', () => {
   });
 
   it('falls back to first in order if all hot', () => {
-    const chosen = selectFailoverAccount(
-      [acc('a@x.com', 99, 99), acc('b@x.com', 98, 98)],
-      {
-        strategy: 'ordered',
-        order: ['a@x.com', 'b@x.com'],
-        thresholds: thr,
-        triggers: trig,
-      }
-    );
+    const chosen = selectFailoverAccount([acc('a@x.com', 99, 99), acc('b@x.com', 98, 98)], {
+      strategy: 'ordered',
+      order: ['a@x.com', 'b@x.com'],
+      thresholds: thr,
+      triggers: trig,
+    });
     assert.equal(chosen.email, 'a@x.com');
   });
 });

@@ -100,7 +100,9 @@ describe('buildSnapshot + triggers', () => {
       '/tmp/fake'
     );
     assert.equal(needsFailover(snap, DEFAULT_THRESHOLDS, DEFAULT_TRIGGERS), true);
-    assert.ok(failoverReasons(snap, DEFAULT_THRESHOLDS, DEFAULT_TRIGGERS).some((r) => /5h/.test(r)));
+    assert.ok(
+      failoverReasons(snap, DEFAULT_THRESHOLDS, DEFAULT_TRIGGERS).some((r) => /5h/.test(r))
+    );
   });
 
   it('weekly trigger when 7d is high', () => {
@@ -114,8 +116,14 @@ describe('buildSnapshot + triggers', () => {
       profile,
       '/tmp/fake'
     );
-    assert.equal(needsFailover(snap, DEFAULT_THRESHOLDS, { session: false, weekly: true, fable: false }), true);
-    assert.equal(needsFailover(snap, DEFAULT_THRESHOLDS, { session: true, weekly: false, fable: false }), false);
+    assert.equal(
+      needsFailover(snap, DEFAULT_THRESHOLDS, { session: false, weekly: true, fable: false }),
+      true
+    );
+    assert.equal(
+      needsFailover(snap, DEFAULT_THRESHOLDS, { session: true, weekly: false, fable: false }),
+      false
+    );
   });
 });
 
