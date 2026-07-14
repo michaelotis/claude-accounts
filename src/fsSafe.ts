@@ -203,14 +203,19 @@ function sleepSync(ms: number): void {
 /**
  * Runs `fn` holding an advisory lock on `<lockDir>`, synchronously. Intended for
  * SHORT read-modify-write critical sections on files this extension owns. If the
- * lock can't be taken within the cap it runs `fn` anyway (best-effort: these
- * writes already degrade gracefully, and blocking a poll forever is worse).
+ * lock can't be taken within the cap it runs `fn` anyway (best-effort: these writes
+ * already degrade gracefully, and blocking a poll forever is worse) — UNLESS
+ * `skipIfUnacquired` is set, in which case `fn` is NOT run and `undefined` is
+ * returned. Use that when running `fn` unlocked would be unsafe (a compare-and-set
+ * on a credential store that another process may be rotating): skipping and retrying
+ * is correct; a stale-read unlocked write is not. Keep the cap SHORT there — the wait
+ * is a synchronous main-thread block.
  */
 export function withLock<T>(
   lockDir: string,
   fn: () => T,
-  opts: { staleMs?: number; capMs?: number; stepMs?: number } = {}
-): T {
+  opts: { staleMs?: number; capMs?: number; stepMs?: number; skipIfUnacquired?: boolean } = {}
+): T | undefined {
   const staleMs = opts.staleMs ?? 15_000;
   const capMs = opts.capMs ?? 2_000;
   const stepMs = opts.stepMs ?? 15;
@@ -224,6 +229,7 @@ export function withLock<T>(
     sleepSync(stepMs);
     waited += stepMs;
   }
+  if (!held && opts.skipIfUnacquired) return undefined;
   try {
     return fn();
   } finally {

@@ -7,7 +7,7 @@ import { isDeepStrictEqual } from 'util';
 import { Account, readIdentity, hasCredentials } from './accounts';
 import { isReservedClaudeDirName } from './sidecars';
 import { log } from './log';
-import { writeFileAtomic, copyFileAtomic } from './fsSafe';
+import { writeFileAtomic, copyFileAtomic, withLockAsync } from './fsSafe';
 
 /**
  * Per-window working directories.
@@ -173,6 +173,44 @@ export function sameCredential(a: Buffer, b: Buffer): boolean {
 }
 
 /**
+ * The access-token expiry (ms since epoch) recorded in a `.credentials.json`, or
+ * null when it is absent/unparseable. Used to decide which of two grants for the
+ * SAME account is the freshest — a refresh mints a new expiry, so the higher one
+ * is the more recently refreshed grant.
+ */
+export function tokenExpiry(buf: Buffer): number | null {
+  try {
+    const d = JSON.parse(buf.toString('utf-8')) as {
+      claudeAiOauth?: { expiresAt?: number };
+      expiresAt?: number;
+    };
+    const e = d.claudeAiOauth?.expiresAt ?? d.expiresAt;
+    return typeof e === 'number' ? e : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when `candidate` is a STRICTLY-OLDER, DIFFERENT grant than `reference` —
+ * i.e. `reference` is the fresher of two grants for one account.
+ *
+ * This is the whole basis of the self-healing token model. When two windows run
+ * the same account, each holds a copy of the store's grant; when either refreshes,
+ * Anthropic rotates the refresh token, so the copies diverge into a newer grant
+ * (the one that refreshed) and one or more older, now-dead ones. "Same account,
+ * different refresh token, older expiry" is exactly that stale copy — and never a
+ * legitimate state to propagate. The same-lineage case (`sameCredential`, e.g. an
+ * access-token refresh in place) is NOT stale; nor is an equal/newer expiry.
+ */
+export function isStaleAgainstStore(candidate: Buffer, reference: Buffer): boolean {
+  if (sameCredential(candidate, reference)) return false;
+  const c = tokenExpiry(candidate);
+  const r = tokenExpiry(reference);
+  return c != null && r != null && r > c;
+}
+
+/**
  * Cross-account contamination tripwire. Returns the path of another account
  * store that already holds this exact OAuth grant under a DIFFERENT identity, or
  * null.
@@ -239,27 +277,87 @@ export function foreignTokenConflict(
  * contamination tripwire): a working dir whose identity has drifted from its
  * token would otherwise write one account's credential into another's store.
  */
-export function refreshStore(account: Account, workingDir: string): void {
+export async function refreshStore(account: Account, workingDir: string): Promise<void> {
   const src = path.join(workingDir, '.credentials.json');
   const dst = path.join(account.dir, '.credentials.json');
   try {
     if (!fs.existsSync(src)) return;
     const incoming = fs.readFileSync(src);
-    if (fs.existsSync(dst) && fs.readFileSync(dst).equals(incoming)) return;
-    const conflict = foreignTokenConflict(account.dir, incoming, account.email);
-    if (conflict) {
-      log(
-        `workdir: REFUSED store refresh of ${account.name} — that token already belongs to ` +
-          `${conflict} (cross-account contamination guard)`
-      );
-      return;
+    // Serialize the read-compare-write on the store's credentials — the SAME lock
+    // ensureFreshToken (usage.ts) takes when it rotates a store token — so newest-
+    // wins is a real compare-and-set, not a lock-free RMW that could publish an
+    // older grant over a concurrently-written newer one. Async lock: it awaits
+    // between attempts (never a synchronous Atomics.wait), so it can't freeze the
+    // extension host even while ensureFreshToken holds this lock across a
+    // multi-second OAuth refresh. skipIfUnacquired: never write unlocked on a stale
+    // read — skip and let a later reconcile retry (the holder is publishing a grant
+    // anyway). The callers (reconcile, captureCurrentAccount) are already async.
+    const { locked } = await withLockAsync(
+      `${dst}.lock`,
+      () => {
+        if (fs.existsSync(dst)) {
+          const cur = fs.readFileSync(dst);
+          if (cur.equals(incoming)) return;
+          // Never regress the store. A same-lineage refresh (same refresh token)
+          // always writes through. A DIFFERENT grant is adopted only when it is a
+          // VALID grant (parseable expiry) AND either the store's current grant is
+          // unparseable/invalid or the incoming is strictly newer. This stops the
+          // multi-window flap (two windows writing divergent copies every reconcile)
+          // and refuses a corrupt/older/equal copy — while still letting a valid
+          // grant repair an unparseable store.
+          if (!sameCredential(incoming, cur)) {
+            const inExp = tokenExpiry(incoming);
+            const curExp = tokenExpiry(cur);
+            const adopt = inExp != null && (curExp == null || inExp > curExp);
+            if (!adopt) {
+              log(
+                `workdir: kept store of ${account.email ?? account.name} — incoming grant is not confirmably newer`
+              );
+              return;
+            }
+          }
+        }
+        const conflict = foreignTokenConflict(account.dir, incoming, account.email);
+        if (conflict) {
+          log(
+            `workdir: REFUSED store refresh of ${account.name} — that token already belongs to ` +
+              `${conflict} (cross-account contamination guard)`
+          );
+          return;
+        }
+        fs.mkdirSync(account.dir, { recursive: true, mode: 0o700 });
+        // Unique-temp atomic write: a half-written store is worse than a stale one.
+        writeFileAtomic(dst, incoming, { mode: 0o600 });
+        log(`workdir: refreshed store of ${account.email ?? account.name}`);
+      },
+      { capMs: 3_000, skipIfUnacquired: true }
+    );
+    if (!locked) {
+      log(`workdir: store of ${account.email ?? account.name} is busy — deferred refresh`);
     }
-    fs.mkdirSync(account.dir, { recursive: true, mode: 0o700 });
-    // Unique-temp atomic write: a half-written store is worse than a stale one.
-    writeFileAtomic(dst, incoming, { mode: 0o600 });
-    log(`workdir: refreshed store of ${account.email ?? account.name}`);
   } catch (err) {
     log(`workdir: could not refresh store of ${account.name}: ${(err as Error).message}`);
+  }
+}
+
+/**
+ * Copies ONLY the token (`.credentials.json`) from `storeDir` into `workingDir`,
+ * leaving the dir's `.claude.json` (its live per-project state — trusted folders,
+ * allowed tools, project-scope MCP) untouched. The self-heal uses this instead of a
+ * full `materialize`: only the credential is stale, and re-copying the store's
+ * frozen `.claude.json` would revert the window's accumulated project state. Returns
+ * true when the token is in place afterward.
+ */
+export function restockTokenOnly(storeDir: string, workingDir: string): boolean {
+  try {
+    const src = path.join(storeDir, '.credentials.json');
+    if (!fs.existsSync(src)) return false;
+    fs.mkdirSync(workingDir, { recursive: true, mode: 0o700 });
+    copyFileAtomic(src, path.join(workingDir, '.credentials.json'), 0o600);
+    return hasCredentials(workingDir);
+  } catch (err) {
+    log(`workdir: could not restock token into ${workingDir}: ${(err as Error).message}`);
+    return false;
   }
 }
 

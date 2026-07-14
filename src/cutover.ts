@@ -44,6 +44,10 @@ export class IdleCutoverController {
   private pending = false;
   private busy = false;
   private evaluating = false;
+  // A heal or a failover switch is rewriting this window's dir + reloading. Both do
+  // that, so they must be mutually exclusive (and heal single-flight); interleaving
+  // them can land the reload on the wrong account.
+  private mutating = false;
   private startupTimer: ReturnType<typeof setTimeout> | undefined;
 
   private panelMode: PanelCutoverMode = 'off';
@@ -66,7 +70,13 @@ export class IdleCutoverController {
     };
     this.watcher.onIdle = () => {
       this.busy = false;
-      void this.onBecameIdle();
+      // Failover THEN heal, in sequence — never concurrently: a failover switchTo
+      // and a heal both rewrite this window's dir, and racing them could reload onto
+      // the wrong account. Heal is independent of failover settings (token health).
+      void (async () => {
+        await this.onBecameIdle();
+        this.maybeHeal();
+      })();
     };
   }
 
@@ -92,6 +102,9 @@ export class IdleCutoverController {
     // If we restored pending and already idle, evaluate (no busy→idle edge)
     this.startupTimer = setTimeout(() => {
       this.startupTimer = undefined;
+      // Heal a window that came up on a stale grant (another window rotated the
+      // shared token while this one was closed).
+      this.maybeHeal();
       if (this.pending && this.watcher.getPhase() === 'idle' && !this.busy) {
         void this.evaluateAndMaybeCutover(['startup-pending']);
       }
@@ -111,6 +124,26 @@ export class IdleCutoverController {
       return;
     }
     void this.evaluateAndMaybeCutover(reasons);
+  }
+
+  /**
+   * Run the stale-token heal, but only while the turn is idle — never mid-stream.
+   * Safe to call from any "just settled / about to be used" signal (the idle edge,
+   * startup, window focus). Passes the live turn state so heal re-checks it right
+   * before reloading (the async gap between here and the reload can span a new turn).
+   */
+  maybeHeal(): void {
+    if (this.busy || this.watcher.getPhase() === 'in_turn') return;
+    // Single-flight, and mutually exclusive with a failover switch — both rewrite the
+    // dir + reload. The check-then-set is atomic (synchronous, single-threaded).
+    if (this.mutating) return;
+    this.mutating = true;
+    void this.wizard
+      .healStaleTokenIfNeeded(() => this.busy || this.watcher.getPhase() === 'in_turn')
+      .catch((e) => log(`cutover: heal error — ${e instanceof Error ? e.message : String(e)}`))
+      .finally(() => {
+        this.mutating = false;
+      });
   }
 
   private async onBecameIdle(): Promise<void> {
@@ -186,16 +219,30 @@ export class IdleCutoverController {
         log('cutover: turn resumed before switch — defer');
         return;
       }
-
-      this.pending = false;
-      await this.context.workspaceState.update(PENDING_KEY, false);
-      await this.context.workspaceState.update(AUTO_COOLDOWN_KEY, now);
-      log(`cutover: idleReload → ${nextEmail}`);
-      void vscode.window.setStatusBarMessage(
-        `Claude Accounts: switching to ${nextEmail} after idle turn…`,
-        8_000
-      );
-      await this.wizard.switchTo(next);
+      // Don't switch on top of an in-flight heal — both rewrite this window's dir and
+      // reload, and interleaving them can land the reload on the wrong account. Defer;
+      // the next pressure re-evaluates once the heal's reload has settled. (check-then-
+      // set is atomic — synchronous, single-threaded.)
+      if (this.mutating) {
+        this.pending = true;
+        await this.context.workspaceState.update(PENDING_KEY, true);
+        log('cutover: heal in flight — deferring switch');
+        return;
+      }
+      this.mutating = true;
+      try {
+        this.pending = false;
+        await this.context.workspaceState.update(PENDING_KEY, false);
+        await this.context.workspaceState.update(AUTO_COOLDOWN_KEY, now);
+        log(`cutover: idleReload → ${nextEmail}`);
+        void vscode.window.setStatusBarMessage(
+          `Claude Accounts: switching to ${nextEmail} after idle turn…`,
+          8_000
+        );
+        await this.wizard.switchTo(next);
+      } finally {
+        this.mutating = false;
+      }
     } catch (err) {
       log(`cutover error: ${err instanceof Error ? err.message : String(err)}`);
     } finally {

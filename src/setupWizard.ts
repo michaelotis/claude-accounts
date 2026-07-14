@@ -12,10 +12,12 @@ import {
   refreshStore,
   allWorkingDirs,
   materialize,
+  restockTokenOnly,
   syncMcpServers,
   linkUserSettings,
   foreignTokenConflict,
   sameCredential,
+  isStaleAgainstStore,
 } from './workdir';
 import { log } from './log';
 import { emailsEqual, matchWorkspaceRoute, type WorkspaceRoute } from './workspaceRoutes';
@@ -174,7 +176,7 @@ export class SetupWizard {
     if (known) {
       known.email = status.email;
       await this.registry.add(known);
-      refreshStore(known, sourceDir);
+      await refreshStore(known, sourceDir);
       await this.binding.bind(known);
       if (!opts.quiet) {
         vscode.window.showInformationMessage(`${status.email} — this window is bound to it.`);
@@ -443,9 +445,18 @@ export class SetupWizard {
       // Keep the store's token in step with the dir (same account — cannot
       // cross-contaminate; refreshStore also carries the tripwire as defence in
       // depth). And keep Claude Code's own default dir signed in as this account, so
-      // losing the extension never leaves the user signed out.
-      refreshStore(account, dir);
-      mirrorToDefault(dir, readIdentity(dir));
+      // losing the extension never leaves the user signed out — UNLESS this dir holds
+      // a STALE grant (an older copy another window already rotated past). Mirroring a
+      // stale grant would regress ~/.claude (the vanilla-Claude-Code safety net) to a
+      // dead token until this window heals; skip the mirror while stale and let a
+      // later reconcile mirror the live grant.
+      await refreshStore(account, dir);
+      const storeTok = this.readToken(account.dir);
+      if (ndTok && storeTok && isStaleAgainstStore(ndTok, storeTok)) {
+        log(`reconcile: dir grant is stale vs store — not mirroring to default (heal pending)`);
+      } else {
+        mirrorToDefault(dir, readIdentity(dir));
+      }
     }
     // Propagate newly-added home MCP servers into already-stocked windows.
     syncMcpServers(dir);
@@ -482,6 +493,98 @@ export class SetupWizard {
       await this.requestWindowReload(
         `Signed in as ${email} — reloading so Claude Code fully switches to it.`
       );
+    }
+  }
+
+  /**
+   * Self-heal a window whose shared-account token has gone stale.
+   *
+   * Two windows running one account share a grant (each a copy of the store's).
+   * When either refreshes, Anthropic rotates the refresh token: the window that
+   * refreshed gets the new grant and carries it to the store (refreshStore is
+   * newest-wins), while the OTHERS still hold the old, now-dead one. A stale window
+   * keeps working on its unexpired access token, then fails on its next refresh and
+   * shows signed-out.
+   *
+   * So: when this window's dir holds a STRICTLY-OLDER grant than its account's
+   * store, re-stock the dir's TOKEN from the store and reload, so Claude Code
+   * re-reads the live token (it only reads credentials at activation). Called off
+   * the TurnWatcher's idle edge / startup / focus (see IdleCutoverController), and
+   * `isBusy()` is re-checked immediately before the destructive steps, so a turn
+   * that resumed since the idle edge defers the heal rather than reloading
+   * mid-stream. Loop-safe: it changes the dir's token BEFORE reloading (the same
+   * staleness can't re-fire) and requestWindowReload meters reloads to one/minute.
+   *
+   * This is not a total cure: a window that goes stale and then never has another
+   * turn/focus event heals only at its next use (bounded by the access-token
+   * lifetime — worst case one failed action, then auto-heal). And, like reconcile's
+   * contaminated-store branch, it cannot detect a store token that was overwritten
+   * by another account and lives nowhere else (no identity is carried in the token).
+   *
+   * Returns true when a heal+reload was initiated.
+   */
+  async healStaleTokenIfNeeded(isBusy?: () => boolean): Promise<boolean> {
+    try {
+      // Never overlap an in-flight reconcile — both can rewrite + reload. A skip is
+      // retried on the next idle/focus edge.
+      if (this.reconciling) return false;
+      // Only a bound window on its OWN working dir: the default dir is Claude Code's
+      // own, and an unbound window has no account to heal against.
+      const dir = this.binding.getEnvDir();
+      if (!dir) return false;
+      const active = this.binding.getActiveName();
+      const account = active ? this.registry.get(active) : undefined;
+      if (!account) return false;
+      if (!hasCredentials(dir) || !hasCredentials(account.dir)) return false;
+
+      // Heal only a window that still runs its bound account. An identity mismatch is
+      // drift — reconcile owns that, decided by the token — and healing across it
+      // could pull the wrong account's grant in.
+      const boundEmail = this.registry.emailOf(account);
+      if (!emailsEqual(readIdentity(dir)?.email, boundEmail)) return false;
+
+      const dirTok = this.readToken(dir);
+      const storeTok = this.readToken(account.dir);
+      if (!dirTok || !storeTok) return false;
+      // Stale ⇔ the store holds a strictly-newer, DIFFERENT grant. If this dir is the
+      // newer one, it just refreshed — refreshStore carries it to the store; pulling
+      // the store back would regress it.
+      if (!isStaleAgainstStore(dirTok, storeTok)) return false;
+
+      // Defence in depth: refuse any grant a DIFFERENT-email store owns. (Cannot
+      // catch a store token overwritten by another account that lives nowhere else —
+      // the dual-home blind spot reconcile's contaminated-store branch also has.)
+      if (foreignTokenConflict(dir, storeTok, boundEmail)) return false;
+
+      // Metered: if we reloaded within the cooldown, skip WITHOUT touching the dir, so
+      // the next edge re-evaluates against unchanged state (no partial heal).
+      if (this.recentlyReloaded()) return false;
+
+      // Final turn re-check: a turn may have resumed since the idle edge that called
+      // us. Bail BEFORE any destructive step so we never reload mid-stream.
+      if (isBusy?.()) return false;
+
+      log(
+        `heal: ${dir} holds a stale grant for ${boundEmail ?? account.name} (store is newer) — ` +
+          `re-stocking token from store and reloading`
+      );
+      // Write the live token FIRST — token only, never the store's frozen
+      // .claude.json (that would revert the window's live per-project state) — and
+      // verify it took, so a failed copy can't leave the window interrupted but
+      // stale. This also changes the dir's token BEFORE the reload, so the same
+      // staleness can't re-fire into a loop.
+      if (!restockTokenOnly(account.dir, dir)) return false;
+      // Then SIGKILL this window's live Claude Code so its graceful-reload shutdown
+      // can't flush the stale in-memory token back over what we just wrote (the
+      // interrupt-before-replace pattern logout/forget use). SIGKILL cannot flush.
+      interruptSessions([dir]);
+      await this.requestWindowReload(
+        `Refreshed ${boundEmail ?? account.name}'s session for this window.`
+      );
+      return true;
+    } catch (err) {
+      log(`heal: error — ${err instanceof Error ? err.message : String(err)}`);
+      return false;
     }
   }
 
