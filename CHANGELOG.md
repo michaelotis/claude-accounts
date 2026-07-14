@@ -1,9 +1,26 @@
 # Changelog
 
+## 0.9.1
+
+### Fixed
+- **Critical — account credential cross-contamination.** With more than one saved account, one account's OAuth token could be written into another account's store, leaving every `.credentials.json` sharing a single token: switching to account B ran as account A, and a `/logout` could sign out both. Root cause: reconcile copied a working dir's token into the store chosen by the dir's _identity_ file, which can drift from the token. Now:
+  - token propagation is decided by which account actually **owns** the token (matched on its refresh token), never the mutable identity field;
+  - a hard tripwire refuses to write a grant into any store it doesn't belong to (fails closed on unreadable identity, skips sidecars), and the capture/snapshot path is guarded the same way;
+  - a working dir whose identity drifted but whose token is unchanged is corrected in place — no reload, no store write;
+  - a store detected as contaminated prompts a one-time "sign in again" instead of looping.
+- Account switching no longer reverts on reload for contaminated stores; a fresh sign-in restores the affected account cleanly.
+
 ## 0.9.0
 
-- Release 0.9.0
+### Improved
+- Multi-window data integrity: atomic writes (unique temp files) and advisory locks for the shared `$HOME` files; on-disk `policy.json` membership; single-writer shared-history migration; per-account 429 backoff; serialized token refresh; overlap-guarded polling
+- MCP servers configured at user scope now propagate into managed windows
+- `~/.claude/settings.json` (auto-compact threshold + message, model, hooks) is shared into every managed window
+- Usage meter colors the individual over-threshold metric, not the whole bar
 
+### Fixed
+- Account safety: logout no longer resurrects a revoked token; the CLI orchestrator fails closed on a missing pin; cutover never fires mid-turn
+- Stripped personal context; added ESLint + Prettier in CI
 
 ## 0.8.2
 

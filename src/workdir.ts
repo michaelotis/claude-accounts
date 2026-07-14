@@ -5,6 +5,7 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import { isDeepStrictEqual } from 'util';
 import { Account, readIdentity, hasCredentials } from './accounts';
+import { isReservedClaudeDirName } from './sidecars';
 import { log } from './log';
 import { writeFileAtomic, copyFileAtomic } from './fsSafe';
 
@@ -97,7 +98,21 @@ export function windowWorkingDir(context: vscode.ExtensionContext): string {
 export function materialize(account: Account, workingDir: string, force = false): boolean {
   const exists = fs.existsSync(workingDir);
   if (exists && !hasCredentials(workingDir) && !force) return false; // emptied by a logout
-  if (hasCredentials(workingDir) && readIdentity(workingDir)?.email === account.email) return false;
+  if (hasCredentials(workingDir) && readIdentity(workingDir)?.email === account.email) {
+    // Same account already. Without force, never churn (the dir's copy may hold a
+    // newer refreshed token). WITH force, still skip only when the GRANT also
+    // matches — a forced restock must overwrite a dir that wears this account's
+    // identity but holds a DIFFERENT (foreign/mismatched) token, or a re-assert
+    // could never repair such a mix.
+    if (!force) return false;
+    try {
+      const dirTok = fs.readFileSync(path.join(workingDir, '.credentials.json'));
+      const storeTok = fs.readFileSync(path.join(account.dir, '.credentials.json'));
+      if (sameCredential(dirTok, storeTok)) return false;
+    } catch {
+      return false; // can't compare — leave the dir as-is rather than risk churn
+    }
+  }
   try {
     fs.mkdirSync(workingDir, { recursive: true, mode: 0o700 });
     copyFile(
@@ -122,10 +137,107 @@ export function materialize(account: Account, workingDir: string, force = false)
 }
 
 /**
+ * A stable fingerprint identifying which ACCOUNT a `.credentials.json` belongs to,
+ * independent of JSON key order, whitespace, or volatile fields like `expiresAt`
+ * and the rotating access token. Two files carrying the same account's grant
+ * fingerprint equal even after an access-token refresh; different accounts differ.
+ * Falls back to the raw bytes when the buffer isn't the expected token JSON.
+ */
+export function credentialFingerprint(buf: Buffer): string {
+  try {
+    const d = JSON.parse(buf.toString('utf-8')) as {
+      claudeAiOauth?: { refreshToken?: string; accessToken?: string };
+      refreshToken?: string;
+      accessToken?: string;
+    };
+    const o = d.claudeAiOauth ?? d;
+    // Fingerprint on the REFRESH token: it is the stable, account-identifying
+    // secret shared by every copy of a grant, and the one a /logout revokes. The
+    // ACCESS token rotates in place on every refresh (per-dir, and by Claude Code
+    // itself), so keying on it would make two copies of the SAME account's grant
+    // look like different accounts the moment either refreshed — letting a
+    // refreshed copy slip past the contamination guard.
+    const rt = o?.refreshToken ?? d.refreshToken;
+    if (rt) return `rt:${rt}`;
+    const at = o?.accessToken ?? d.accessToken;
+    if (at) return `at:${at}`;
+  } catch {
+    /* not token JSON — fall through to raw bytes */
+  }
+  return `raw:${buf.toString('base64')}`;
+}
+
+/** True when two credential buffers carry the same underlying OAuth grant. */
+export function sameCredential(a: Buffer, b: Buffer): boolean {
+  return credentialFingerprint(a) === credentialFingerprint(b);
+}
+
+/**
+ * Cross-account contamination tripwire. Returns the path of another account
+ * store that already holds this exact OAuth grant under a DIFFERENT identity, or
+ * null.
+ *
+ * Two accounts can never legitimately share one OAuth grant, so a token about to
+ * be written into account A's store that already lives in account B's store is
+ * the signature of the credential mix that once left every account sharing a
+ * single token (one account's `/logout` then killing them all). Same-email
+ * duplicate stores DO legitimately share a grant, so an identity match never
+ * conflicts.
+ *
+ * Fails CLOSED: if the target store's own identity can't be read (corrupt/absent
+ * `.claude.json`), the caller passes the account's known email as `targetEmail`;
+ * and when another store owns the grant under a known email while the target's is
+ * unknown, that is still treated as a conflict — the mix must not slip through an
+ * unreadable identity file.
+ */
+export function foreignTokenConflict(
+  targetStoreDir: string,
+  token: Buffer,
+  targetEmail?: string
+): string | null {
+  const home = os.homedir();
+  const wantEmail = (readIdentity(targetStoreDir)?.email ?? targetEmail)?.trim().toLowerCase();
+  const wantFp = credentialFingerprint(token);
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(home, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const e of entries) {
+    if (!e.isDirectory() || !/^\.claude[-_]/.test(e.name)) continue;
+    // Skip extension internals and Docker/tool sidecars — they are not managed
+    // accounts, and one legitimately holding a copied token must not read as a mix.
+    if (isReservedClaudeDirName(e.name)) continue;
+    const dir = path.join(home, e.name);
+    if (path.normalize(dir) === path.normalize(targetStoreDir)) continue;
+    let buf: Buffer;
+    try {
+      buf = fs.readFileSync(path.join(dir, '.credentials.json'));
+    } catch {
+      continue; // no token here
+    }
+    if (credentialFingerprint(buf) !== wantFp) continue;
+    const otherEmail = readIdentity(dir)?.email?.trim().toLowerCase();
+    // A shared grant is legitimate ONLY between two copies of the SAME account —
+    // both identities readable AND equal. Every other case (different emails, or
+    // EITHER identity unreadable) cannot be proven same-account, so refuse: a
+    // shared grant we cannot attribute to one account is the contamination
+    // signature, and failing closed never wrongly writes a foreign token.
+    if (!(wantEmail && otherEmail && wantEmail === otherEmail)) return dir;
+  }
+  return null;
+}
+
+/**
  * Copies a working dir's (possibly refreshed) token back into the account's
  * store, so the store never falls far behind the credential actually in use.
  * Only the token: the store's config is the account's own and shouldn't be
  * churned by every window that runs it.
+ *
+ * Refuses when the incoming token already belongs to a DIFFERENT account (the
+ * contamination tripwire): a working dir whose identity has drifted from its
+ * token would otherwise write one account's credential into another's store.
  */
 export function refreshStore(account: Account, workingDir: string): void {
   const src = path.join(workingDir, '.credentials.json');
@@ -134,6 +246,14 @@ export function refreshStore(account: Account, workingDir: string): void {
     if (!fs.existsSync(src)) return;
     const incoming = fs.readFileSync(src);
     if (fs.existsSync(dst) && fs.readFileSync(dst).equals(incoming)) return;
+    const conflict = foreignTokenConflict(account.dir, incoming, account.email);
+    if (conflict) {
+      log(
+        `workdir: REFUSED store refresh of ${account.name} — that token already belongs to ` +
+          `${conflict} (cross-account contamination guard)`
+      );
+      return;
+    }
     fs.mkdirSync(account.dir, { recursive: true, mode: 0o700 });
     // Unique-temp atomic write: a half-written store is worse than a stale one.
     writeFileAtomic(dst, incoming, { mode: 0o600 });

@@ -4,6 +4,7 @@ import * as os from 'os';
 import { AuthStatus } from './cli';
 import { AccountIdentity } from './accounts';
 import { writeFileAtomic, copyFileAtomic } from './fsSafe';
+import { foreignTokenConflict } from './workdir';
 
 /**
  * Snapshots the account currently signed in inside `sourceDir` into a dedicated
@@ -18,6 +19,18 @@ export function snapshotAccount(sourceDir: string, targetDir: string, status: Au
   const srcCreds = path.join(sourceDir, '.credentials.json');
   if (!fs.existsSync(srcCreds)) {
     throw new Error(`No credentials found in ${sourceDir} — sign in first.`);
+  }
+
+  // Contamination tripwire: never mint/refill a store from a token that already
+  // belongs to a DIFFERENT account. Without this, a working dir whose identity
+  // drifted from its token (or a restore-forgotten of an email whose dir holds a
+  // foreign token) would snapshot one account's credential under another's name.
+  const conflict = foreignTokenConflict(targetDir, fs.readFileSync(srcCreds), status.email);
+  if (conflict) {
+    throw new Error(
+      `Refusing to save ${status.email ?? 'this account'} from ${sourceDir}: that token already ` +
+        `belongs to ${conflict}. Sign in as ${status.email ?? 'the intended account'} first.`
+    );
   }
 
   if (path.normalize(sourceDir) === path.normalize(targetDir)) {
@@ -47,6 +60,34 @@ export function snapshotAccount(sourceDir: string, targetDir: string, status: Au
     writeMinimalIdentity(dstIdentity, status);
   }
   ensureIdentity(targetDir, status);
+}
+
+/**
+ * Rewrites a dir's `.claude.json` oauthAccount to `identity`, leaving the token
+ * and every other key untouched. Used to correct an identity-only bleed — a dir
+ * that still HOLDS the right account's token but whose identity field was
+ * re-stamped (e.g. by Claude Code from the shared home config) — without pulling
+ * or pushing any credential.
+ */
+export function stampIdentity(dir: string, identity: AccountIdentity): void {
+  const file = path.join(dir, '.claude.json');
+  let obj: Record<string, unknown> = {};
+  if (fs.existsSync(file)) {
+    try {
+      obj = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    } catch {
+      obj = {};
+    }
+  }
+  // REPLACE oauthAccount wholesale rather than merge: a bled identity may have left
+  // a different account's uuid / displayName / org fields, and a merge would keep
+  // them. The token is untouched.
+  obj.oauthAccount = {
+    emailAddress: identity.email,
+    displayName: identity.displayName,
+    organizationName: identity.organizationName,
+  };
+  writeFileAtomic(file, JSON.stringify(obj, null, 2), { mode: 0o600 });
 }
 
 /** Makes sure oauthAccount in the target reflects `status` (best effort). */
