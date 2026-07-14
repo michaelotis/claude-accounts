@@ -235,13 +235,19 @@ export function linkUserSettings(workingDir: string): void {
       return; // already our link
     }
     if (st) {
-      // A real per-window settings.json (or a foreign link): back it up once, then
-      // take over so this window uses the shared user settings.
       if (!st.isSymbolicLink()) {
-        try {
-          fs.copyFileSync(dst, `${dst}.bak`);
-        } catch {
-          /* best effort */
+        // Preserve the ORIGINAL per-window settings.json exactly once (never
+        // overwrite an existing backup — a later real file is a superseded
+        // in-window change, and the shared settings are authoritative). If we
+        // cannot make that first backup, leave the file in place rather than
+        // delete the only copy; the next reconcile retries.
+        const bak = `${dst}.bak`;
+        if (!fs.existsSync(bak)) {
+          try {
+            fs.copyFileSync(dst, bak);
+          } catch {
+            return;
+          }
         }
       }
       fs.unlinkSync(dst);
