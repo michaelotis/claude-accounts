@@ -549,7 +549,12 @@ describe('healStaleTokenIfNeeded', () => {
     await withHomeAsync(async (home, mk) => {
       const store = mk('.claude-a', 'a@example.com', A_NEW);
       const wd = mk(path.join('.claude-windows', 'w1'), 'a@example.com', A_OLD);
-      const wiz = makeWizard({ envDir: wd, activeName: 'a', account: acc(store), stamp: Date.now() });
+      const wiz = makeWizard({
+        envDir: wd,
+        activeName: 'a',
+        account: acc(store),
+        stamp: Date.now(),
+      });
 
       assert.equal(await wiz.healStaleTokenIfNeeded(), false);
       assert.equal(globalThis.__vscodeCalls.reloadCount, 0);
