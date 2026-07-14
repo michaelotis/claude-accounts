@@ -91,7 +91,7 @@
             "cli"
           ],
           "default": "notify",
-          "description": "CLI/policy side: off = meter only. notify = toast when hot. cli = PATH orchestrator for new claude processes. Panel cutover is separate (failover.panelCutover)."
+          "description": "CLI/policy side: off = meter only. notify = meter only (usage pressure is shown by the status-bar meter, no popup). cli = PATH orchestrator for new claude processes. Panel cutover is separate (failover.panelCutover)."
         },
         "claudeAccounts.failover.panelCutover": {
           "type": "string",
@@ -101,7 +101,7 @@
             "idleReload"
           ],
           "default": "notify",
-          "description": "Panel failover timing: never mid-turn. off = no panel action. notify = after turn settles, offer Switch. idleReload = after turn settles, auto switchTo (bind + window reload) to the next account by strategy. Workspace path pins are never auto-left."
+          "description": "Panel failover timing: never mid-turn. off = no panel action. notify = meter only (no popup; the status-bar meter shows pressure and you switch when you choose). idleReload = after the turn settles, auto switchTo (bind + window reload) to the next account by strategy. Workspace path pins are never auto-left."
         },
         "claudeAccounts.failover.strategy": {
           "type": "string",

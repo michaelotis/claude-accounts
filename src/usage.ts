@@ -51,9 +51,15 @@ const FETCH_TIMEOUT_MS = 15_000;
 /** Same public Claude Code OAuth client id the claude-code CLI uses. */
 const CLAUDE_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const CLAUDE_OAUTH_TOKEN_URL = 'https://console.anthropic.com/v1/oauth/token';
-/** 5-min cache to avoid hammering /api/oauth/usage (429). */
-export const USAGE_CACHE_TTL_MS = 5 * 60_000;
-/** After a poll 429, do not hit the network again for this long. */
+/**
+ * Disk cache TTL for /api/oauth/usage. Shared on-disk across windows, so the poll
+ * fetches at most once per TTL per account no matter how many windows are open
+ * (a window whose poll finds a fresh cache serves it without a network hit). 1 min
+ * keeps the meter responsive; the API tolerates this — the old 5 min was a
+ * self-imposed guess, not a measured limit, and a real 429 still backs off below.
+ */
+export const USAGE_CACHE_TTL_MS = 60_000;
+/** After a poll 429, do not hit the network again for this long (a real limit). */
 const RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
 /** Refresh access token this long before expiresAt. */
 const TOKEN_HEADROOM_MS = 60_000;

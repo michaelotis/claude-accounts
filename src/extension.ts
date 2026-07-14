@@ -9,7 +9,7 @@ import { SetupWizard, NOTICE_KEY } from './setupWizard';
 import { ensureSharedHistory } from './sharedHistory';
 import { defaultSourceDir } from './capture';
 import { AccountWatcher } from './accountWatcher';
-import { allWorkingDirs } from './workdir';
+import { allWorkingDirs, foreignTokenConflict } from './workdir';
 import { log, showLog } from './log';
 import { UsageMonitor, writePolicyCache, type WorkspaceRoutePolicy } from './usage';
 import { isSidecarConfigDir } from './sidecars';
@@ -38,6 +38,16 @@ import { looksLikeLogout } from './reclaim';
  * REMOTE side (extensionKind "workspace"), so a Windows desktop driving a
  * Linux remote is fully supported and never lands here.
  */
+/** True if a store's own `.credentials.json` holds a grant that belongs to a different account. */
+function storeTokenIsForeign(storeDir: string, email: string | undefined): boolean {
+  try {
+    const buf = fs.readFileSync(path.join(storeDir, '.credentials.json'));
+    return Boolean(foreignTokenConflict(storeDir, buf, email));
+  } catch {
+    return false;
+  }
+}
+
 function activateUnsupported(context: vscode.ExtensionContext): void {
   const label =
     process.platform === 'darwin'
@@ -91,8 +101,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const registry = new AccountRegistry(context);
   const binding = new WindowBinding(context);
   const wizard = new SetupWizard(registry, binding, context);
-  // 5 min poll — matches the usage cache TTL; faster polling just 429s the usage API.
-  const usage = new UsageMonitor(5 * 60_000);
+  // 1 min poll — matches the (disk-shared, cross-window-deduped) usage cache TTL,
+  // so the meter stays responsive without extra API pressure. A real 429 backs off.
+  const usage = new UsageMonitor(60_000);
 
   const accountByEmail = (email: string) => {
     const want = normalizeEmail(email);
@@ -217,38 +228,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     cutover.notePressure(snap, reasons);
   };
 
-  // Toasts only — gated by mode / panelCutover (not by cutover itself)
+  // Usage pressure is surfaced by the status-bar meter (each metric colours itself
+  // as it crosses its threshold), not by popups. Switching always needs a reload,
+  // so a "usage high — switch?" toast is just noise on top of the meter; the user
+  // sees the colour and switches when they choose. The cutover controller still
+  // receives pressure via onPressure (for the opt-in idle auto-switch).
   usage.onHot = (snap, reasons) => {
-    const mode = usage.getMode();
-    const panelMode = vscode.workspace
-      .getConfiguration('claudeAccounts')
-      .get<PanelCutoverMode>('failover.panelCutover', 'notify');
-
-    if (panelMode === 'idleReload') {
-      log(`usage hot — idleReload after turn: ${reasons.join(', ')}`);
-      return;
-    }
-    if (mode === 'cli') {
-      void vscode.window.showWarningMessage(
-        `Claude usage high on ${snap.email ?? 'this account'}: ${reasons.join(', ')}. ` +
-          `CLI orch uses policy for new invocations; panel cutover waits until the turn is idle.`
-      );
-      return;
-    }
-    if (mode === 'notify' || panelMode === 'notify') {
-      void vscode.window
-        .showWarningMessage(
-          `Claude usage high on ${snap.email ?? 'this account'}: ${reasons.join(', ')}. ` +
-            `Prefer switching after this turn finishes.`,
-          'Switch account',
-          'Dismiss'
-        )
-        .then((pick) => {
-          if (pick === 'Switch account') {
-            void vscode.commands.executeCommand('claudeProfiles.switchAccount');
-          }
-        });
-    }
+    log(`usage hot on ${snap.email ?? 'this account'}: ${reasons.join(', ')} (shown on the meter)`);
   };
 
   const statusBar = new StatusBarManager(registry, binding, usage);
@@ -345,6 +331,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // logout, forgets the account, and prompts a fresh sign-in.
       log(
         `workspace route ${preferredAfter.folderPath}: pinned ${preferredAfter.email} was logged out here — not restocking`
+      );
+    } else if (!routeOk && storeTokenIsForeign(preferredAfter.account.dir, preferredAfter.email)) {
+      // The pinned account's own store holds a token that belongs to a DIFFERENT
+      // account (the credential-mix state). Forcing a switch would just restock the
+      // wrong token and reload — surface the real fix instead and let the window
+      // come up; reconcile shows the same guidance and the user signs in again.
+      log(
+        `workspace route ${preferredAfter.folderPath}: pinned ${preferredAfter.email} store is ` +
+          `contaminated (token belongs to another account) — not force-switching; prompting re-login`
+      );
+      void vscode.window.showWarningMessage(
+        `Claude Accounts: ${preferredAfter.email}'s saved credentials were overwritten by another ` +
+          `account. Sign in again as ${preferredAfter.email} (Claude Code /login) to restore it.`
       );
     } else if (!routeOk) {
       // Dir not stocked with the pin (empty first stock, late discovery, or

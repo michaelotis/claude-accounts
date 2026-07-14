@@ -5,7 +5,7 @@ import * as os from 'os';
 import { Account, AccountRegistry, readIdentity, hasCredentials } from './accounts';
 import { WindowBinding } from './binding';
 import { getAuthStatus, AuthStatus } from './cli';
-import { snapshotAccount, defaultSourceDir, mirrorToDefault } from './capture';
+import { snapshotAccount, defaultSourceDir, mirrorToDefault, stampIdentity } from './capture';
 import { ensureSharedHistory } from './sharedHistory';
 import { signOut, interruptSessions, dirsHoldingToken, looksLikeLogout } from './reclaim';
 import {
@@ -14,9 +14,11 @@ import {
   materialize,
   syncMcpServers,
   linkUserSettings,
+  foreignTokenConflict,
+  sameCredential,
 } from './workdir';
 import { log } from './log';
-import { matchWorkspaceRoute, type WorkspaceRoute } from './workspaceRoutes';
+import { emailsEqual, matchWorkspaceRoute, type WorkspaceRoute } from './workspaceRoutes';
 
 /**
  * All the user-facing flows.
@@ -288,15 +290,126 @@ export class SetupWizard {
 
     const active = this.binding.getActiveName();
     const bound = active ? this.registry.get(active) : undefined;
-    if (bound?.email && bound.email !== email) {
-      // The user signed in as someone else, in THIS window. There is nothing to
-      // repair: the dir is this window's alone, so no other window was touched,
-      // and the account that was here is safe in its own store — untouched,
-      // because a window only ever runs a copy. Just follow the user.
-      //
-      // This is the payoff of per-window dirs. It used to take a shadow copy, a
-      // restore, a guess at which window signed in, and a forced reload.
-      log(`sign-in in this window: ${bound.email} → ${email}`);
+
+    const boundEmail = bound ? this.registry.emailOf(bound) : undefined;
+
+    // Identity drift: the dir's .claude.json identity no longer matches the account
+    // this window is bound to. That is EITHER a deliberate /login as another account
+    // here, OR an identity BLEED — Claude Code re-stamped the dir's identity from the
+    // shared home config while the TOKEN did not change. The identity field alone
+    // can't tell them apart, and guessing wrong corrupts credentials, so we decide
+    // by the TOKEN, never the identity: on drift we NEVER pull dir→store.
+    //
+    // boundEmail uses emailOf (reads the store) not bound.email — discovered
+    // accounts carry no cached email, and missing it here would skip drift handling.
+    const drifted = Boolean(boundEmail && !emailsEqual(boundEmail, email));
+    if (drifted && !onDefault) {
+      const dirTok = this.readToken(dir);
+      const boundTok = bound ? this.readToken(bound.dir) : undefined;
+
+      // (0) The bound account's OWN store is contaminated — its stored token belongs
+      //     to a different account (the credential-mix end state). It can't be
+      //     re-asserted; only signing in again fixes it. Surface that once.
+      if (bound && boundTok && foreignTokenConflict(bound.dir, boundTok, boundEmail)) {
+        if (await this.noteContaminationPrompt()) {
+          this.offerAccountPick(
+            `${boundEmail}'s saved credentials were overwritten by another account. ` +
+              `Sign in again as ${boundEmail} (Claude Code /login) to restore it.`
+          );
+        }
+        return;
+      }
+
+      // (1) Identity-only bleed: the dir still HOLDS the bound account's token; only
+      //     its identity field drifted. The window genuinely still runs `bound`, so
+      //     correct the identity in place — no follow, no store write, no reload.
+      //     This is what stops a bleed from flickering the account or looping a
+      //     reload, even if Claude Code keeps re-stamping from the shared home file.
+      if (bound && dirTok && boundTok && sameCredential(dirTok, boundTok)) {
+        const id =
+          readIdentity(bound.dir) ??
+          (boundEmail ? { email: boundEmail, displayName: boundEmail } : undefined);
+        if (id) {
+          stampIdentity(dir, id);
+          log(
+            `reconcile: identity-only drift ${boundEmail} → ${email} (token unchanged) — ` +
+              `restamped in place, no reload`
+          );
+        } else {
+          log(`reconcile: identity-only drift but bound identity unreadable — left dir as-is`);
+        }
+        return;
+      }
+
+      // (2) The dir holds a DIFFERENT token than the bound account. Decide by who
+      //     OWNS that token (its bytes in a store), not the bled identity field.
+      const owner = dirTok ? this.accountOwningToken(dirTok, dir) : undefined;
+      if (owner && emailsEqual(this.registry.emailOf(owner), email)) {
+        // The dir consistently holds this saved account's own token — a genuine
+        // in-window switch. captureCurrentAccount refreshes ITS store (same account,
+        // so no contamination) and binds it.
+        log(`reconcile: in-window switch to saved ${email} (token matches its store) — following`);
+        const followed = await this.captureCurrentAccount({
+          quiet: true,
+          silent: true,
+          sourceDir: dir,
+        });
+        // Only reload if the follow actually took (capture bound the account) — a
+        // reload that left the trigger state unchanged would just re-fire this path.
+        if (followed && !this.recentlyReloaded()) {
+          await this.requestWindowReload(
+            `Signed in as ${email} — reloading so Claude Code switches to it.`
+          );
+        }
+        return;
+      }
+      if (!owner) {
+        // A brand-new grant no saved store holds — a real /login as a new (or
+        // re-authed) account. Capturing it is the one safe pull: a fresh grant can't
+        // be another account's. captureCurrentAccount reuses/restores by email + binds.
+        log(`reconcile: in-window sign-in as ${email} (new grant) — capturing`);
+        const captured = await this.captureCurrentAccount({
+          quiet: true,
+          silent: true,
+          sourceDir: dir,
+        });
+        if (captured && !this.recentlyReloaded()) {
+          await this.requestWindowReload(
+            `Signed in as ${email} — reloading so Claude Code switches to it.`
+          );
+        }
+        return;
+      }
+
+      // (3) The dir's token belongs to a DIFFERENT account than its identity claims —
+      //     a mix. Never follow, never pull. Re-assert the bound account from its
+      //     (verified-clean above) store: push store→dir, overwriting the foreign
+      //     pair. Reload only if that actually cleared the drift, or a no-op/failed
+      //     materialize would spin a metered reload loop.
+      if (bound && hasCredentials(bound.dir)) {
+        log(
+          `reconcile: dir token belongs to ${this.registry.emailOf(owner) ?? owner.name} but ` +
+            `identity says ${email} — re-asserting ${boundEmail} from store`
+        );
+        materialize(bound, dir, true);
+        if (emailsEqual(readIdentity(dir)?.email, boundEmail)) {
+          mirrorToDefault(dir, readIdentity(dir));
+          if (!this.recentlyReloaded()) {
+            await this.requestWindowReload(`Restored ${boundEmail ?? bound.name} for this window.`);
+          }
+        } else {
+          log(
+            `reconcile: re-assert did not clear drift (materialize no-op/failed) — not reloading`
+          );
+        }
+        return;
+      }
+      if (await this.noteContaminationPrompt()) {
+        this.offerAccountPick(
+          `This window's account identity looks inconsistent. Pick an account or sign in again.`
+        );
+      }
+      return;
     }
 
     const account =
@@ -304,13 +417,38 @@ export class SetupWizard {
       (await this.captureCurrentAccount({ quiet: true, silent: true, sourceDir: dir }));
     if (!account) return;
 
-    // Keep the store's token from drifting far behind the one actually in use.
-    refreshStore(account, dir);
-    // And keep Claude Code's own default dir signed in as this account, so that
-    // losing the extension — uninstalled, disabled, failed to activate — never
-    // leaves the user with a signed-out Claude Code. The uninstall hook cannot
-    // cover that: VSCode defers it to the next server start, and it may never run.
-    mirrorToDefault(dir, readIdentity(dir));
+    // No drift: the dir runs the account this window is bound to (or the window is
+    // unbound / on the default dir). Copy the dir's token back to the store and
+    // mirror to the default — but only when the dir's token is NOT another
+    // account's (a bled identity that happens to match the bound name while carrying
+    // a foreign token must not seed the store or the default dir).
+    const ndTok = this.readToken(dir);
+    const foreign = ndTok
+      ? foreignTokenConflict(account.dir, ndTok, this.registry.emailOf(account))
+      : null;
+    if (foreign) {
+      // Contaminated steady state: identity matches the bound account but the token
+      // belongs to someone else (the dir was stocked from a store whose token was
+      // overwritten). Don't touch the store or the default dir, and surface the one
+      // real fix — sign in again — since no drift will occur to trigger it elsewhere.
+      log(
+        `reconcile: dir token belongs to ${foreign} though identity is ${email} — ` +
+          `not refreshing store or mirroring`
+      );
+      if (await this.noteContaminationPrompt()) {
+        this.offerAccountPick(
+          `${email}'s saved credentials were overwritten by another account. ` +
+            `Sign in again as ${email} (Claude Code /login) to restore it.`
+        );
+      }
+    } else {
+      // Keep the store's token in step with the dir (same account — cannot
+      // cross-contaminate; refreshStore also carries the tripwire as defence in
+      // depth). And keep Claude Code's own default dir signed in as this account, so
+      // losing the extension never leaves the user signed out.
+      refreshStore(account, dir);
+      mirrorToDefault(dir, readIdentity(dir));
+    }
     // Propagate newly-added home MCP servers into already-stocked windows.
     syncMcpServers(dir);
     linkUserSettings(dir);
@@ -347,6 +485,48 @@ export class SetupWizard {
         `Signed in as ${email} — reloading so Claude Code fully switches to it.`
       );
     }
+  }
+
+  /** This dir's `.credentials.json` bytes, or undefined if absent/unreadable. */
+  private readToken(dir: string): Buffer | undefined {
+    try {
+      return fs.readFileSync(path.join(dir, '.credentials.json'));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The saved account whose STORE holds this exact OAuth grant, or undefined —
+   * i.e. who a token actually belongs to, decided by the credential bytes rather
+   * than the (spoofable) identity field. `excludeDir` skips the working dir doing
+   * the asking so it never matches itself.
+   */
+  private accountOwningToken(token: Buffer, excludeDir: string): Account | undefined {
+    const skip = path.normalize(excludeDir);
+    for (const a of this.registry.list()) {
+      if (path.normalize(a.dir) === skip) continue;
+      const buf = this.readToken(a.dir);
+      if (buf && sameCredential(buf, token)) return a;
+    }
+    return undefined;
+  }
+
+  /**
+   * Rate-limits the "your credentials were overwritten" prompt to once per window
+   * per cooldown. The contaminated-store branch changes no state (re-materializing
+   * the wrong token would loop), so without this every focus/watcher reconcile
+   * would re-toast. Returns true when it's OK to prompt now.
+   */
+  private async noteContaminationPrompt(withinMs = 5 * 60_000): Promise<boolean> {
+    const key = 'claudeProfiles.lastContaminationPrompt';
+    const last = this.context.workspaceState.get<number>(key, 0);
+    const now = Date.now();
+    if (last && now - last < withinMs) return false;
+    // Await the persist so a focus/watcher reconcile firing right after does not
+    // read a stale timestamp and re-toast inside the cooldown.
+    await this.context.workspaceState.update(key, now);
+    return true;
   }
 
   /**
