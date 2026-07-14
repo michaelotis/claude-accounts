@@ -10,6 +10,10 @@
   - a store detected as contaminated prompts a one-time "sign in again" instead of looping.
 - Account switching no longer reverts on reload for contaminated stores; a fresh sign-in restores the affected account cleanly.
 
+### Changed
+- **Meter-only usage pressure.** Removed the modal usage popups ("usage high", "no cooler account / staying put", the post-turn "switch to X?" prompt, and the cooldown prompt) — switching always needs a reload, so they were noise on top of the status-bar meter. The per-metric meter now colours as each limit crosses its threshold and you switch when you choose. `failover.panelCutover = idleReload` still auto-switches (opt-in); account-safety prompts (signed-out / re-login) are unchanged.
+- Usage meter now refreshes every **1 minute** (was 5). The old interval was a self-imposed cache TTL, not an API limit; the disk cache is shared and deduped across windows, so this stays ~1 fetch/min per account, and a real 429 still backs off.
+
 ## 0.9.0
 
 ### Improved

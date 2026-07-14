@@ -136,12 +136,11 @@ export class IdleCutoverController {
 
       const next = await this.pickNextAccount(currentSnap.email ?? undefined);
       if (!next) {
-        log('cutover: no cool alternate account');
+        // No popup — the status-bar meter already shows the pressure, and switching
+        // needs a reload anyway, so a "staying put" toast is pure noise.
+        log(`cutover: usage high (${reasons.join(', ')}) but no cooler account — meter shows it`);
         this.pending = false;
         await this.context.workspaceState.update(PENDING_KEY, false);
-        void vscode.window.showWarningMessage(
-          `Claude Accounts: usage high (${reasons.join(', ')}) but no cooler account is available. Staying put.`
-        );
         return;
       }
 
@@ -153,26 +152,16 @@ export class IdleCutoverController {
       }
 
       const nextEmail = this.registry.emailOf(next) ?? next.name;
-      const msg = `Turn finished — switch to ${nextEmail}? (${reasons.join('; ')})`;
 
       if (this.panelMode === 'notify') {
+        // Meter-only: surface pressure through the status-bar meter, never a popup.
+        // The user switches when they choose; `idleReload` is the opt-in for
+        // automatic post-turn switching.
         this.pending = false;
         await this.context.workspaceState.update(PENDING_KEY, false);
-        const pick = await vscode.window.showWarningMessage(
-          `Claude Accounts: ${msg}`,
-          'Switch now',
-          'Dismiss'
+        log(
+          `cutover: cooler account ${nextEmail} available (${reasons.join('; ')}) — meter shows it`
         );
-        if (pick === 'Switch now') {
-          // A new turn may have started while the dialog was open.
-          if (this.busy || this.watcher.getPhase() === 'in_turn') {
-            this.pending = true;
-            await this.context.workspaceState.update(PENDING_KEY, true);
-            log('cutover: turn resumed before switch — defer');
-            return;
-          }
-          await this.wizard.switchTo(next);
-        }
         return;
       }
 
@@ -180,26 +169,11 @@ export class IdleCutoverController {
       const last = this.context.workspaceState.get<number>(AUTO_COOLDOWN_KEY, 0);
       const now = Date.now();
       if (now - last < AUTO_COOLDOWN_MS) {
+        // On cooldown: skip silently (no popup). The next post-turn evaluation will
+        // auto-switch once the cooldown clears.
         log(
-          `cutover: auto-reload cooldown (${Math.round((AUTO_COOLDOWN_MS - (now - last)) / 1000)}s left)`
+          `cutover: auto-reload cooldown (${Math.round((AUTO_COOLDOWN_MS - (now - last)) / 1000)}s left) — skipping`
         );
-        void vscode.window
-          .showWarningMessage(
-            `Claude Accounts: ${msg} (auto-switch on cooldown)`,
-            'Switch now',
-            'Dismiss'
-          )
-          .then((pick) => {
-            if (pick === 'Switch now') {
-              if (this.busy || this.watcher.getPhase() === 'in_turn') {
-                this.pending = true;
-                void this.context.workspaceState.update(PENDING_KEY, true);
-                log('cutover: turn resumed before switch — defer');
-                return;
-              }
-              void this.wizard.switchTo(next);
-            }
-          });
         this.pending = false;
         await this.context.workspaceState.update(PENDING_KEY, false);
         return;

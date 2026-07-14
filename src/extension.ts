@@ -101,8 +101,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const registry = new AccountRegistry(context);
   const binding = new WindowBinding(context);
   const wizard = new SetupWizard(registry, binding, context);
-  // 5 min poll — matches the usage cache TTL; faster polling just 429s the usage API.
-  const usage = new UsageMonitor(5 * 60_000);
+  // 1 min poll — matches the (disk-shared, cross-window-deduped) usage cache TTL,
+  // so the meter stays responsive without extra API pressure. A real 429 backs off.
+  const usage = new UsageMonitor(60_000);
 
   const accountByEmail = (email: string) => {
     const want = normalizeEmail(email);
@@ -227,38 +228,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     cutover.notePressure(snap, reasons);
   };
 
-  // Toasts only — gated by mode / panelCutover (not by cutover itself)
+  // Usage pressure is surfaced by the status-bar meter (each metric colours itself
+  // as it crosses its threshold), not by popups. Switching always needs a reload,
+  // so a "usage high — switch?" toast is just noise on top of the meter; the user
+  // sees the colour and switches when they choose. The cutover controller still
+  // receives pressure via onPressure (for the opt-in idle auto-switch).
   usage.onHot = (snap, reasons) => {
-    const mode = usage.getMode();
-    const panelMode = vscode.workspace
-      .getConfiguration('claudeAccounts')
-      .get<PanelCutoverMode>('failover.panelCutover', 'notify');
-
-    if (panelMode === 'idleReload') {
-      log(`usage hot — idleReload after turn: ${reasons.join(', ')}`);
-      return;
-    }
-    if (mode === 'cli') {
-      void vscode.window.showWarningMessage(
-        `Claude usage high on ${snap.email ?? 'this account'}: ${reasons.join(', ')}. ` +
-          `CLI orch uses policy for new invocations; panel cutover waits until the turn is idle.`
-      );
-      return;
-    }
-    if (mode === 'notify' || panelMode === 'notify') {
-      void vscode.window
-        .showWarningMessage(
-          `Claude usage high on ${snap.email ?? 'this account'}: ${reasons.join(', ')}. ` +
-            `Prefer switching after this turn finishes.`,
-          'Switch account',
-          'Dismiss'
-        )
-        .then((pick) => {
-          if (pick === 'Switch account') {
-            void vscode.commands.executeCommand('claudeProfiles.switchAccount');
-          }
-        });
-    }
+    log(`usage hot on ${snap.email ?? 'this account'}: ${reasons.join(', ')} (shown on the meter)`);
   };
 
   const statusBar = new StatusBarManager(registry, binding, usage);
