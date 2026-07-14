@@ -2,7 +2,7 @@
   "name": "claude-accounts",
   "displayName": "Claude Accounts + Usage",
   "description": "Multi-account Claude Code for WSL/Linux (per-window isolation + shared history) with live usage: 5h, 7d, Fable/Opus/Sonnet — workspace extension, never binds to a Windows Claude binary.",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "publisher": "michaelotis",
   "icon": "images/icon.png",
   "repository": {
