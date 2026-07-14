@@ -100,7 +100,9 @@ describe('buildSnapshot + triggers', () => {
       '/tmp/fake'
     );
     assert.equal(needsFailover(snap, DEFAULT_THRESHOLDS, DEFAULT_TRIGGERS), true);
-    assert.ok(failoverReasons(snap, DEFAULT_THRESHOLDS, DEFAULT_TRIGGERS).some((r) => /5h/.test(r)));
+    assert.ok(
+      failoverReasons(snap, DEFAULT_THRESHOLDS, DEFAULT_TRIGGERS).some((r) => /5h/.test(r))
+    );
   });
 
   it('weekly trigger when 7d is high', () => {
@@ -114,13 +116,19 @@ describe('buildSnapshot + triggers', () => {
       profile,
       '/tmp/fake'
     );
-    assert.equal(needsFailover(snap, DEFAULT_THRESHOLDS, { session: false, weekly: true, fable: false }), true);
-    assert.equal(needsFailover(snap, DEFAULT_THRESHOLDS, { session: true, weekly: false, fable: false }), false);
+    assert.equal(
+      needsFailover(snap, DEFAULT_THRESHOLDS, { session: false, weekly: true, fable: false }),
+      true
+    );
+    assert.equal(
+      needsFailover(snap, DEFAULT_THRESHOLDS, { session: true, weekly: false, fable: false }),
+      false
+    );
   });
 });
 
 describe('sidecars', () => {
-  it('flags camwatch and reserved names', () => {
+  it('flags extension reserved names', () => {
     const out2 = path.join(os.tmpdir(), `sidecars-${process.pid}.cjs`);
     esbuild.buildSync({
       entryPoints: [path.join(__dirname, '../src/sidecars.ts')],
@@ -130,9 +138,9 @@ describe('sidecars', () => {
       outfile: out2,
     });
     const { isReservedClaudeDirName, isSidecarConfigDir } = require(out2);
-    assert.equal(isReservedClaudeDirName('.claude-camwatch'), true);
     assert.equal(isReservedClaudeDirName('.claude-windows'), true);
     assert.equal(isReservedClaudeDirName('.claude-shared'), true);
+    assert.equal(isReservedClaudeDirName('.claude-vault'), true);
     assert.equal(isReservedClaudeDirName('.claude-work'), false);
     assert.equal(isSidecarConfigDir('/mnt/c/Users/x/.claude'), true);
     fs.unlinkSync(out2);

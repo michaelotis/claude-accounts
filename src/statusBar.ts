@@ -4,23 +4,28 @@ import { log } from './log';
 import { WindowBinding } from './binding';
 import { getAuthStatus, AuthStatus } from './cli';
 import { defaultSourceDir } from './capture';
-import {
-  UsageMonitor,
-  formatUsageBar,
-  formatUsageTooltip,
-  type UsageSnapshot,
-} from './usage';
+import { UsageMonitor, formatUsageBar, formatUsageTooltip, type UsageSnapshot } from './usage';
 
 /** Marketplace / local id — hover links to the extension page when published. */
 const EXTENSION_ID = 'michaelotis.claude-accounts';
+
+const ERROR_BG = new vscode.ThemeColor('statusBarItem.errorBackground');
+const WARN_BG = new vscode.ThemeColor('statusBarItem.warningBackground');
 
 /**
  * Status bar: active account + usage (5h / 7d / Fable…) for THIS window.
  * Usage is read via OAuth API against the window's CLAUDE_CONFIG_DIR only —
  * never a Windows Claude binary.
+ *
+ * Account name is one item; each usage metric is its own item so only the
+ * over-threshold number gets a warning/error background (VS Code cannot
+ * color substrings within a single StatusBarItem).
  */
 export class StatusBarManager implements vscode.Disposable {
   private readonly item: vscode.StatusBarItem;
+  private readonly sessionItem: vscode.StatusBarItem;
+  private readonly weeklyItem: vscode.StatusBarItem;
+  private readonly fableItem: vscode.StatusBarItem;
   private readonly disposables: vscode.Disposable[] = [];
   private readonly statusCache = new Map<string, { status: AuthStatus | null; at: number }>();
   private static readonly STATUS_TTL_MS = 60_000;
@@ -38,6 +43,31 @@ export class StatusBarManager implements vscode.Disposable {
     );
     this.item.command = 'claudeProfiles.showStatus';
     this.item.name = 'Claude Account + Usage';
+
+    this.sessionItem = vscode.window.createStatusBarItem(
+      'claudeAccounts.usage.session',
+      vscode.StatusBarAlignment.Right,
+      89
+    );
+    this.sessionItem.command = 'claudeProfiles.showStatus';
+    this.sessionItem.name = 'Claude 5h session usage';
+
+    this.weeklyItem = vscode.window.createStatusBarItem(
+      'claudeAccounts.usage.weekly',
+      vscode.StatusBarAlignment.Right,
+      88
+    );
+    this.weeklyItem.command = 'claudeProfiles.showStatus';
+    this.weeklyItem.name = 'Claude 7d weekly usage';
+
+    this.fableItem = vscode.window.createStatusBarItem(
+      'claudeAccounts.usage.fable',
+      vscode.StatusBarAlignment.Right,
+      87
+    );
+    this.fableItem.command = 'claudeProfiles.showStatus';
+    this.fableItem.name = 'Claude Fable usage';
+
     this.disposables.push(
       this.binding.onDidChange.event(() => {
         const dir = this.binding.getEnvDir();
@@ -100,7 +130,7 @@ export class StatusBarManager implements vscode.Disposable {
     const cliSaysOut = status !== undefined && status !== null && status.loggedIn !== true;
     const signedOut = cliSaysOut || (!hasCredentials(dir) && !cliSaysIn);
     return {
-      email: signedOut ? undefined : status?.email ?? readIdentity(dir)?.email,
+      email: signedOut ? undefined : (status?.email ?? readIdentity(dir)?.email),
       signedOut,
       confirmed: cliSaysIn,
       unreachable,
@@ -128,6 +158,48 @@ export class StatusBarManager implements vscode.Disposable {
     return this.usage.getCached(dir);
   }
 
+  /** Background for one metric from its own percent only. */
+  private metricBackground(percent: number, warnAt: number): vscode.ThemeColor | undefined {
+    if (percent >= 80) return ERROR_BG;
+    if (percent >= warnAt) return WARN_BG;
+    return undefined;
+  }
+
+  private hideMetricItems(): void {
+    this.sessionItem.hide();
+    this.weeklyItem.hide();
+    this.fableItem.hide();
+  }
+
+  private renderMetricItems(usage: UsageSnapshot | null | undefined): void {
+    if (!usage) {
+      this.hideMetricItems();
+      return;
+    }
+
+    // Hovering any pill shows the same card as the account item (usage detail + actions).
+    this.sessionItem.tooltip = this.item.tooltip;
+    this.weeklyItem.tooltip = this.item.tooltip;
+    this.fableItem.tooltip = this.item.tooltip;
+
+    this.sessionItem.text = `5h ${usage.sessionPercent}%`;
+    this.sessionItem.backgroundColor = this.metricBackground(usage.sessionPercent, 65);
+    this.sessionItem.show();
+
+    this.weeklyItem.text = `7d ${usage.weeklyPercent}%`;
+    this.weeklyItem.backgroundColor = this.metricBackground(usage.weeklyPercent, 70);
+    this.weeklyItem.show();
+
+    const fable = usage.modelLimits.find((m) => /fable/i.test(m.name));
+    if (fable) {
+      this.fableItem.text = `Fable ${fable.percent}%`;
+      this.fableItem.backgroundColor = this.metricBackground(fable.percent, 70);
+      this.fableItem.show();
+    } else {
+      this.fableItem.hide();
+    }
+  }
+
   private render(): void {
     const dir = this.effectiveDir();
     const active = this.binding.getActiveName();
@@ -137,15 +209,12 @@ export class StatusBarManager implements vscode.Disposable {
     const { email, signedOut, confirmed, unreachable } = this.resolve(dir);
     const notLoggedIn = signedOut;
     const usage = this.usageFor(dir);
-    const usageText = formatUsageBar(usage ?? null);
 
     if (email) {
       const savedByEmail = email ? this.registry.savedForEmail(email) : undefined;
       const isSaved = Boolean(savedName || active || savedByEmail);
-      // Compact Claude-Code-like bar: email + 5h/7d/Fable
-      const main = usageText
-        ? `$(account) ${email.split('@')[0]} · ${usageText}`
-        : `$(account) ${email}${isSaved ? '' : ' $(circle-outline)'}`;
+      // Account pill only — usage meters are separate items (per-metric color)
+      const main = `$(account) ${email.split('@')[0]}${isSaved ? '' : ' $(circle-outline)'}`;
       this.item.text = main.length > 80 ? main.slice(0, 77) + '…' : main;
 
       const unique = this.registry.listUniqueByEmail();
@@ -184,20 +253,9 @@ export class StatusBarManager implements vscode.Disposable {
             : '_Confirming with `claude auth status`…_',
         actions.join(' &nbsp;·&nbsp; '),
       ]);
-      // Soft warning colors near limits
-      const hot =
-        (usage?.sessionPercent ?? 0) >= 80 ||
-        (usage?.weeklyPercent ?? 0) >= 80 ||
-        (usage?.modelLimits.some((m) => m.percent >= 80) ?? false);
-      const warn =
-        (usage?.sessionPercent ?? 0) >= 65 ||
-        (usage?.weeklyPercent ?? 0) >= 70 ||
-        (usage?.modelLimits.some((m) => m.percent >= 70) ?? false);
-      this.item.backgroundColor = hot
-        ? new vscode.ThemeColor('statusBarItem.errorBackground')
-        : warn
-          ? new vscode.ThemeColor('statusBarItem.warningBackground')
-          : undefined;
+      // Account item never carries usage hot/warn background
+      this.item.backgroundColor = undefined;
+      this.renderMetricItems(usage);
     } else if (notLoggedIn) {
       const wasEmail = readIdentity(dir)?.email;
       this.item.text = '$(account) Claude: sign in';
@@ -215,10 +273,12 @@ export class StatusBarManager implements vscode.Disposable {
           : '',
       ]);
       this.item.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+      this.hideMetricItems();
     } else {
       this.item.text = '$(account) Claude $(sync~spin)';
       this.item.tooltip = this.card(['Reading the Claude account this window is signed in as…']);
       this.item.backgroundColor = undefined;
+      this.hideMetricItems();
     }
   }
 
@@ -277,6 +337,9 @@ export class StatusBarManager implements vscode.Disposable {
 
   dispose(): void {
     this.item.dispose();
+    this.sessionItem.dispose();
+    this.weeklyItem.dispose();
+    this.fableItem.dispose();
     this.usage.dispose();
     this.disposables.forEach((d) => d.dispose());
   }

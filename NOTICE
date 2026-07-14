@@ -14,5 +14,5 @@ This project combines and adapts:
    License: MIT
 
 Local modifications: workspace-only activation (WSL/Linux), combined status bar
-with 5h/7d/Fable model-scoped limits, discovery denylist for sidecar configs
-(e.g. camwatch), refuse Windows CLAUDE_CONFIG_DIR paths, prefer Linux claude CLI.
+with 5h/7d/Fable model-scoped limits, discovery denylist for sidecar configs,
+refuse Windows CLAUDE_CONFIG_DIR paths, prefer Linux claude CLI.

@@ -7,8 +7,14 @@ import { WindowBinding } from './binding';
 import { getAuthStatus, AuthStatus } from './cli';
 import { snapshotAccount, defaultSourceDir, mirrorToDefault } from './capture';
 import { ensureSharedHistory } from './sharedHistory';
-import { signOut, interruptSessions, dirsHoldingToken } from './reclaim';
-import { refreshStore, allWorkingDirs, materialize } from './workdir';
+import { signOut, interruptSessions, dirsHoldingToken, looksLikeLogout } from './reclaim';
+import {
+  refreshStore,
+  allWorkingDirs,
+  materialize,
+  syncMcpServers,
+  linkUserSettings,
+} from './workdir';
 import { log } from './log';
 import { matchWorkspaceRoute, type WorkspaceRoute } from './workspaceRoutes';
 
@@ -143,7 +149,10 @@ export class SetupWizard {
       opts.silent && identity && hasCredentials(sourceDir)
         ? { loggedIn: true, email: identity.email, orgName: identity.organizationName }
         : await vscode.window.withProgress(
-            { location: vscode.ProgressLocation.Notification, title: 'Reading current Claude account…' },
+            {
+              location: vscode.ProgressLocation.Notification,
+              title: 'Reading current Claude account…',
+            },
             () => getAuthStatus(sourceDir)
           );
 
@@ -190,7 +199,7 @@ export class SetupWizard {
       vscode.window.showErrorMessage(`Could not save account: ${(err as Error).message}`);
       return undefined;
     }
-    ensureSharedHistory([target.dir]);
+    await ensureSharedHistory([target.dir]);
     target.email = status.email;
     await this.registry.add(target);
     await this.binding.bind(target);
@@ -302,6 +311,9 @@ export class SetupWizard {
     // leaves the user with a signed-out Claude Code. The uninstall hook cannot
     // cover that: VSCode defers it to the next server start, and it may never run.
     mirrorToDefault(dir, readIdentity(dir));
+    // Propagate newly-added home MCP servers into already-stocked windows.
+    syncMcpServers(dir);
+    linkUserSettings(dir);
     const changed = active !== account.name;
     if (changed) await this.binding.bind(account);
 
@@ -357,10 +369,10 @@ export class SetupWizard {
     // a logout but a working copy that failed to stock (an interrupted copy, a
     // full disk). The store is intact, so restock it; concluding "logout" here
     // would forget — and sign out — a perfectly good account over an IO hiccup.
-    const looksLikeRealLogout =
-      !readIdentity(dir) && fs.existsSync(path.join(dir, '.claude.json'));
-    if (!looksLikeRealLogout && hasCredentials(account.dir)) {
-      log(`working dir ${dir} lost its token but kept its identity — restocking from ${account.name}`);
+    if (!looksLikeLogout(dir) && hasCredentials(account.dir)) {
+      log(
+        `working dir ${dir} lost its token but kept its identity — restocking from ${account.name}`
+      );
       materialize(account, dir, true);
       await this.requestWindowReload(
         `Restored ${this.registry.emailOf(account) ?? account.name} for this window.`
@@ -381,6 +393,10 @@ export class SetupWizard {
       ...dirsHoldingToken(email),
       ...allWorkingDirs().filter((d) => readIdentity(d)?.email === email),
     ];
+    // Kill any live session on these dirs before deleting the token: on a
+    // graceful shutdown Claude Code flushes its in-memory token back to disk,
+    // which would resurrect the credential we are signing out.
+    interruptSessions(dirs);
     for (const d of dirs) signOut(d);
     vscode.window.showInformationMessage(
       `Claude Accounts: you signed out of ${email}, so it was removed from the list — a logout ` +
@@ -409,13 +425,12 @@ export class SetupWizard {
 
     const folderPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const settingsRoutes = (
-      vscode.workspace.getConfiguration('claudeAccounts').get<WorkspaceRoute[]>('workspaceRoutes', []) ||
-      []
+      vscode.workspace
+        .getConfiguration('claudeAccounts')
+        .get<WorkspaceRoute[]>('workspaceRoutes', []) || []
     ).filter((r) => r?.pathPrefix && r?.email);
     const settingsPin =
-      folderPath && settingsRoutes.length
-        ? matchWorkspaceRoute(folderPath, settingsRoutes)
-        : null;
+      folderPath && settingsRoutes.length ? matchWorkspaceRoute(folderPath, settingsRoutes) : null;
 
     const picked = await vscode.window.showQuickPick(items, {
       title: 'Switch Claude account for this window (reloads the window)',
@@ -568,10 +583,14 @@ export class SetupWizard {
  */
 function suggestName(email: string, available: (n: string) => boolean): string {
   const slug = (s: string) =>
-    s.replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'account';
+    s
+      .replace(/[^a-z0-9]+/gi, '-')
+      .replace(/^-+|-+$/g, '')
+      .toLowerCase() || 'account';
   const [local = 'account', domain = ''] = email.split('@');
   const candidates = [slug(local), domain ? slug(`${local}-${domain}`) : ''].filter(Boolean);
   for (const c of candidates) if (available(c)) return c;
-  for (let i = 2; i < 100; i++) if (available(`${candidates[0]}${i}`)) return `${candidates[0]}${i}`;
+  for (let i = 2; i < 100; i++)
+    if (available(`${candidates[0]}${i}`)) return `${candidates[0]}${i}`;
   return candidates[0];
 }

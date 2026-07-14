@@ -2,26 +2,16 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import {
-  AccountRegistry,
-  hasCredentials,
-  readIdentity,
-  type Account,
-} from './accounts';
+import { AccountRegistry, hasCredentials, readIdentity, type Account } from './accounts';
 import { WindowBinding } from './binding';
 import { StatusBarManager } from './statusBar';
 import { SetupWizard, NOTICE_KEY } from './setupWizard';
 import { ensureSharedHistory } from './sharedHistory';
 import { defaultSourceDir } from './capture';
 import { AccountWatcher } from './accountWatcher';
-import { allWorkingDirs, workingRoot } from './workdir';
+import { allWorkingDirs } from './workdir';
 import { log, showLog } from './log';
-import {
-  UsageMonitor,
-  writePolicyCache,
-  prunePolicyEmails,
-  type WorkspaceRoutePolicy,
-} from './usage';
+import { UsageMonitor, writePolicyCache, type WorkspaceRoutePolicy } from './usage';
 import { isSidecarConfigDir } from './sidecars';
 import {
   emailsEqual,
@@ -31,6 +21,7 @@ import {
   type WorkspaceRoute,
 } from './workspaceRoutes';
 import { IdleCutoverController, type PanelCutoverMode } from './cutover';
+import { looksLikeLogout } from './reclaim';
 
 /**
  * Everything this extension does rests on Linux semantics that we verified:
@@ -49,12 +40,18 @@ import { IdleCutoverController, type PanelCutoverMode } from './cutover';
  */
 function activateUnsupported(context: vscode.ExtensionContext): void {
   const label =
-    process.platform === 'darwin' ? 'macOS' : process.platform === 'win32' ? 'native Windows' : process.platform;
+    process.platform === 'darwin'
+      ? 'macOS'
+      : process.platform === 'win32'
+        ? 'native Windows'
+        : process.platform;
   const msg =
     `Claude Accounts + Usage supports Linux only (workspace extension) — desktop Linux, WSL, Remote-SSH ` +
     `to a Linux host, or a dev container. On ${label} it stays inactive so it never attaches to a ` +
     `Windows Claude binary. No files are read or written.` +
-    (process.platform === 'win32' ? ' Tip: open your folder in a WSL window and install it there.' : '');
+    (process.platform === 'win32'
+      ? ' Tip: open your folder in a WSL window and install it there.'
+      : '');
   log(`platform ${process.platform} is unsupported — inert mode, nothing will be touched`);
 
   const item = vscode.window.createStatusBarItem(
@@ -94,15 +91,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const registry = new AccountRegistry(context);
   const binding = new WindowBinding(context);
   const wizard = new SetupWizard(registry, binding, context);
-  // 5 min poll — matches camwatch cache TTL; faster polling just 429s the usage API.
+  // 5 min poll — matches the usage cache TTL; faster polling just 429s the usage API.
   const usage = new UsageMonitor(5 * 60_000);
 
   const accountByEmail = (email: string) => {
     const want = normalizeEmail(email);
     if (!want) return undefined;
-    return registry
-      .list()
-      .find((a) => normalizeEmail(registry.emailOf(a) || a.email) === want);
+    return registry.list().find((a) => normalizeEmail(registry.emailOf(a) || a.email) === want);
   };
 
   /** Settings routes + learned folder→account map (from prior Switch Account). */
@@ -150,10 +145,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       fable: cfg.get<boolean>('failover.onFable', false),
     };
     const accountOrder = resolveAccountOrder();
-    const strategy = cfg.get<'lowestUsage' | 'ordered'>(
-      'failover.strategy',
-      'lowestUsage'
-    );
+    const strategy = cfg.get<'lowestUsage' | 'ordered'>('failover.strategy', 'lowestUsage');
     const nameByEmail: Record<string, string> = {};
     for (const a of registry.list()) {
       const em = registry.emailOf(a);
@@ -187,7 +179,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       workspaceRoutes: routes,
       nameByEmail,
       snapshots: [],
-      retainEmails: usage.listAccountsToPoll().map((a) => a.email),
     });
   };
   applyUsageSettings();
@@ -307,19 +298,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       `workspace auto-select: ${preferredAtStart.folderPath} → ${preferredAtStart.email} (${preferredName})`
     );
   } else if (preferredAtStart && !preferredAtStart.account) {
-    log(
-      `workspace route ${preferredAtStart.email} has no saved account yet — sign in as it once`
-    );
+    log(`workspace route ${preferredAtStart.email} has no saved account yet — sign in as it once`);
   }
   const appliedStart = binding.applyStored(resolveAccount, preferredName);
   // Healthy bind only when the working dir is stocked. Preferred + unstocked is
   // escalated after override clear (force bind + metered reload).
-  let bound =
-    appliedStart?.stocked
-      ? appliedStart.account
-      : preferredName
-        ? undefined
-        : appliedStart?.account;
+  let bound = appliedStart?.stocked
+    ? appliedStart.account
+    : preferredName
+      ? undefined
+      : appliedStart?.account;
 
   // ── The critical fix ───────────────────────────────────────────────────────
   // The machine-scoped `claudeCode.environmentVariables` setting is shared by
@@ -348,11 +336,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const preferredAfter = resolveFolderPreferred();
   if (preferredAfter?.account) {
     const workDir = binding.workingDir();
-    const dirEmail =
-      hasCredentials(workDir) ? readIdentity(workDir)?.email : undefined;
+    const dirEmail = hasCredentials(workDir) ? readIdentity(workDir)?.email : undefined;
     const routeOk = emailsEqual(dirEmail, preferredAfter.email);
-    if (!routeOk) {
-      // Dir not stocked with the pin (empty after logout, late discovery, or
+    if (!routeOk && looksLikeLogout(workDir)) {
+      // The pinned account was logged out in this window. Do NOT restock it —
+      // refilling from the store would resurrect a token the server revoked.
+      // Leave the dir empty; reconcile (at activation, below) concludes the
+      // logout, forgets the account, and prompts a fresh sign-in.
+      log(
+        `workspace route ${preferredAfter.folderPath}: pinned ${preferredAfter.email} was logged out here — not restocking`
+      );
+    } else if (!routeOk) {
+      // Dir not stocked with the pin (empty first stock, late discovery, or
       // wrong account). Force bind + reload; metered so a bug cannot loop.
       log(
         `workspace route reload: ${preferredAfter.folderPath} → ${preferredAfter.email} (${preferredAfter.account.name}) ` +
@@ -363,12 +358,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         notice: `This folder is pinned to ${preferredAfter.email}.`,
       });
       return; // activation continues after reload
+    } else {
+      // Dir already correct — persist folder→account without reload.
+      if (binding.getActiveName() !== preferredAfter.account.name) {
+        await binding.remember(preferredAfter.account);
+      }
+      bound = preferredAfter.account;
     }
-    // Dir already correct — persist folder→account without reload.
-    if (binding.getActiveName() !== preferredAfter.account.name) {
-      await binding.remember(preferredAfter.account);
-    }
-    bound = preferredAfter.account;
   } else if (preferredAfter && !preferredAfter.account) {
     void vscode.window.showWarningMessage(
       `Claude Accounts: this folder is mapped to ${preferredAfter.email}, but that account is not saved yet. ` +
@@ -393,14 +389,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // used to copy the entire store into each of them.
   //
   // Active accounts + working dirs only. Forgotten / sidecar paths are NOT
-  // migrated into ~/.claude-shared (that rewired Scrypted CamWatch when it
-  // lived under ~/.claude-camwatch). History already in the shared store stays;
+  // migrated into ~/.claude-shared. History already in the shared store stays;
   // forgotten dirs simply keep whatever local or linked layout they already have.
   const allDirs = (): string[] =>
     [defaultSourceDir(), ...registry.list().map((a) => a.dir), ...allWorkingDirs()].filter(
       (d) => !isSidecarConfigDir(d)
     );
-  const warnings = ensureSharedHistory(allDirs());
+  const warnings = await ensureSharedHistory(allDirs());
   if (warnings.length > 0) {
     vscode.window.showWarningMessage(
       `Claude Accounts: shared history migration hit ${warnings.length} issue(s); ` +
@@ -451,7 +446,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     cmd('claudeProfiles.showLog', () => showLog()),
     cmd('claudeProfiles.refreshUsage', async () => {
       const dir = binding.getEnvDir() ?? defaultSourceDir();
-      // Prefer cache/backoff first (camwatch). Only force network if nothing fresh.
+      // Prefer cache/backoff first. Only force network if nothing fresh.
       let snap = await usage.refresh(dir, false);
       if (!snap || snap.fetchedAt === 0) {
         snap = await usage.refresh(dir, true);
@@ -488,7 +483,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // unfocused while that happened must reconcile when focus comes back —
     // otherwise a handoff nobody was around to finish would sit unrepaired.
     vscode.window.onDidChangeWindowState((s) => {
-      if (s.focused) void wizard.reconcile().finally(() => statusBar.reconfirm());
+      if (s.focused)
+        void wizard
+          .reconcile()
+          .catch((e) => log(`reconcile failed: ${e instanceof Error ? e.message : String(e)}`))
+          .finally(() => statusBar.reconfirm());
     }),
     statusBar
   );
@@ -501,7 +500,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // of the account this dir held — move the new account into a dir of its own and
   // restore the displaced one. Then repaint the bar so it never lags behind.
   const watcher = new AccountWatcher(binding, () => {
-    void wizard.reconcile().finally(() => statusBar.reconfirm());
+    void wizard
+      .reconcile()
+      .catch((e) => log(`reconcile failed: ${e instanceof Error ? e.message : String(e)}`))
+      .finally(() => statusBar.reconfirm());
   });
   watcher.start();
   context.subscriptions.push(watcher);
@@ -516,7 +518,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       )
       .then((pick) => {
         if (pick === 'Show extensions') {
-          void vscode.commands.executeCommand('workbench.extensions.search', 'claude parallel accounts');
+          void vscode.commands.executeCommand(
+            'workbench.extensions.search',
+            'claude parallel accounts'
+          );
         }
       });
   }
@@ -524,7 +529,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   if (cleared) {
     vscode.window.showInformationMessage(
       'Claude Accounts: removed CLAUDE_CONFIG_DIR from the shared machine setting. ' +
-        'Isolation now works per-window. Pick this window\'s account from the status bar.'
+        "Isolation now works per-window. Pick this window's account from the status bar."
     );
   }
 
@@ -549,7 +554,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // the news must come with the way out attached, not read as a dead end.
     const canSwitch = !binding.getActiveName() && registry.listUniqueByEmail().length > 0;
     void vscode.window
-      .showInformationMessage(`Claude Accounts: ${notice}`, ...(canSwitch ? ['Switch account'] : []))
+      .showInformationMessage(
+        `Claude Accounts: ${notice}`,
+        ...(canSwitch ? ['Switch account'] : [])
+      )
       .then((pick) => {
         if (pick === 'Switch account') {
           void vscode.commands.executeCommand('claudeProfiles.switchAccount');

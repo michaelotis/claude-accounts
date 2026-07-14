@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { isReservedClaudeDirName } from './sidecars';
+import { writeFileAtomic } from './fsSafe';
 
 /**
  * An account = a Claude Code data directory (CLAUDE_CONFIG_DIR) that has been
@@ -122,7 +123,7 @@ export class AccountRegistry {
       const stores = [...this.list(), ...this.listForgotten()].map((a) => path.normalize(a.dir));
       const file = manifestPath();
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-      fs.writeFileSync(file, JSON.stringify({ stores: [...new Set(stores)] }, null, 2), {
+      writeFileAtomic(file, JSON.stringify({ stores: [...new Set(stores)] }, null, 2), {
         mode: 0o600,
       });
     } catch {
@@ -157,7 +158,10 @@ export class AccountRegistry {
    */
   listUniqueByEmail(): Account[] {
     const slug = (email: string) =>
-      (email.split('@')[0] || '').replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '').toLowerCase();
+      (email.split('@')[0] || '')
+        .replace(/[^a-z0-9]+/gi, '-')
+        .replace(/^-+|-+$/g, '')
+        .toLowerCase();
     const chosen = new Map<string, Account>();
     const noEmail: Account[] = [];
     for (const a of this.list()) {
@@ -208,7 +212,6 @@ export class AccountRegistry {
     return this.context.globalState.get<Account[]>(FORGOTTEN_KEY, []);
   }
 
-
   /** Moves an account from the registry to the forgotten list. Dir stays on disk. */
   async forget(account: Account): Promise<void> {
     await this.remove(account.name);
@@ -240,7 +243,7 @@ export class AccountRegistry {
   async discoverAndMerge(): Promise<Account[]> {
     const home = os.homedir();
     const found: Account[] = [];
-    let entries: fs.Dirent[] = [];
+    let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(home, { withFileTypes: true });
     } catch {

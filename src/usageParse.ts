@@ -245,15 +245,6 @@ export function failoverReasons(
   return reasons;
 }
 
-/** @deprecated use failoverReasons — kept as alias for callers */
-export function hotReasons(
-  u: UsageSnapshot,
-  t: FailoverThresholds = DEFAULT_THRESHOLDS,
-  triggers: FailoverTriggers = DEFAULT_TRIGGERS
-): string[] {
-  return failoverReasons(u, t, triggers);
-}
-
 export function needsFailover(
   u: UsageSnapshot,
   t: FailoverThresholds = DEFAULT_THRESHOLDS,

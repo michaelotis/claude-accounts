@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { withLockAsync } from './fsSafe';
 
 /**
  * Shared conversation history across accounts.
@@ -39,8 +40,7 @@ export function sharedStoreDir(): string {
  * reported as a warning instead of aborting the rest (a partial migration
  * simply converges on the next activation). Returns human-readable warnings.
  */
-export function ensureSharedHistory(accountDirs: string[]): string[] {
-  const warnings: string[] = [];
+export async function ensureSharedHistory(accountDirs: string[]): Promise<string[]> {
   const store = sharedStoreDir();
   try {
     fs.mkdirSync(store, { recursive: true, mode: 0o700 });
@@ -48,6 +48,53 @@ export function ensureSharedHistory(accountDirs: string[]): string[] {
     return [`Could not create ${store}: ${(err as Error).message}`];
   }
 
+  // Fast path: when every entry for these dirs is already our symlink there is
+  // nothing to migrate — skip the lock entirely. This is the steady-state case
+  // hit on every activation; only a dir still holding real history takes the lock.
+  if (accountDirs.every((d) => alreadyLinked(d, store))) return [];
+
+  // linkDirEntry moves real directories into the store (unlink → rename → rm →
+  // symlink); two windows doing that to the same path at once can move or
+  // duplicate a user's transcripts. Serialize behind a single-writer lock. A
+  // live holder is never reclaimed (its long first-time merge is safe), so a
+  // waiter blocks up to capMs; if the holder is STILL migrating we skip rather
+  // than run concurrently — the holder migrates every dir it saw, and anything
+  // it missed converges on this window's next activation. Never run the merge
+  // unlocked: overlapping movers is exactly the corruption the lock prevents.
+  const { result, locked } = await withLockAsync(
+    migrateLockDir(),
+    () => migrateAll(accountDirs, store),
+    { staleMs: 10 * 60_000, capMs: 60_000, stepMs: 500, skipIfUnacquired: true }
+  );
+  if (!locked) {
+    return ['shared-history migration deferred: another window holds the migrate lock'];
+  }
+  return result ?? [];
+}
+
+/** Single-writer lock directory guarding the migration into the shared store. */
+function migrateLockDir(): string {
+  return path.join(sharedStoreDir(), '.migrate-lock');
+}
+
+/** True when every shared entry for `rawDir` is already our symlink into the store. */
+function alreadyLinked(rawDir: string, store: string): boolean {
+  const dir = path.normalize(rawDir);
+  if (dir === path.normalize(store)) return true;
+  if (!fs.existsSync(dir)) return true; // a dir that isn't there has nothing to migrate
+  const isOurs = (name: string): boolean => {
+    const src = path.join(dir, name);
+    const st = fs.lstatSync(src, { throwIfNoEntry: false });
+    return Boolean(
+      st?.isSymbolicLink() &&
+      path.normalize(fs.readlinkSync(src)) === path.normalize(path.join(store, name))
+    );
+  };
+  return SHARED_DIRS.every(isOurs) && SHARED_FILES.every(isOurs);
+}
+
+function migrateAll(accountDirs: string[], store: string): string[] {
+  const warnings: string[] = [];
   const seen = new Set<string>();
   for (const rawDir of accountDirs) {
     const dir = path.normalize(rawDir);
@@ -131,7 +178,12 @@ function mergeDirInto(src: string, dst: string, store: string): void {
     }
     // Genuinely different: keep the newer, back up the older.
     const loser = srcStat.mtimeMs > dstStat.mtimeMs ? d : s;
-    const backup = path.join(store, '.merge-backup', path.relative(store, dst), `${entry.name}.${Date.now()}`);
+    const backup = path.join(
+      store,
+      '.merge-backup',
+      path.relative(store, dst),
+      `${entry.name}.${Date.now()}`
+    );
     fs.mkdirSync(path.dirname(backup), { recursive: true });
     fs.renameSync(loser, backup);
     if (loser === d) fs.renameSync(s, d);

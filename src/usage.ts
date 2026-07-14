@@ -7,7 +7,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { log } from './log';
-import { readIdentity } from './accounts';
+import { readIdentity, hasCredentials } from './accounts';
+import { writeFileAtomic, withLock, withLockAsync } from './fsSafe';
+import { isWindowsPath } from './sidecars';
 import {
   buildSnapshot,
   formatUsageBar,
@@ -23,7 +25,6 @@ import {
   needsFailover,
   failoverReasons,
   pressureReasons,
-  hotReasons,
   selectFailoverAccount,
   usageScore,
 } from './usageParse';
@@ -39,7 +40,6 @@ export {
   needsFailover,
   failoverReasons,
   pressureReasons,
-  hotReasons,
   selectFailoverAccount,
   usageScore,
 };
@@ -48,24 +48,24 @@ const API_BASE = 'https://api.anthropic.com';
 const USAGE_PATH = '/api/oauth/usage';
 const USAGE_URL = `${API_BASE}${USAGE_PATH}`;
 const FETCH_TIMEOUT_MS = 15_000;
-/** Same public Claude Code OAuth client id camwatch / claude-code CLI use. */
+/** Same public Claude Code OAuth client id the claude-code CLI uses. */
 const CLAUDE_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const CLAUDE_OAUTH_TOKEN_URL = 'https://console.anthropic.com/v1/oauth/token';
-/** CamWatch-style usage cache TTL — avoid hammering /api/oauth/usage (429). */
+/** 5-min cache to avoid hammering /api/oauth/usage (429). */
 export const USAGE_CACHE_TTL_MS = 5 * 60_000;
-/** After a poll 429, do not hit the network again for this long (camwatch stamps lastUsageCheckTs). */
+/** After a poll 429, do not hit the network again for this long. */
 const RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
-/** Refresh access token this long before expiresAt (camwatch). */
+/** Refresh access token this long before expiresAt. */
 const TOKEN_HEADROOM_MS = 60_000;
 
 /**
- * Headers for GET /api/oauth/usage — match camwatch exactly.
- * (Camwatch does NOT send anthropic-version on the usage poll.)
+ * Headers for GET /api/oauth/usage.
+ * (Does not send anthropic-version on the usage poll.)
  */
 const USAGE_HEADERS: Record<string, string> = {
   'anthropic-beta': 'oauth-2025-04-20',
   Accept: 'application/json',
-  'User-Agent': 'claude-accounts/CamWatch-compat',
+  'User-Agent': 'claude-accounts',
 };
 
 /** Policy cache for the CLI orchestrator (JSON). */
@@ -79,6 +79,15 @@ export function policyPath(): string {
 
 function usageCachePath(): string {
   return path.join(policyDir(), 'usage-cache.json');
+}
+
+/**
+ * Advisory lock for a machine-wide file this extension fully owns. Every window
+ * read-modify-writes these, so the lock serializes those critical sections
+ * (unique temp names alone stop torn writes, not lost updates).
+ */
+function lockFor(file: string): string {
+  return `${file}.lock`;
 }
 
 interface CredsFile {
@@ -124,9 +133,7 @@ function readCreds(configDir: string): CredsFile | null {
 function writeCredsAtomic(configDir: string, creds: CredsFile): void {
   const file = path.join(configDir, '.credentials.json');
   fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
-  const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(creds, null, 2), { mode: 0o600 });
-  fs.renameSync(tmp, file);
+  writeFileAtomic(file, JSON.stringify(creds, null, 2), { mode: 0o600 });
 }
 
 function cacheKeyForDir(configDir: string): string {
@@ -150,16 +157,20 @@ function readUsageCache(): UsageCacheFile {
 function writeUsageCache(cache: UsageCacheFile): void {
   try {
     fs.mkdirSync(policyDir(), { recursive: true, mode: 0o700 });
-    const tmp = `${usageCachePath()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(cache, null, 2), { mode: 0o600 });
-    fs.renameSync(tmp, usageCachePath());
+    writeFileAtomic(usageCachePath(), JSON.stringify(cache, null, 2), { mode: 0o600 });
   } catch (err) {
     log(`usage-cache write failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
 interface UsageMeta {
-  /** Wall clock of last poll HTTP 429 — drives network backoff. */
+  /**
+   * Per-account network backoff: cache-key (email:… / dir:…) → wall clock of its
+   * last poll HTTP 429. Per-account so one account's 429 does not freeze every
+   * other account's meter on stale data for the backoff window.
+   */
+  rateLimitAt?: Record<string, number>;
+  /** Legacy machine-wide stamp (pre per-account); ignored now, left to expire. */
   lastRateLimitAt?: number;
 }
 
@@ -178,29 +189,34 @@ function readMeta(): UsageMeta {
 function writeMeta(m: UsageMeta): void {
   try {
     fs.mkdirSync(policyDir(), { recursive: true, mode: 0o700 });
-    const tmp = `${metaPath()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(m, null, 2), { mode: 0o600 });
-    fs.renameSync(tmp, metaPath());
-  } catch {
-    /* ignore */
+    writeFileAtomic(metaPath(), JSON.stringify(m, null, 2), { mode: 0o600 });
+  } catch (err) {
+    log(`usage-meta write failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
-function inRateLimitBackoff(): boolean {
-  const at = readMeta().lastRateLimitAt || 0;
+function inRateLimitBackoff(key: string): boolean {
+  const at = readMeta().rateLimitAt?.[key] || 0;
   return at > 0 && Date.now() - at < RATE_LIMIT_BACKOFF_MS;
 }
 
-function stampRateLimitBackoff(): void {
-  writeMeta({ ...readMeta(), lastRateLimitAt: Date.now() });
+function stampRateLimitBackoff(key: string): void {
+  withLock(lockFor(metaPath()), () => {
+    const m = readMeta();
+    const map = m.rateLimitAt ?? {};
+    map[key] = Date.now();
+    writeMeta({ ...m, rateLimitAt: map });
+  });
 }
 
-function clearRateLimitBackoff(): void {
-  const m = readMeta();
-  if (m.lastRateLimitAt) {
+function clearRateLimitBackoff(key: string): void {
+  withLock(lockFor(metaPath()), () => {
+    const m = readMeta();
+    if (!m.rateLimitAt?.[key] && m.lastRateLimitAt === undefined) return;
+    if (m.rateLimitAt) delete m.rateLimitAt[key];
     delete m.lastRateLimitAt;
     writeMeta(m);
-  }
+  });
 }
 
 function getCachedSnap(key: string, maxAgeMs: number): UsageSnapshot | null {
@@ -216,9 +232,13 @@ function getStaleSnap(key: string): UsageSnapshot | null {
 }
 
 function putCachedSnap(key: string, snap: UsageSnapshot): void {
-  const cache = readUsageCache();
-  cache.entries[key] = { key, fetchedAt: Date.now(), snap };
-  writeUsageCache(cache);
+  // Lock the read-modify-write: another window caching a different key must not
+  // drop this entry (unique temp names stop torn writes, not lost updates).
+  withLock(lockFor(usageCachePath()), () => {
+    const cache = readUsageCache();
+    cache.entries[key] = { key, fetchedAt: Date.now(), snap };
+    writeUsageCache(cache);
+  });
 }
 
 /** Fall back to policy.json account rows (last successful poll from any version). */
@@ -235,8 +255,9 @@ function snapFromPolicy(dir: string, key: string): UsageSnapshot | null {
         fetchedAt?: number;
       }>;
     };
-    const email =
-      key.startsWith('email:') ? key.slice('email:'.length) : readIdentity(dir)?.email?.toLowerCase();
+    const email = key.startsWith('email:')
+      ? key.slice('email:'.length)
+      : readIdentity(dir)?.email?.toLowerCase();
     if (!email || !pol.accounts?.length) return null;
     const row = pol.accounts.find((a) => (a.email || '').toLowerCase() === email);
     if (!row) return null;
@@ -266,7 +287,7 @@ function snapFromPolicy(dir: string, key: string): UsageSnapshot | null {
   }
 }
 
-/** Camwatch default when no prior sample: { session: 0, weekly: 0 }. */
+/** Default when no prior sample: { session: 0, weekly: 0 }. */
 function emptySnap(dir: string, email?: string | null): UsageSnapshot {
   return {
     sessionPercent: 0,
@@ -288,8 +309,8 @@ function emptySnap(dir: string, email?: string | null): UsageSnapshot {
 }
 
 /**
- * Best available meter without network — camwatch on 429 returns previous cache
- * (or zeros), never a hard error toast.
+ * Best available meter without network — on 429 serve the last good meter
+ * (or zeros), never a hard sign-in error.
  */
 function bestEffortSnap(dir: string, key: string): UsageSnapshot {
   return (
@@ -299,110 +320,136 @@ function bestEffortSnap(dir: string, key: string): UsageSnapshot {
   );
 }
 
-/** In-flight token refresh coalesced per config dir (camwatch). */
+/** In-flight token refresh coalesced per config dir. */
 const inflightTokenRefresh = new Map<string, Promise<string>>();
 
 /**
- * Ensure access token is usable before calling usage API — camwatch pattern.
+ * Ensure access token is usable before calling usage API.
  * Refreshes when expiresAt is missing/past or within TOKEN_HEADROOM_MS.
  * Writes the new pair back into this config dir only.
  */
 async function ensureFreshToken(configDir: string, force = false): Promise<string> {
-  const existing = inflightTokenRefresh.get(configDir);
+  // Key by force: a forced refresh (the 401-retry path) must NOT join an
+  // in-flight non-force refresh, which can resolve to the still-valid-looking
+  // OLD access token via the `!force` short-circuit below and defeat the retry.
+  const inflightKey = force ? `${configDir}#force` : configDir;
+  const existing = inflightTokenRefresh.get(inflightKey);
   if (existing) return existing;
 
   const run = (async () => {
-    const creds = readCreds(configDir);
-    const oauth = creds?.claudeAiOauth;
-    const accessToken = oauth?.accessToken || creds?.accessToken;
-    const refreshToken = oauth?.refreshToken;
-    const expiresAt = Number(oauth?.expiresAt) || 0;
-
-    if (!accessToken) {
+    const cur = readCreds(configDir);
+    const curOauth = cur?.claudeAiOauth;
+    const curAccess = curOauth?.accessToken || cur?.accessToken;
+    const curExpiry = Number(curOauth?.expiresAt) || 0;
+    if (!curAccess) {
       throw Object.assign(new Error('NO_TOKEN'), { kind: 'no_token' as const });
     }
-
-    if (!force && expiresAt && Date.now() < expiresAt - TOKEN_HEADROOM_MS) {
-      return accessToken;
+    // Fast path: token still good — no refresh, no lock.
+    if (!force && curExpiry && Date.now() < curExpiry - TOKEN_HEADROOM_MS) {
+      return curAccess;
     }
 
-    if (!refreshToken) {
-      // Still try the access token if present (server may accept it).
-      if (accessToken && (!expiresAt || Date.now() < expiresAt)) return accessToken;
-      throw Object.assign(new Error('NO_REFRESH'), { kind: 'no_token' as const });
-    }
+    // A refresh is due. Serialize it across windows on this store's credentials
+    // file: two windows refreshing the same account would each POST a refresh
+    // and, if the server rotates the refresh token, invalidate the other's. The
+    // waiter re-reads under the lock and reuses a token another window just wrote.
+    const credsLock = lockFor(path.join(configDir, '.credentials.json'));
+    const { result } = await withLockAsync(
+      credsLock,
+      async (): Promise<string> => {
+        const creds = readCreds(configDir);
+        const oauth = creds?.claudeAiOauth;
+        const accessToken = oauth?.accessToken || creds?.accessToken;
+        const refreshToken = oauth?.refreshToken;
+        const expiresAt = Number(oauth?.expiresAt) || 0;
 
-    log(`usage: refreshing OAuth token for ${configDir} (force=${force})`);
-    const body = JSON.stringify({
-      grant_type: 'refresh_token',
-      refresh_token: refreshToken,
-      client_id: CLAUDE_OAUTH_CLIENT_ID,
-    });
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10_000);
-    try {
-      const res = await fetch(CLAUDE_OAUTH_TOKEN_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          'User-Agent': 'claude-accounts (oauth-refresh)',
-        },
-        body,
-        redirect: 'error',
-        signal: controller.signal,
-      });
-      const text = await res.text();
-      if (res.status === 400 || res.status === 401) {
-        let errType = '';
-        try {
-          errType = (JSON.parse(text) as { error?: string }).error || '';
-        } catch {
-          /* ignore */
+        if (!accessToken) {
+          throw Object.assign(new Error('NO_TOKEN'), { kind: 'no_token' as const });
         }
-        if (errType === 'invalid_grant' || res.status === 401) {
-          throw Object.assign(new Error('TOKEN_REJECTED'), {
-            kind: 'token_rejected' as const,
-            status: res.status,
-          });
+        // Re-check under the lock: another window may have refreshed while we waited.
+        if (!force && expiresAt && Date.now() < expiresAt - TOKEN_HEADROOM_MS) {
+          return accessToken;
         }
-      }
-      if (!res.ok) {
-        throw Object.assign(new Error(`REFRESH_HTTP_${res.status}`), {
-          kind: 'network' as const,
-          status: res.status,
+        if (!refreshToken) {
+          // Still try the access token if present (server may accept it).
+          if (accessToken && (!expiresAt || Date.now() < expiresAt)) return accessToken;
+          throw Object.assign(new Error('NO_REFRESH'), { kind: 'no_token' as const });
+        }
+
+        log(`usage: refreshing OAuth token for ${configDir} (force=${force})`);
+        const body = JSON.stringify({
+          grant_type: 'refresh_token',
+          refresh_token: refreshToken,
+          client_id: CLAUDE_OAUTH_CLIENT_ID,
         });
-      }
-      const parsed = JSON.parse(text) as {
-        access_token?: string;
-        refresh_token?: string;
-        expires_in?: number;
-        scope?: string;
-        subscription_type?: string;
-      };
-      if (!parsed.access_token) {
-        throw Object.assign(new Error('REFRESH_NO_TOKEN'), { kind: 'unknown' as const });
-      }
-      const nextOauth = {
-        ...(oauth || {}),
-        accessToken: parsed.access_token,
-        refreshToken: parsed.refresh_token || refreshToken,
-        expiresAt: Date.now() + (parsed.expires_in || 3600) * 1000,
-        scopes:
-          typeof parsed.scope === 'string' ? parsed.scope.split(' ') : oauth?.scopes,
-        subscriptionType: parsed.subscription_type || oauth?.subscriptionType,
-      };
-      writeCredsAtomic(configDir, { ...(creds || {}), claudeAiOauth: nextOauth });
-      log(`usage: token refreshed, expiry ${new Date(nextOauth.expiresAt).toISOString()}`);
-      return parsed.access_token;
-    } finally {
-      clearTimeout(timer);
-    }
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 10_000);
+        try {
+          const res = await fetch(CLAUDE_OAUTH_TOKEN_URL, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+              'User-Agent': 'claude-accounts (oauth-refresh)',
+            },
+            body,
+            redirect: 'error',
+            signal: controller.signal,
+          });
+          const text = await res.text();
+          if (res.status === 400 || res.status === 401) {
+            let errType = '';
+            try {
+              errType = (JSON.parse(text) as { error?: string }).error || '';
+            } catch {
+              /* ignore */
+            }
+            if (errType === 'invalid_grant' || res.status === 401) {
+              throw Object.assign(new Error('TOKEN_REJECTED'), {
+                kind: 'token_rejected' as const,
+                status: res.status,
+              });
+            }
+          }
+          if (!res.ok) {
+            throw Object.assign(new Error(`REFRESH_HTTP_${res.status}`), {
+              kind: 'network' as const,
+              status: res.status,
+            });
+          }
+          const parsed = JSON.parse(text) as {
+            access_token?: string;
+            refresh_token?: string;
+            expires_in?: number;
+            scope?: string;
+            subscription_type?: string;
+          };
+          if (!parsed.access_token) {
+            throw Object.assign(new Error('REFRESH_NO_TOKEN'), { kind: 'unknown' as const });
+          }
+          const nextOauth = {
+            ...(oauth || {}),
+            accessToken: parsed.access_token,
+            refreshToken: parsed.refresh_token || refreshToken,
+            expiresAt: Date.now() + (parsed.expires_in || 3600) * 1000,
+            scopes: typeof parsed.scope === 'string' ? parsed.scope.split(' ') : oauth?.scopes,
+            subscriptionType: parsed.subscription_type || oauth?.subscriptionType,
+          };
+          writeCredsAtomic(configDir, { ...(creds || {}), claudeAiOauth: nextOauth });
+          log(`usage: token refreshed, expiry ${new Date(nextOauth.expiresAt).toISOString()}`);
+          return parsed.access_token;
+        } finally {
+          clearTimeout(timer);
+        }
+      },
+      { capMs: 15_000, staleMs: 30_000 }
+    );
+    return result as string;
   })().finally(() => {
-    inflightTokenRefresh.delete(configDir);
+    inflightTokenRefresh.delete(inflightKey);
   });
 
-  inflightTokenRefresh.set(configDir, run);
+  inflightTokenRefresh.set(inflightKey, run);
   return run;
 }
 
@@ -423,54 +470,15 @@ export interface UsageFetchFailure {
 }
 
 export type UsageFetchResult =
-  | { ok: true; snap: UsageSnapshot }
-  | { ok: false; failure: UsageFetchFailure };
+  { ok: true; snap: UsageSnapshot } | { ok: false; failure: UsageFetchFailure };
 
 function failure(kind: UsageFetchKind, message: string, status?: number): UsageFetchResult {
   return { ok: false, failure: { kind, message, status } };
 }
 
-function classifyHttpError(err: unknown): UsageFetchFailure {
-  const status =
-    typeof err === 'object' && err && 'status' in err
-      ? Number((err as { status: number }).status)
-      : undefined;
-  const msg = err instanceof Error ? err.message : String(err);
-  if (msg === 'TOKEN_REJECTED' || status === 401 || status === 403) {
-    return {
-      kind: 'token_rejected',
-      message: 'Claude rejected this window’s token. Sign in again with Claude Code (/login).',
-      status: status ?? 401,
-    };
-  }
-  if (msg === 'RATE_LIMITED' || status === 429) {
-    return {
-      kind: 'rate_limited',
-      message:
-        'Anthropic usage API rate-limited this request (not a sign-in problem). Wait a minute and try again.',
-      status: 429,
-    };
-  }
-  if (msg.includes('abort') || msg.includes('AbortError') || msg.includes('fetch failed')) {
-    return {
-      kind: 'network',
-      message: 'Could not reach api.anthropic.com (network or timeout). Check connectivity and retry.',
-    };
-  }
-  const m = /^API_ERROR_(\d+)$/.exec(msg);
-  if (m) {
-    return {
-      kind: 'api_error',
-      message: `Usage API returned HTTP ${m[1]}. Try again shortly.`,
-      status: Number(m[1]),
-    };
-  }
-  return { kind: 'unknown', message: `Usage fetch failed: ${msg}`, status };
-}
-
 /**
- * Camwatch-style usage poll: returns { status, data } for both success and
- * HTTP errors (does not throw on 429). Throws only on network/timeout.
+ * Usage poll: returns { status, data } for both success and HTTP errors
+ * (does not throw on 429). Throws only on network/timeout.
  */
 async function callUsageApi(token: string): Promise<{ status: number; data: unknown }> {
   const controller = new AbortController();
@@ -498,7 +506,7 @@ async function callUsageApi(token: string): Promise<{ status: number; data: unkn
 }
 
 /**
- * Camwatch checkClaudeUsage sequence:
+ * Usage poll sequence:
  *  1. If cache younger than 5 min → return it (no network)
  *  2. If recent poll 429 backoff → return best-effort (no network)
  *  3. PRELIMINARY: ensureFreshToken() — may POST console.anthropic.com/v1/oauth/token
@@ -507,14 +515,14 @@ async function callUsageApi(token: string): Promise<{ status: number; data: unkn
  *  6. 429 → stamp backoff, return previous cache / policy / zeros (never hard-fail)
  *  7. 200 → cache + return
  *
- * Profile is NOT called on this path (camwatch only hits /usage for the meter).
+ * Profile is NOT called on this path (only /usage for the meter).
  */
 export async function fetchUsageDetailed(
   configDir?: string,
   opts: { forceNetwork?: boolean } = {}
 ): Promise<UsageFetchResult> {
   const dir = resolveConfigDir(configDir);
-  if (dir.startsWith('/mnt/c/') || dir.startsWith('C:') || dir.startsWith('c:')) {
+  if (isWindowsPath(dir)) {
     log(`usage: refusing Windows path ${dir}`);
     return failure(
       'windows_path',
@@ -533,8 +541,8 @@ export async function fetchUsageDetailed(
     }
   }
 
-  // (2) Backoff after poll 429 — camwatch stamps lastUsageCheckTs and skips re-poll
-  if (inRateLimitBackoff() && !opts.forceNetwork) {
+  // (2) Backoff after poll 429 — skip re-poll until window expires
+  if (inRateLimitBackoff(key) && !opts.forceNetwork) {
     const snap = bestEffortSnap(dir, key);
     log(`usage: rate-limit backoff active — serving best-effort for ${key}`);
     return { ok: true, snap: { ...snap, configDir: dir } };
@@ -569,15 +577,13 @@ export async function fetchUsageDetailed(
     // (4) Usage poll
     let { status, data } = await callUsageApi(token);
 
-    // (5) 401/403 → force refresh + one retry (camwatch)
+    // (5) 401/403 → force refresh + one retry
     if (status === 401 || status === 403) {
       log(`usage: HTTP ${status} after ensureFreshToken — forcing refresh + retry`);
       try {
-        const creds = readCreds(dir);
-        if (creds?.claudeAiOauth) {
-          creds.claudeAiOauth.expiresAt = 0;
-          writeCredsAtomic(dir, creds);
-        }
+        // Force a refresh (bypasses the expiry check and re-reads creds under the
+        // per-store lock) then retry once. No unlocked pre-write of expiresAt — it
+        // was redundant with force=true and could clobber another window's refresh.
         token = await ensureFreshToken(dir, true);
         ({ status, data } = await callUsageApi(token));
       } catch (retryErr) {
@@ -607,9 +613,9 @@ export async function fetchUsageDetailed(
       }
     }
 
-    // (6) 429 poll rate-limit — keep previous usage, stamp backoff (camwatch)
+    // (6) 429 poll rate-limit — keep previous usage, stamp backoff
     if (status === 429) {
-      stampRateLimitBackoff();
+      stampRateLimitBackoff(key);
       const snap = bestEffortSnap(dir, key);
       log(
         `usage: HTTP 429 (poll rate-limit) — serving best-effort (5h ${snap.sessionPercent}% 7d ${snap.weeklyPercent}%), NOT treating as sign-out`
@@ -623,16 +629,14 @@ export async function fetchUsageDetailed(
     }
 
     // (7) Success
-    clearRateLimitBackoff();
+    clearRateLimitBackoff(key);
     const usage = data as Record<string, unknown>;
     // Identity from dir (no second profile HTTP call — avoids extra 429s)
     const identity = readIdentity(dir);
     const profile = identity
       ? {
           account: { email: identity.email, display_name: identity.displayName },
-          organization: identity.organizationName
-            ? { name: identity.organizationName }
-            : undefined,
+          organization: identity.organizationName ? { name: identity.organizationName } : undefined,
         }
       : null;
     const snap = buildSnapshot(usage, profile, dir);
@@ -644,7 +648,7 @@ export async function fetchUsageDetailed(
     );
     return { ok: true, snap };
   } catch (err) {
-    // Network / timeout — same as camwatch transient: keep cache
+    // Network / timeout — keep last good cache
     log(`usage: network error — ${err instanceof Error ? err.message : String(err)}`);
     return { ok: true, snap: { ...bestEffortSnap(dir, key), configDir: dir } };
   }
@@ -713,87 +717,86 @@ export function writePolicyCache(opts: {
   snapshots: UsageSnapshot[];
   /** Drop these emails entirely (e.g. after Forget). */
   removeEmails?: string[];
-  /**
-   * If set, policy.accounts becomes exactly this set of emails after merge
-   * (plus any successful snapshots). Drops forgotten / unknown entries.
-   */
-  retainEmails?: string[];
 }): void {
   try {
-    fs.mkdirSync(policyDir(), { recursive: true, mode: 0o700 });
-    let prev: Partial<OrchPolicy> = {};
-    if (fs.existsSync(policyPath())) {
-      try {
-        prev = JSON.parse(fs.readFileSync(policyPath(), 'utf-8')) as OrchPolicy;
-      } catch {
-        prev = {};
-      }
-    }
-    const byEmail = new Map<string, PolicyAccount>();
-    for (const a of prev.accounts || []) {
-      if (a.email) byEmail.set(a.email, a);
-    }
-    for (const e of opts.removeEmails || []) {
-      byEmail.delete(e);
-    }
-    for (const s of opts.snapshots) {
-      if (!s.email) continue;
-      const fable = s.modelLimits.find((m) => /fable/i.test(m.name))?.percent ?? null;
-      const prevDir = byEmail.get(s.email)?.dir;
-      let dir = s.configDir;
-      // Prefer durable account store over per-window workdir
-      if (dir.includes(`${path.sep}.claude-windows${path.sep}`)) {
-        if (prevDir && !prevDir.includes(`${path.sep}.claude-windows${path.sep}`)) {
-          dir = prevDir;
+    // Lock the whole read-modify-write: policy.json is one machine-wide file
+    // every window rewrites, so an unlocked RMW loses a concurrent window's
+    // update (and unique temp names only stop torn writes, not lost updates).
+    withLock(lockFor(policyPath()), () => {
+      fs.mkdirSync(policyDir(), { recursive: true, mode: 0o700 });
+      let prev: Partial<OrchPolicy> = {};
+      if (fs.existsSync(policyPath())) {
+        try {
+          prev = JSON.parse(fs.readFileSync(policyPath(), 'utf-8')) as OrchPolicy;
+        } catch {
+          prev = {};
         }
       }
-      const name = opts.nameByEmail?.[s.email] || byEmail.get(s.email)?.name;
-      byEmail.set(s.email, {
-        id: s.email,
-        email: s.email,
-        name,
-        dir,
-        sessionPercent: s.sessionPercent,
-        weeklyPercent: s.weeklyPercent,
-        fablePercent: fable,
-        hot: needsFailover(s, opts.thresholds, opts.triggers),
-        reasons: failoverReasons(s, opts.thresholds, opts.triggers),
-        planLabel: s.planLabel,
-        fetchedAt: s.fetchedAt,
-      });
-    }
-    if (opts.retainEmails) {
-      const keep = new Set(opts.retainEmails);
-      for (const em of [...byEmail.keys()]) {
-        if (!keep.has(em)) byEmail.delete(em);
+      const byEmail = new Map<string, PolicyAccount>();
+      for (const a of prev.accounts || []) {
+        if (a.email) byEmail.set(a.email, a);
       }
-    }
-    let accountOrder =
-      opts.accountOrder !== undefined ? opts.accountOrder : prev.accountOrder || [];
-    if (!accountOrder.length) {
-      const legacy: string[] = [];
-      const prevAny = prev as { primaryEmail?: string; secondaryEmail?: string };
-      if (prevAny.primaryEmail) legacy.push(prevAny.primaryEmail);
-      if (prevAny.secondaryEmail) legacy.push(prevAny.secondaryEmail);
-      accountOrder = legacy;
-    }
-    const policy: OrchPolicy = {
-      version: 3,
-      updatedAt: Date.now(),
-      mode: opts.mode,
-      thresholds: opts.thresholds,
-      triggers: opts.triggers,
-      strategy: opts.strategy || prev.strategy || DEFAULT_STRATEGY,
-      accountOrder,
-      workspaceRoutes:
-        opts.workspaceRoutes !== undefined
-          ? opts.workspaceRoutes
-          : prev.workspaceRoutes || [],
-      accounts: [...byEmail.values()],
-    };
-    const tmp = policyPath() + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(policy, null, 2), { mode: 0o600 });
-    fs.renameSync(tmp, policyPath());
+      for (const e of opts.removeEmails || []) {
+        byEmail.delete(e);
+      }
+      for (const s of opts.snapshots) {
+        if (!s.email) continue;
+        const fable = s.modelLimits.find((m) => /fable/i.test(m.name))?.percent ?? null;
+        const prevDir = byEmail.get(s.email)?.dir;
+        let dir = s.configDir;
+        // Prefer durable account store over per-window workdir
+        if (dir.includes(`${path.sep}.claude-windows${path.sep}`)) {
+          if (prevDir && !prevDir.includes(`${path.sep}.claude-windows${path.sep}`)) {
+            dir = prevDir;
+          }
+        }
+        const name = opts.nameByEmail?.[s.email] || byEmail.get(s.email)?.name;
+        byEmail.set(s.email, {
+          id: s.email,
+          email: s.email,
+          name,
+          dir,
+          sessionPercent: s.sessionPercent,
+          weeklyPercent: s.weeklyPercent,
+          fablePercent: fable,
+          hot: needsFailover(s, opts.thresholds, opts.triggers),
+          reasons: failoverReasons(s, opts.thresholds, opts.triggers),
+          planLabel: s.planLabel,
+          fetchedAt: s.fetchedAt,
+        });
+      }
+      // Membership is decided by disk, not by this window's globalState view of
+      // the account list (which does not propagate between windows): keep a row
+      // only while its store still holds a credential. A window that has not yet
+      // discovered an account — or forgot it locally — must not delete it out
+      // from under another window that is legitimately still polling it. Explicit
+      // Forget removes rows through removeEmails / prunePolicyEmails.
+      for (const [em, acc] of [...byEmail.entries()]) {
+        if (!acc.dir || !hasCredentials(acc.dir)) byEmail.delete(em);
+      }
+      let accountOrder =
+        opts.accountOrder !== undefined ? opts.accountOrder : prev.accountOrder || [];
+      if (!accountOrder.length) {
+        const legacy: string[] = [];
+        const prevAny = prev as { primaryEmail?: string; secondaryEmail?: string };
+        if (prevAny.primaryEmail) legacy.push(prevAny.primaryEmail);
+        if (prevAny.secondaryEmail) legacy.push(prevAny.secondaryEmail);
+        accountOrder = legacy;
+      }
+      const policy: OrchPolicy = {
+        version: 3,
+        updatedAt: Date.now(),
+        mode: opts.mode,
+        thresholds: opts.thresholds,
+        triggers: opts.triggers,
+        strategy: opts.strategy || prev.strategy || DEFAULT_STRATEGY,
+        accountOrder,
+        workspaceRoutes:
+          opts.workspaceRoutes !== undefined ? opts.workspaceRoutes : prev.workspaceRoutes || [],
+        accounts: [...byEmail.values()],
+      };
+      writeFileAtomic(policyPath(), JSON.stringify(policy, null, 2), { mode: 0o600 });
+    });
   } catch (err) {
     log(`policy write failed: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -803,14 +806,14 @@ export function writePolicyCache(opts: {
 export function prunePolicyEmails(emails: string[]): void {
   if (!emails.length || !fs.existsSync(policyPath())) return;
   try {
-    const prev = JSON.parse(fs.readFileSync(policyPath(), 'utf-8')) as OrchPolicy;
-    const drop = new Set(emails);
-    prev.accounts = (prev.accounts || []).filter((a) => !drop.has(a.email));
-    prev.accountOrder = (prev.accountOrder || []).filter((id) => !drop.has(id));
-    prev.updatedAt = Date.now();
-    const tmp = policyPath() + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(prev, null, 2), { mode: 0o600 });
-    fs.renameSync(tmp, policyPath());
+    withLock(lockFor(policyPath()), () => {
+      const prev = JSON.parse(fs.readFileSync(policyPath(), 'utf-8')) as OrchPolicy;
+      const drop = new Set(emails);
+      prev.accounts = (prev.accounts || []).filter((a) => !drop.has(a.email));
+      prev.accountOrder = (prev.accountOrder || []).filter((id) => !drop.has(id));
+      prev.updatedAt = Date.now();
+      writeFileAtomic(policyPath(), JSON.stringify(prev, null, 2), { mode: 0o600 });
+    });
     log(`policy: pruned ${emails.join(', ')}`);
   } catch (err) {
     log(`policy prune failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -820,6 +823,8 @@ export function prunePolicyEmails(emails: string[]): void {
 export class UsageMonitor {
   private cache = new Map<string, UsageSnapshot | null>();
   private inflight = new Map<string, Promise<UsageSnapshot | null>>();
+  /** Guards refreshAllAccounts against the interval re-entering a live run. */
+  private refreshingAll = false;
   private timer: NodeJS.Timeout | null = null;
   private listeners = new Set<() => void>();
   private currentDir: string | undefined;
@@ -834,7 +839,7 @@ export class UsageMonitor {
   private storeDirForEmail?: (email: string) => string | undefined;
   private lastNotifyKey = '';
 
-  /** Default 5 min — matches USAGE_CACHE_TTL and camwatch background refresh. */
+  /** Default 5 min — matches USAGE_CACHE_TTL. */
   constructor(private readonly intervalMs = USAGE_CACHE_TTL_MS) {}
 
   configure(opts: {
@@ -903,7 +908,6 @@ export class UsageMonitor {
   }
 
   private policyWrite(snapshots: UsageSnapshot[]): void {
-    const listed = this.listAccountsToPoll?.() ?? [];
     writePolicyCache({
       mode: this.mode,
       thresholds: this.thresholds,
@@ -913,7 +917,6 @@ export class UsageMonitor {
       workspaceRoutes: this.workspaceRoutes,
       nameByEmail: this.nameByEmail,
       snapshots,
-      retainEmails: listed.length ? listed.map((a) => a.email) : undefined,
     });
   }
 
@@ -970,13 +973,26 @@ export class UsageMonitor {
 
   /** Poll every registered account store and refresh policy (for lowestUsage). */
   async refreshAllAccounts(): Promise<void> {
+    // The 5-min interval must not re-enter a run still in flight: sequential
+    // per-account fetches on a slow/429 network can exceed 5 min, and two runs
+    // would interleave policy.json read-modify-writes.
+    if (this.refreshingAll) return;
+    this.refreshingAll = true;
+    try {
+      await this.refreshAllAccountsOnce();
+    } finally {
+      this.refreshingAll = false;
+    }
+  }
+
+  private async refreshAllAccountsOnce(): Promise<void> {
     const listed = this.listAccountsToPoll?.() ?? [];
     if (!listed.length) {
       await this.refresh(this.currentDir);
       return;
     }
     // One network path per email — duplicate dirs with the same token were
-    // hammering /api/oauth/usage and tripping 429 (camwatch: single check + cache).
+    // hammering /api/oauth/usage and tripping 429.
     const byEmail = new Map<string, { email: string; dir: string; name?: string }>();
     for (const a of listed) {
       if (!a.dir || !fs.existsSync(a.dir)) continue;

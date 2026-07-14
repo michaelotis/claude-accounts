@@ -82,13 +82,15 @@ function anotherCopyInstalled() {
     } catch {
       // no .obsolete → nothing is pending removal → any sibling is a live install
     }
-    return fs.readdirSync(root, { withFileTypes: true }).some(
-      (e) =>
-        e.isDirectory() &&
-        e.name !== me &&
-        e.name.toLowerCase().startsWith(prefix) &&
-        !obsolete[e.name]
-    );
+    return fs
+      .readdirSync(root, { withFileTypes: true })
+      .some(
+        (e) =>
+          e.isDirectory() &&
+          e.name !== me &&
+          e.name.toLowerCase().startsWith(prefix) &&
+          !obsolete[e.name]
+      );
   } catch {
     // Cannot tell. Assume there IS one: leaving files behind is a nuisance,
     // deleting a live install's accounts is a catastrophe.
@@ -309,8 +311,9 @@ function restoreDefaultAccount(source, defaultDir, defaultConfig) {
     if (!fs.existsSync(token)) return;
     fs.mkdirSync(defaultDir, { recursive: true, mode: 0o700 });
     const dstToken = path.join(defaultDir, '.credentials.json');
-    fs.copyFileSync(token, dstToken);
-    fs.chmodSync(dstToken, 0o600);
+    const tmpToken = `${dstToken}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpToken, fs.readFileSync(token), { mode: 0o600 });
+    fs.renameSync(tmpToken, dstToken);
 
     const cfgFile = path.join(source, '.claude.json');
     if (!fs.existsSync(cfgFile)) return;
@@ -326,7 +329,7 @@ function restoreDefaultAccount(source, defaultDir, defaultConfig) {
       ...incoming,
       projects: { ...(existing.projects || {}), ...(incoming.projects || {}) },
     };
-    const tmp = `${defaultConfig}.tmp`;
+    const tmp = `${defaultConfig}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, defaultConfig); // atomic: a half-written config bricks Claude Code
   } catch {
