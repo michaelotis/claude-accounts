@@ -53,7 +53,7 @@ const thr = p.thresholds || { session: 90, weekly: 90, fable: 90 };
 const trig = Object.assign({ session: true, weekly: true, fable: false }, p.triggers || {});
 const routes = Array.isArray(p.workspaceRoutes) ? p.workspaceRoutes : [];
 const strategy = p.strategy || 'lowestUsage';
-let order = Array.isArray(p.accountOrder) ? p.accountOrder.map(String) : [];
+const order = Array.isArray(p.accountOrder) ? p.accountOrder.map(String) : [];
 if (!order.length) {
   if (p.primaryEmail) order.push(p.primaryEmail);
   if (p.secondaryEmail) order.push(p.secondaryEmail);

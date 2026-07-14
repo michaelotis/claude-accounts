@@ -477,44 +477,6 @@ function failure(kind: UsageFetchKind, message: string, status?: number): UsageF
   return { ok: false, failure: { kind, message, status } };
 }
 
-function classifyHttpError(err: unknown): UsageFetchFailure {
-  const status =
-    typeof err === 'object' && err && 'status' in err
-      ? Number((err as { status: number }).status)
-      : undefined;
-  const msg = err instanceof Error ? err.message : String(err);
-  if (msg === 'TOKEN_REJECTED' || status === 401 || status === 403) {
-    return {
-      kind: 'token_rejected',
-      message: 'Claude rejected this window’s token. Sign in again with Claude Code (/login).',
-      status: status ?? 401,
-    };
-  }
-  if (msg === 'RATE_LIMITED' || status === 429) {
-    return {
-      kind: 'rate_limited',
-      message:
-        'Anthropic usage API rate-limited this request (not a sign-in problem). Wait a minute and try again.',
-      status: 429,
-    };
-  }
-  if (msg.includes('abort') || msg.includes('AbortError') || msg.includes('fetch failed')) {
-    return {
-      kind: 'network',
-      message: 'Could not reach api.anthropic.com (network or timeout). Check connectivity and retry.',
-    };
-  }
-  const m = /^API_ERROR_(\d+)$/.exec(msg);
-  if (m) {
-    return {
-      kind: 'api_error',
-      message: `Usage API returned HTTP ${m[1]}. Try again shortly.`,
-      status: Number(m[1]),
-    };
-  }
-  return { kind: 'unknown', message: `Usage fetch failed: ${msg}`, status };
-}
-
 /**
  * Usage poll: returns { status, data } for both success and HTTP errors
  * (does not throw on 429). Throws only on network/timeout.

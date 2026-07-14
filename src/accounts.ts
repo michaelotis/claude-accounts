@@ -241,7 +241,7 @@ export class AccountRegistry {
   async discoverAndMerge(): Promise<Account[]> {
     const home = os.homedir();
     const found: Account[] = [];
-    let entries: fs.Dirent[] = [];
+    let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(home, { withFileTypes: true });
     } catch {

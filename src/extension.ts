@@ -14,12 +14,11 @@ import { SetupWizard, NOTICE_KEY } from './setupWizard';
 import { ensureSharedHistory } from './sharedHistory';
 import { defaultSourceDir } from './capture';
 import { AccountWatcher } from './accountWatcher';
-import { allWorkingDirs, workingRoot } from './workdir';
+import { allWorkingDirs } from './workdir';
 import { log, showLog } from './log';
 import {
   UsageMonitor,
   writePolicyCache,
-  prunePolicyEmails,
   type WorkspaceRoutePolicy,
 } from './usage';
 import { isSidecarConfigDir } from './sidecars';

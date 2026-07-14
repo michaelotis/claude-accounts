@@ -1,0 +1,5 @@
+dist/
+scripts/lib/
+*.vsix
+node_modules/
+CHANGELOG.md
