@@ -63,6 +63,11 @@ DIR="$(pick_dir || true)"
 
 export CLAUDE_ACCOUNTS_ORCH=1
 
+if [ "${DIR:-}" = "__CLAUDE_ORCH_REFUSE__" ]; then
+  echo "claude-orch: this folder is pinned to an account that isn't signed in — run /login as that email, or remove the workspace route. Refusing to launch as a different account." >&2
+  exit 1
+fi
+
 if [ -n "${DIR:-}" ]; then
   export CLAUDE_CONFIG_DIR="$DIR"
   if [ "${CLAUDE_ORCH_STICKY:-}" = "1" ]; then
@@ -70,8 +75,8 @@ if [ -n "${DIR:-}" ]; then
   fi
 else
   # Picker prints ambient env when it means to honor it. Empty output is
-  # fail-closed (e.g. workspace route matched but account missing) — do not
-  # let an inherited CLAUDE_CONFIG_DIR run claude under the wrong account.
+  # no-opinion (no route / non-cli mode) — do not force an inherited
+  # CLAUDE_CONFIG_DIR when the picker intentionally printed nothing.
   unset CLAUDE_CONFIG_DIR
 fi
 

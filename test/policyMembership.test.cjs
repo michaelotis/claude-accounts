@@ -118,8 +118,8 @@ describe('writePolicyCache membership (credentials on disk)', () => {
   });
 });
 
-describe('pick-account fail-closed on missing route account', () => {
-  it('prints nothing when workspace route email has no dir (does not fall through to env)', () => {
+describe('pick-account refuse on missing route account', () => {
+  it('prints refuse sentinel when workspace route email has no dir (does not fall through to env)', () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ca-pick-'));
     const envDir = path.join(tmp, 'env-account');
     fs.mkdirSync(envDir, { recursive: true });
@@ -139,7 +139,10 @@ describe('pick-account fail-closed on missing route account', () => {
       env: { ...process.env, CLAUDE_CONFIG_DIR: envDir },
       encoding: 'utf8',
     });
-    assert.equal(stdout, '');
+    assert.ok(
+      stdout.includes('__CLAUDE_ORCH_REFUSE__'),
+      `expected refuse sentinel, got: ${JSON.stringify(stdout)}`
+    );
     try {
       fs.rmSync(tmp, { recursive: true, force: true });
     } catch {

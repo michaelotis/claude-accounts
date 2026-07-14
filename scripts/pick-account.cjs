@@ -81,7 +81,8 @@ if (route) {
   if (process.env.CLAUDE_ORCH_VERBOSE) {
     console.error('claude-orch: workspace route', route.email, 'but no account dir');
   }
-  // fail closed for wrong-account risk under a work tree: no env fallthrough
+  // Matched pin with missing account/dir — refuse launch (not empty/env fallthrough)
+  process.stdout.write('__CLAUDE_ORCH_REFUSE__');
   process.exit(0);
 }
 
@@ -104,11 +105,17 @@ const pool = accounts
     sessionPercent: a.sessionPercent ?? 0,
     weeklyPercent: a.weeklyPercent ?? 0,
     fablePercent: a.fablePercent ?? null,
+    // Never-metered rows (no successful fetch) must not outrank real meters as 0%
+    metered: Boolean(a.fetchedAt),
   }));
 
+// Prefer metered accounts: unmetered (fetchedAt 0/missing) only if none metered exist
+const metered = pool.filter((a) => a.metered);
+const basePool = metered.length ? metered : pool;
+
 // Prefer cool accounts only for auto pick (no hot least-bad for CLI either when any cool exists)
-const cool = pool.filter((a) => accountIsCool(a, thr, trig));
-const usePool = cool.length ? cool : pool;
+const cool = basePool.filter((a) => accountIsCool(a, thr, trig));
+const usePool = cool.length ? cool : basePool;
 
 const picked = selectFailoverAccount(usePool, {
   strategy,
