@@ -8,7 +8,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { log } from './log';
 import { readIdentity, hasCredentials } from './accounts';
-import { writeFileAtomic, withLock } from './fsSafe';
+import { writeFileAtomic, withLock, withLockAsync } from './fsSafe';
 import { isWindowsPath } from './sidecars';
 import {
   buildSnapshot,
@@ -336,92 +336,115 @@ async function ensureFreshToken(configDir: string, force = false): Promise<strin
   if (existing) return existing;
 
   const run = (async () => {
-    const creds = readCreds(configDir);
-    const oauth = creds?.claudeAiOauth;
-    const accessToken = oauth?.accessToken || creds?.accessToken;
-    const refreshToken = oauth?.refreshToken;
-    const expiresAt = Number(oauth?.expiresAt) || 0;
-
-    if (!accessToken) {
+    const cur = readCreds(configDir);
+    const curOauth = cur?.claudeAiOauth;
+    const curAccess = curOauth?.accessToken || cur?.accessToken;
+    const curExpiry = Number(curOauth?.expiresAt) || 0;
+    if (!curAccess) {
       throw Object.assign(new Error('NO_TOKEN'), { kind: 'no_token' as const });
     }
-
-    if (!force && expiresAt && Date.now() < expiresAt - TOKEN_HEADROOM_MS) {
-      return accessToken;
+    // Fast path: token still good — no refresh, no lock.
+    if (!force && curExpiry && Date.now() < curExpiry - TOKEN_HEADROOM_MS) {
+      return curAccess;
     }
 
-    if (!refreshToken) {
-      // Still try the access token if present (server may accept it).
-      if (accessToken && (!expiresAt || Date.now() < expiresAt)) return accessToken;
-      throw Object.assign(new Error('NO_REFRESH'), { kind: 'no_token' as const });
-    }
+    // A refresh is due. Serialize it across windows on this store's credentials
+    // file: two windows refreshing the same account would each POST a refresh
+    // and, if the server rotates the refresh token, invalidate the other's. The
+    // waiter re-reads under the lock and reuses a token another window just wrote.
+    const credsLock = lockFor(path.join(configDir, '.credentials.json'));
+    const { result } = await withLockAsync(
+      credsLock,
+      async (): Promise<string> => {
+        const creds = readCreds(configDir);
+        const oauth = creds?.claudeAiOauth;
+        const accessToken = oauth?.accessToken || creds?.accessToken;
+        const refreshToken = oauth?.refreshToken;
+        const expiresAt = Number(oauth?.expiresAt) || 0;
 
-    log(`usage: refreshing OAuth token for ${configDir} (force=${force})`);
-    const body = JSON.stringify({
-      grant_type: 'refresh_token',
-      refresh_token: refreshToken,
-      client_id: CLAUDE_OAUTH_CLIENT_ID,
-    });
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10_000);
-    try {
-      const res = await fetch(CLAUDE_OAUTH_TOKEN_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          'User-Agent': 'claude-accounts (oauth-refresh)',
-        },
-        body,
-        redirect: 'error',
-        signal: controller.signal,
-      });
-      const text = await res.text();
-      if (res.status === 400 || res.status === 401) {
-        let errType = '';
-        try {
-          errType = (JSON.parse(text) as { error?: string }).error || '';
-        } catch {
-          /* ignore */
+        if (!accessToken) {
+          throw Object.assign(new Error('NO_TOKEN'), { kind: 'no_token' as const });
         }
-        if (errType === 'invalid_grant' || res.status === 401) {
-          throw Object.assign(new Error('TOKEN_REJECTED'), {
-            kind: 'token_rejected' as const,
-            status: res.status,
-          });
+        // Re-check under the lock: another window may have refreshed while we waited.
+        if (!force && expiresAt && Date.now() < expiresAt - TOKEN_HEADROOM_MS) {
+          return accessToken;
         }
-      }
-      if (!res.ok) {
-        throw Object.assign(new Error(`REFRESH_HTTP_${res.status}`), {
-          kind: 'network' as const,
-          status: res.status,
+        if (!refreshToken) {
+          // Still try the access token if present (server may accept it).
+          if (accessToken && (!expiresAt || Date.now() < expiresAt)) return accessToken;
+          throw Object.assign(new Error('NO_REFRESH'), { kind: 'no_token' as const });
+        }
+
+        log(`usage: refreshing OAuth token for ${configDir} (force=${force})`);
+        const body = JSON.stringify({
+          grant_type: 'refresh_token',
+          refresh_token: refreshToken,
+          client_id: CLAUDE_OAUTH_CLIENT_ID,
         });
-      }
-      const parsed = JSON.parse(text) as {
-        access_token?: string;
-        refresh_token?: string;
-        expires_in?: number;
-        scope?: string;
-        subscription_type?: string;
-      };
-      if (!parsed.access_token) {
-        throw Object.assign(new Error('REFRESH_NO_TOKEN'), { kind: 'unknown' as const });
-      }
-      const nextOauth = {
-        ...(oauth || {}),
-        accessToken: parsed.access_token,
-        refreshToken: parsed.refresh_token || refreshToken,
-        expiresAt: Date.now() + (parsed.expires_in || 3600) * 1000,
-        scopes:
-          typeof parsed.scope === 'string' ? parsed.scope.split(' ') : oauth?.scopes,
-        subscriptionType: parsed.subscription_type || oauth?.subscriptionType,
-      };
-      writeCredsAtomic(configDir, { ...(creds || {}), claudeAiOauth: nextOauth });
-      log(`usage: token refreshed, expiry ${new Date(nextOauth.expiresAt).toISOString()}`);
-      return parsed.access_token;
-    } finally {
-      clearTimeout(timer);
-    }
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 10_000);
+        try {
+          const res = await fetch(CLAUDE_OAUTH_TOKEN_URL, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+              'User-Agent': 'claude-accounts (oauth-refresh)',
+            },
+            body,
+            redirect: 'error',
+            signal: controller.signal,
+          });
+          const text = await res.text();
+          if (res.status === 400 || res.status === 401) {
+            let errType = '';
+            try {
+              errType = (JSON.parse(text) as { error?: string }).error || '';
+            } catch {
+              /* ignore */
+            }
+            if (errType === 'invalid_grant' || res.status === 401) {
+              throw Object.assign(new Error('TOKEN_REJECTED'), {
+                kind: 'token_rejected' as const,
+                status: res.status,
+              });
+            }
+          }
+          if (!res.ok) {
+            throw Object.assign(new Error(`REFRESH_HTTP_${res.status}`), {
+              kind: 'network' as const,
+              status: res.status,
+            });
+          }
+          const parsed = JSON.parse(text) as {
+            access_token?: string;
+            refresh_token?: string;
+            expires_in?: number;
+            scope?: string;
+            subscription_type?: string;
+          };
+          if (!parsed.access_token) {
+            throw Object.assign(new Error('REFRESH_NO_TOKEN'), { kind: 'unknown' as const });
+          }
+          const nextOauth = {
+            ...(oauth || {}),
+            accessToken: parsed.access_token,
+            refreshToken: parsed.refresh_token || refreshToken,
+            expiresAt: Date.now() + (parsed.expires_in || 3600) * 1000,
+            scopes:
+              typeof parsed.scope === 'string' ? parsed.scope.split(' ') : oauth?.scopes,
+            subscriptionType: parsed.subscription_type || oauth?.subscriptionType,
+          };
+          writeCredsAtomic(configDir, { ...(creds || {}), claudeAiOauth: nextOauth });
+          log(`usage: token refreshed, expiry ${new Date(nextOauth.expiresAt).toISOString()}`);
+          return parsed.access_token;
+        } finally {
+          clearTimeout(timer);
+        }
+      },
+      { capMs: 15_000, staleMs: 30_000 }
+    );
+    return result as string;
   })().finally(() => {
     inflightTokenRefresh.delete(inflightKey);
   });
