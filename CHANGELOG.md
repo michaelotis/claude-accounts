@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.2
+
+### Fixed
+- **Status bar no longer shells out to `claude auth status`.** That 250 MB binary cold-starts slowly and errored intermittently, which showed up as a flickering "Confirming with `claude auth status`…" / "Could not run `claude auth status`…" tooltip. The account shown now comes from the window's own config file (the signal the rest of the extension already trusts) and usage from the token — no CLI spawn, no flicker.
+- **Recovering a contaminated account is no longer blocked.** Reconcile now follows a fresh in-window `/login` *before* the "this store was overwritten" prompt, so signing in again as the affected account actually lands and heals its store (previously the prompt short-circuited the login). The "shared grant" warning also no longer fires in the healthy (victim) window — only the window whose account was actually overwritten is prompted.
+
 ## 0.9.1
 
 ### Fixed

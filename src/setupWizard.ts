@@ -306,10 +306,33 @@ export class SetupWizard {
     if (drifted && !onDefault) {
       const dirTok = this.readToken(dir);
       const boundTok = bound ? this.readToken(bound.dir) : undefined;
+      const owner = dirTok ? this.accountOwningToken(dirTok, dir) : undefined;
+
+      // (A) A FRESH grant no saved store holds → a genuine new or re-auth sign-in.
+      //     This is how a user RECOVERS a contaminated account, so it must run before
+      //     the contaminated-store prompt (0): otherwise a real /login is short-
+      //     circuited by the prompt and never lands (the exact way recovery got stuck).
+      //     A fresh grant cannot be another account's, so capturing it is safe;
+      //     captureCurrentAccount reuses/restores by email, heals the store, and binds.
+      if (dirTok && !owner) {
+        log(`reconcile: in-window sign-in as ${email} (fresh grant) — capturing`);
+        const captured = await this.captureCurrentAccount({
+          quiet: true,
+          silent: true,
+          sourceDir: dir,
+        });
+        if (captured && !this.recentlyReloaded()) {
+          await this.requestWindowReload(
+            `Signed in as ${email} — reloading so Claude Code switches to it.`
+          );
+        }
+        return;
+      }
 
       // (0) The bound account's OWN store is contaminated — its stored token belongs
       //     to a different account (the credential-mix end state). It can't be
-      //     re-asserted; only signing in again fixes it. Surface that once.
+      //     re-asserted; only signing in again fixes it. Surface that once. (A fresh
+      //     login already returned above, so this can no longer block recovery.)
       if (bound && boundTok && foreignTokenConflict(bound.dir, boundTok, boundEmail)) {
         if (await this.noteContaminationPrompt()) {
           this.offerAccountPick(
@@ -341,13 +364,10 @@ export class SetupWizard {
         return;
       }
 
-      // (2) The dir holds a DIFFERENT token than the bound account. Decide by who
-      //     OWNS that token (its bytes in a store), not the bled identity field.
-      const owner = dirTok ? this.accountOwningToken(dirTok, dir) : undefined;
+      // (2) The dir holds an EXISTING account's grant, consistent with its identity —
+      //     a genuine in-window switch to that saved account. Follow (same-account
+      //     store refresh + bind); decided by who OWNS the token, not the identity.
       if (owner && emailsEqual(this.registry.emailOf(owner), email)) {
-        // The dir consistently holds this saved account's own token — a genuine
-        // in-window switch. captureCurrentAccount refreshes ITS store (same account,
-        // so no contamination) and binds it.
         log(`reconcile: in-window switch to saved ${email} (token matches its store) — following`);
         const followed = await this.captureCurrentAccount({
           quiet: true,
@@ -363,23 +383,6 @@ export class SetupWizard {
         }
         return;
       }
-      if (!owner) {
-        // A brand-new grant no saved store holds — a real /login as a new (or
-        // re-authed) account. Capturing it is the one safe pull: a fresh grant can't
-        // be another account's. captureCurrentAccount reuses/restores by email + binds.
-        log(`reconcile: in-window sign-in as ${email} (new grant) — capturing`);
-        const captured = await this.captureCurrentAccount({
-          quiet: true,
-          silent: true,
-          sourceDir: dir,
-        });
-        if (captured && !this.recentlyReloaded()) {
-          await this.requestWindowReload(
-            `Signed in as ${email} — reloading so Claude Code switches to it.`
-          );
-        }
-        return;
-      }
 
       // (3) The dir's token belongs to a DIFFERENT account than its identity claims —
       //     a mix. Never follow, never pull. Re-assert the bound account from its
@@ -388,7 +391,7 @@ export class SetupWizard {
       //     materialize would spin a metered reload loop.
       if (bound && hasCredentials(bound.dir)) {
         log(
-          `reconcile: dir token belongs to ${this.registry.emailOf(owner) ?? owner.name} but ` +
+          `reconcile: dir token belongs to ${owner ? (this.registry.emailOf(owner) ?? owner.name) : 'another account'} but ` +
             `identity says ${email} — re-asserting ${boundEmail} from store`
         );
         materialize(bound, dir, true);
@@ -427,20 +430,15 @@ export class SetupWizard {
       ? foreignTokenConflict(account.dir, ndTok, this.registry.emailOf(account))
       : null;
     if (foreign) {
-      // Contaminated steady state: identity matches the bound account but the token
-      // belongs to someone else (the dir was stocked from a store whose token was
-      // overwritten). Don't touch the store or the default dir, and surface the one
-      // real fix — sign in again — since no drift will occur to trigger it elsewhere.
+      // This window's grant is byte-shared with another account's store. This window
+      // is NOT the broken one — its token matches its identity and it works; the
+      // account whose store was overwritten is surfaced in ITS window (the drift
+      // path prompts the correctly-attributed account). Prompting here would nag the
+      // wrong (victim) account, so just refuse to propagate and log it.
       log(
-        `reconcile: dir token belongs to ${foreign} though identity is ${email} — ` +
+        `reconcile: dir token also lives in ${foreign} (shared grant); identity is ${email} — ` +
           `not refreshing store or mirroring`
       );
-      if (await this.noteContaminationPrompt()) {
-        this.offerAccountPick(
-          `${email}'s saved credentials were overwritten by another account. ` +
-            `Sign in again as ${email} (Claude Code /login) to restore it.`
-        );
-      }
     } else {
       // Keep the store's token in step with the dir (same account — cannot
       // cross-contaminate; refreshStore also carries the tripwire as defence in
