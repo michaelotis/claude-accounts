@@ -177,6 +177,11 @@ export class StatusBarManager implements vscode.Disposable {
       return;
     }
 
+    // Hovering any pill shows the same card as the account item (usage detail + actions).
+    this.sessionItem.tooltip = this.item.tooltip;
+    this.weeklyItem.tooltip = this.item.tooltip;
+    this.fableItem.tooltip = this.item.tooltip;
+
     this.sessionItem.text = `5h ${usage.sessionPercent}%`;
     this.sessionItem.backgroundColor = this.metricBackground(usage.sessionPercent, 65);
     this.sessionItem.show();

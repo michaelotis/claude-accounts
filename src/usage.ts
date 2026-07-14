@@ -581,11 +581,9 @@ export async function fetchUsageDetailed(
     if (status === 401 || status === 403) {
       log(`usage: HTTP ${status} after ensureFreshToken — forcing refresh + retry`);
       try {
-        const creds = readCreds(dir);
-        if (creds?.claudeAiOauth) {
-          creds.claudeAiOauth.expiresAt = 0;
-          writeCredsAtomic(dir, creds);
-        }
+        // Force a refresh (bypasses the expiry check and re-reads creds under the
+        // per-store lock) then retry once. No unlocked pre-write of expiresAt — it
+        // was redundant with force=true and could clobber another window's refresh.
         token = await ensureFreshToken(dir, true);
         ({ status, data } = await callUsageApi(token));
       } catch (retryErr) {

@@ -107,13 +107,12 @@ const pool = accounts
     metered: Boolean(a.fetchedAt),
   }));
 
-// Prefer metered accounts: unmetered (fetchedAt 0/missing) only if none metered exist
-const metered = pool.filter((a) => a.metered);
-const basePool = metered.length ? metered : pool;
-
-// Prefer cool accounts only for auto pick (no hot least-bad for CLI either when any cool exists)
-const cool = basePool.filter((a) => accountIsCool(a, thr, trig));
-const usePool = cool.length ? cool : basePool;
+// Zero-bias: a never-metered row's fake 0% must not outrank a real metered cool
+// account. Prefer metered cool; if none are cool, fall back to ANY cool (including
+// a freshly-added unmetered account) rather than a hot metered one; else least-bad.
+const cool = pool.filter((a) => accountIsCool(a, thr, trig));
+const meteredCool = cool.filter((a) => a.metered);
+const usePool = meteredCool.length ? meteredCool : cool.length ? cool : pool;
 
 const picked = selectFailoverAccount(usePool, {
   strategy,
