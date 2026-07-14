@@ -578,9 +578,11 @@ export class SetupWizard {
       // can't flush the stale in-memory token back over what we just wrote (the
       // interrupt-before-replace pattern logout/forget use). SIGKILL cannot flush.
       interruptSessions([dir]);
-      await this.requestWindowReload(
-        `Refreshed ${boundEmail ?? account.name}'s session for this window.`
-      );
+      // Reload SILENTLY — no post-reload notice. A token refresh is routine
+      // background maintenance the user did not ask about and does not need told
+      // every time; the reload itself is the only necessary effect. (The event is
+      // still in the log for diagnostics.)
+      await this.requestWindowReload(undefined);
       return true;
     } catch (err) {
       log(`heal: error — ${err instanceof Error ? err.message : String(err)}`);

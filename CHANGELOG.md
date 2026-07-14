@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.4
+
+### Changed
+- The self-healing token refresh (0.9.3) no longer shows a "session refreshed" notice
+  when it reloads a window. A token refresh is routine background maintenance you
+  didn't ask about and don't need told about each time; the reload still happens
+  silently (and the event stays in the log for diagnostics).
+
 ## 0.9.3
 
 ### Fixed
