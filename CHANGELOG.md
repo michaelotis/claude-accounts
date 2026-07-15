@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.9.6
+
+### Fixed
+- **Stop polling other accounts from every window (the real source of the 429s).**
+  Each window was fetching usage for *every* registered account on every poll cycle,
+  even though nothing in meter-only mode reads another account's numbers — the status
+  bar only shows the window's own account. Those extra calls piled onto the same
+  per-token rate budget and tripped 429s, which then froze the meter (it looked stuck
+  at an old percent while you actually climbed to 100%). Now a window polls only its
+  own bound account; the full multi-account poll runs only when an auto-cutover
+  strategy needs it (`failover.panelCutover = idleReload` or `failover.mode = cli`).
+- **Don't fan-fetch every account when the meter is hot.** In the default meter-only
+  mode, whenever the active account went over threshold the cutover check fetched usage
+  for *all* registered accounts to find a cooler one — then threw the answer away,
+  because meter-only mode never auto-switches. That fired on every poll while you were
+  near your limit, adding cross-account API calls at the worst possible moment. Meter-
+  only mode now skips that lookup entirely (the meter already shows the pressure; you
+  switch when you choose). Only `idleReload` still computes a target.
+
 ## 0.9.5
 
 ### Fixed

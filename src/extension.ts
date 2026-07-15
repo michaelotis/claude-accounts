@@ -144,6 +144,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const applyUsageSettings = () => {
     const cfg = vscode.workspace.getConfiguration('claudeAccounts');
     const mode = cfg.get<'off' | 'notify' | 'cli'>('failover.mode', 'notify');
+    const panelMode = cfg.get<PanelCutoverMode>('failover.panelCutover', 'notify');
     const routes = buildWorkspaceRoutes();
     const thresholds = {
       session: cfg.get<number>('failover.sessionThreshold', 90),
@@ -180,6 +181,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       workspaceRoutes: routes,
       nameByEmail,
       storeDirForEmail: (email) => accountByEmail(email)?.dir,
+      // Only the auto-cutover strategies read other accounts' usage; in meter-only
+      // mode each window polls just its own account (no cross-account 429 pressure).
+      pollAllAccounts: panelMode === 'idleReload' || mode === 'cli',
     });
     writePolicyCache({
       mode,

@@ -853,8 +853,16 @@ export class UsageMonitor {
   /** Map email → durable account store dir (not window workdir). */
   private storeDirForEmail?: (email: string) => string | undefined;
   private lastNotifyKey = '';
+  /**
+   * Poll every registered account (not just this window's) each cycle. Only the
+   * cross-account failover paths consume that data, so it's off unless an
+   * auto-cutover strategy needs it (panelCutover=idleReload or failover.mode=cli).
+   * In meter-only mode every window polling every account just multiplied
+   * /api/oauth/usage calls and tripped 429 with nothing reading the result.
+   */
+  private pollAllAccounts = false;
 
-  /** Default 5 min — matches USAGE_CACHE_TTL. */
+  /** Default poll cadence — matches USAGE_CACHE_TTL_MS. */
   constructor(private readonly intervalMs = USAGE_CACHE_TTL_MS) {}
 
   configure(opts: {
@@ -866,6 +874,7 @@ export class UsageMonitor {
     workspaceRoutes?: WorkspaceRoutePolicy[];
     nameByEmail?: Record<string, string>;
     storeDirForEmail?: (email: string) => string | undefined;
+    pollAllAccounts?: boolean;
   }): void {
     if (opts.thresholds) this.thresholds = opts.thresholds;
     if (opts.triggers) this.triggers = opts.triggers;
@@ -875,6 +884,7 @@ export class UsageMonitor {
     if (opts.workspaceRoutes !== undefined) this.workspaceRoutes = opts.workspaceRoutes;
     if (opts.nameByEmail) this.nameByEmail = opts.nameByEmail;
     if (opts.storeDirForEmail) this.storeDirForEmail = opts.storeDirForEmail;
+    if (opts.pollAllAccounts !== undefined) this.pollAllAccounts = opts.pollAllAccounts;
   }
 
   getThresholds(): FailoverThresholds {
@@ -1010,7 +1020,10 @@ export class UsageMonitor {
   }
 
   private async refreshAllAccountsOnce(): Promise<void> {
-    const listed = this.listAccountsToPoll?.() ?? [];
+    // Meter-only mode: poll just this window's bound account. refresh() feeds the
+    // in-memory gauge, writes policy, and emits pressure for the active account —
+    // everything the meter needs — without touching the other accounts' APIs.
+    const listed = this.pollAllAccounts ? (this.listAccountsToPoll?.() ?? []) : [];
     if (!listed.length) {
       await this.refresh(this.currentDir);
       return;
