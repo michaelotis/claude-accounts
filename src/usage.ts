@@ -59,8 +59,13 @@ const CLAUDE_OAUTH_TOKEN_URL = 'https://console.anthropic.com/v1/oauth/token';
  * self-imposed guess, not a measured limit, and a real 429 still backs off below.
  */
 export const USAGE_CACHE_TTL_MS = 60_000;
-/** After a poll 429, do not hit the network again for this long (a real limit). */
-const RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
+/**
+ * After a poll 429, serve the last cache and don't re-poll for this long. Kept to a
+ * single poll cycle: a longer freeze (this was 5 min) is exactly what left the meter
+ * stuck at an old percent and missing the climb to 100%. One cycle lets it recover on
+ * the next (jittered) poll, which — de-aligned across windows — usually isn't limited.
+ */
+const RATE_LIMIT_BACKOFF_MS = 60_000;
 /** Refresh access token this long before expiresAt. */
 const TOKEN_HEADROOM_MS = 60_000;
 
@@ -832,6 +837,10 @@ export class UsageMonitor {
   /** Guards refreshAllAccounts against the interval re-entering a live run. */
   private refreshingAll = false;
   private timer: NodeJS.Timeout | null = null;
+  /** False once stopped/disposed — stops an in-flight poll from re-arming the timer. */
+  private polling = false;
+  /** Bumped on every start(); an older poll chain whose gen no longer matches stops. */
+  private pollGen = 0;
   private listeners = new Set<() => void>();
   private currentDir: string | undefined;
   private thresholds: FailoverThresholds = { ...DEFAULT_THRESHOLDS };
@@ -907,6 +916,15 @@ export class UsageMonitor {
   getCached(dir?: string): UsageSnapshot | null | undefined {
     const d = resolveConfigDir(dir);
     return this.cache.get(d);
+  }
+
+  /**
+   * True when this dir's account is inside the post-429 backoff window (a real
+   * signal — a 429 returns ok:true with a best-effort snap and never sets
+   * lastFailure, so the meter is serving last-known figures right now).
+   */
+  isRateLimited(dir?: string): boolean {
+    return inRateLimitBackoff(cacheKeyForDir(resolveConfigDir(dir)));
   }
 
   setActiveDir(dir: string | undefined): void {
@@ -1038,6 +1056,11 @@ export class UsageMonitor {
       const curResult = await fetchUsageDetailed(this.currentDir);
       if (curResult.ok) {
         const cur = curResult.snap;
+        // Feed the IN-MEMORY cache the status bar reads (getCached) — not just disk +
+        // policy. Without this a background poll fetched fresh figures and emit()'d,
+        // but the re-render read a stale in-memory snap, so the meter only ever moved
+        // on focus/manual refresh and could sit at an old percent for minutes.
+        this.cache.set(resolveConfigDir(this.currentDir), cur);
         const store = cur.email ? this.storeDirForEmail?.(cur.email) : undefined;
         activeSnap = store ? { ...cur, configDir: store } : cur;
         if (activeSnap.email && !snaps.some((s) => s.email === activeSnap!.email)) {
@@ -1055,19 +1078,35 @@ export class UsageMonitor {
 
   start(getDir: () => string | undefined): void {
     this.stop();
-    const tick = () => {
+    this.polling = true;
+    const gen = ++this.pollGen;
+    const runAndReschedule = () => {
       const d = getDir();
       this.currentDir = d;
-      void this.refreshAllAccounts();
+      void this.refreshAllAccounts()
+        .catch((e) => log(`usage: poll error — ${e instanceof Error ? e.message : String(e)}`))
+        .finally(() => {
+          // Don't re-arm if stopped/disposed, or if a newer start() superseded this
+          // chain (a re-start while a poll was in flight would otherwise double-arm).
+          if (!this.polling || gen !== this.pollGen) return;
+          // Reschedule AFTER the run (never overlap two polls) with jitter, so windows
+          // that started together — e.g. a batch of self-heal reloads — don't all poll
+          // at the 60s cache boundary and stampede /api/oauth/usage into a 429.
+          const delay = this.intervalMs + Math.floor(Math.random() * this.intervalMs * 0.5);
+          this.timer = setTimeout(runAndReschedule, delay);
+          this.timer.unref?.();
+        });
     };
-    tick();
-    this.timer = setInterval(tick, this.intervalMs);
-    if (typeof this.timer.unref === 'function') this.timer.unref();
+    // Initial poll jittered 0–3s so a batch of simultaneously-activated windows
+    // spreads out; the first to fetch populates the shared disk cache for the rest.
+    this.timer = setTimeout(runAndReschedule, Math.floor(Math.random() * 3_000));
+    this.timer.unref?.();
   }
 
   stop(): void {
+    this.polling = false;
     if (this.timer) {
-      clearInterval(this.timer);
+      clearTimeout(this.timer);
       this.timer = null;
     }
   }

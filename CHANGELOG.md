@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.9.5
+
+### Fixed
+- **Usage meter now actually updates in the background.** The 5-hour / weekly / model
+  figures could sit at an old percent for minutes (stuck at 95% while you actually ran
+  out) because the background poll fetched fresh numbers but only wrote them to disk and
+  policy — the status-bar meter reads an in-memory value that was refreshed only on
+  window focus or a manual refresh. The poll now updates that in-memory value too, so the
+  meter moves on its own. And a rate-limit (429) used to freeze the meter for 5 minutes;
+  that backoff is now one poll cycle, each window jitters its poll so several open windows
+  don't stampede the API into a 429, and the tooltip says when it's rate-limited.
+
+### Changed
+- **Refresh Usage is inline, not a toast.** It forces a fresh fetch, shows a spinner on
+  the status-bar account plus "Updating usage…" in the tooltip, and repaints the meter in
+  place — no popup. While the API is backing off it won't hammer it; a hard failure such
+  as being signed out still surfaces a message.
+
 ## 0.9.4
 
 ### Changed
