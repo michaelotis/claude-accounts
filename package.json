@@ -2,7 +2,7 @@
   "name": "claude-accounts",
   "displayName": "Claude Accounts + Usage",
   "description": "Multi-account Claude Code for WSL/Linux (per-window isolation + shared history) with live usage: 5h, 7d, Fable/Opus/Sonnet — workspace extension, never binds to a Windows Claude binary.",
-  "version": "0.9.6",
+  "version": "0.9.7",
   "publisher": "michaelotis",
   "icon": "images/icon.png",
   "repository": {
@@ -87,11 +87,10 @@
           "type": "string",
           "enum": [
             "off",
-            "notify",
-            "cli"
+            "notify"
           ],
           "default": "notify",
-          "description": "CLI/policy side: off = meter only. notify = meter only (usage pressure is shown by the status-bar meter, no popup). cli = PATH orchestrator for new claude processes. Panel cutover is separate (failover.panelCutover)."
+          "description": "off / notify both show usage pressure through the status-bar meter (no popup). Automatic account switching is controlled separately by failover.panelCutover."
         },
         "claudeAccounts.failover.panelCutover": {
           "type": "string",
@@ -169,7 +168,7 @@
         "claudeAccounts.workspaceRoutes": {
           "type": "array",
           "default": [],
-          "description": "Hard map of directory trees to Claude account emails. Longest matching pathPrefix wins. Under a match, CLI orch and VS Code auto-select that account when the folder opens (multi-window: work tree in one VS Code, personal in another). No cross-account failover under a match. Example: work monorepos → work email; personal repos → personal email.",
+          "description": "Hard map of directory trees to Claude account emails. Longest matching pathPrefix wins. Under a match, VS Code auto-selects that account when the folder opens (multi-window: work tree in one VS Code, personal in another). No cross-account failover under a match. Example: work monorepos → work email; personal repos → personal email.",
           "items": {
             "type": "object",
             "required": [
@@ -203,7 +202,6 @@
     "vscode:prepublish": "npm run check-types && node esbuild.js --production",
     "vscode:uninstall": "node ./uninstall.js",
     "package": "vsce package --no-dependencies --allow-star-activation",
-    "install-orch": "bash scripts/install-orch.sh",
     "install-latest": "bash scripts/install-latest.sh",
     "ship": "bash scripts/ship.sh",
     "release": "vsce publish"

@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.9.7
+
+### Changed
+- **Windows no longer reload themselves to refresh a token.** The self-healing token
+  refresh (0.9.3) reloaded a window on focus/idle/startup whenever another window sharing
+  the same account had rotated the OAuth token — and since 0.9.4 it did so silently, so a
+  window you'd left on a plan prompt could come back reloaded with your work gone. That
+  automatic heal-and-reload is removed: a window running its own account no longer reloads
+  on focus/idle/startup just because another window refreshed the shared token — the case
+  that was silently reloading windows mid-task. (Reloads still happen when you switch a
+  window's account, sign in or out inside it, or via the opt-in post-turn cutover — all
+  deliberate.) Trade-off: if you run the *same* account in several windows, a window can
+  get signed out when the shared token rotates away; recover it with a fresh `/login` in
+  that window. The clean fix is the extension's actual design: one account per window, so
+  tokens never collide.
+
+### Removed
+- **The CLI orchestrator is gone.** The PATH-shim orchestrator (`scripts/claude-orch`,
+  `install-orch`, `scripts/pick-account.cjs`) and the `failover.mode = "cli"` option are
+  removed — it was an unused path that also caused stray "open with" popups on Windows.
+  `failover.mode` is now `off` / `notify` (both meter-only); automatic account switching
+  is `failover.panelCutover = idleReload`, unchanged. Existing `mode: "cli"` settings
+  harmlessly read as `notify`.
+
+### Internal
+- Dead-code sweep: removed `healStaleTokenIfNeeded` / `restockTokenOnly` / `getMode`, the
+  orch esbuild build steps and its tests, and renamed the write-only `OrchPolicy` type to
+  `PolicyCache` (the on-disk cache is now used only as the cross-window usage fallback).
+
 ## 0.9.6
 
 ### Fixed

@@ -79,7 +79,7 @@ const USAGE_HEADERS: Record<string, string> = {
   'User-Agent': 'claude-accounts',
 };
 
-/** Policy cache for the CLI orchestrator (JSON). */
+/** Cross-window policy / last-known-usage cache (JSON). */
 export function policyDir(): string {
   return path.join(os.homedir(), '.config', 'claude-accounts');
 }
@@ -692,10 +692,10 @@ export interface WorkspaceRoutePolicy {
   email: string;
 }
 
-export interface OrchPolicy {
+export interface PolicyCache {
   version: 3;
   updatedAt: number;
-  mode: 'off' | 'notify' | 'cli';
+  mode: 'off' | 'notify';
   thresholds: FailoverThresholds;
   /** Which dimensions trigger account failover (vs meter-only). */
   triggers: FailoverTriggers;
@@ -709,15 +709,15 @@ export interface OrchPolicy {
   accountOrder: string[];
   /**
    * Hard path pins: under pathPrefix, always use this email (no cross-account failover).
-   * Longest prefix wins. Used by CLI orch and for VS Code auto-bind.
+   * Longest prefix wins. Used for VS Code auto-bind.
    */
   workspaceRoutes: WorkspaceRoutePolicy[];
   accounts: PolicyAccount[];
 }
 
-/** Merge usage snapshots + workspace routes into the on-disk policy for the CLI shim. */
+/** Merge usage snapshots + workspace routes into the on-disk cross-window policy cache. */
 export function writePolicyCache(opts: {
-  mode: 'off' | 'notify' | 'cli';
+  mode: 'off' | 'notify';
   thresholds: FailoverThresholds;
   triggers: FailoverTriggers;
   strategy?: FailoverStrategy;
@@ -735,10 +735,10 @@ export function writePolicyCache(opts: {
     // update (and unique temp names only stop torn writes, not lost updates).
     withLock(lockFor(policyPath()), () => {
       fs.mkdirSync(policyDir(), { recursive: true, mode: 0o700 });
-      let prev: Partial<OrchPolicy> = {};
+      let prev: Partial<PolicyCache> = {};
       if (fs.existsSync(policyPath())) {
         try {
-          prev = JSON.parse(fs.readFileSync(policyPath(), 'utf-8')) as OrchPolicy;
+          prev = JSON.parse(fs.readFileSync(policyPath(), 'utf-8')) as PolicyCache;
         } catch {
           prev = {};
         }
@@ -794,7 +794,7 @@ export function writePolicyCache(opts: {
         if (prevAny.secondaryEmail) legacy.push(prevAny.secondaryEmail);
         accountOrder = legacy;
       }
-      const policy: OrchPolicy = {
+      const policy: PolicyCache = {
         version: 3,
         updatedAt: Date.now(),
         mode: opts.mode,
@@ -818,7 +818,7 @@ export function prunePolicyEmails(emails: string[]): void {
   if (!emails.length || !fs.existsSync(policyPath())) return;
   try {
     withLock(lockFor(policyPath()), () => {
-      const prev = JSON.parse(fs.readFileSync(policyPath(), 'utf-8')) as OrchPolicy;
+      const prev = JSON.parse(fs.readFileSync(policyPath(), 'utf-8')) as PolicyCache;
       const drop = new Set(emails);
       prev.accounts = (prev.accounts || []).filter((a) => !drop.has(a.email));
       prev.accountOrder = (prev.accountOrder || []).filter((id) => !drop.has(id));
@@ -847,7 +847,7 @@ export class UsageMonitor {
   private triggers: FailoverTriggers = { ...DEFAULT_TRIGGERS };
   private strategy: FailoverStrategy = DEFAULT_STRATEGY;
   private accountOrder: string[] = [];
-  private mode: 'off' | 'notify' | 'cli' = 'notify';
+  private mode: 'off' | 'notify' = 'notify';
   private workspaceRoutes: WorkspaceRoutePolicy[] = [];
   private nameByEmail: Record<string, string> = {};
   /** Map email → durable account store dir (not window workdir). */
@@ -855,10 +855,10 @@ export class UsageMonitor {
   private lastNotifyKey = '';
   /**
    * Poll every registered account (not just this window's) each cycle. Only the
-   * cross-account failover paths consume that data, so it's off unless an
-   * auto-cutover strategy needs it (panelCutover=idleReload or failover.mode=cli).
-   * In meter-only mode every window polling every account just multiplied
-   * /api/oauth/usage calls and tripped 429 with nothing reading the result.
+   * auto-cutover target selection consumes that data, so it's off unless
+   * panelCutover=idleReload needs it. In meter-only mode every window polling every
+   * account just multiplied /api/oauth/usage calls and tripped 429 with nothing
+   * reading the result.
    */
   private pollAllAccounts = false;
 
@@ -870,7 +870,7 @@ export class UsageMonitor {
     triggers?: FailoverTriggers;
     strategy?: FailoverStrategy;
     accountOrder?: string[];
-    mode?: 'off' | 'notify' | 'cli';
+    mode?: 'off' | 'notify';
     workspaceRoutes?: WorkspaceRoutePolicy[];
     nameByEmail?: Record<string, string>;
     storeDirForEmail?: (email: string) => string | undefined;
@@ -895,10 +895,6 @@ export class UsageMonitor {
     return this.triggers;
   }
 
-  getMode(): 'off' | 'notify' | 'cli' {
-    return this.mode;
-  }
-
   onChange(fn: () => void): { dispose: () => void } {
     this.listeners.add(fn);
     return {
@@ -913,7 +909,7 @@ export class UsageMonitor {
    * Extension uses this for panel cutover; gate toasts separately.
    */
   onPressure?: (snap: UsageSnapshot, reasons: string[]) => void;
-  /** Optional CLI/notify toast hook (extension gates on mode). */
+  /** Optional pressure hook (extension gates on mode). */
   onHot?: (snap: UsageSnapshot, reasons: string[]) => void;
 
   /** Resolve all account stores to poll (email + durable dir). */
@@ -1103,8 +1099,8 @@ export class UsageMonitor {
           // chain (a re-start while a poll was in flight would otherwise double-arm).
           if (!this.polling || gen !== this.pollGen) return;
           // Reschedule AFTER the run (never overlap two polls) with jitter, so windows
-          // that started together — e.g. a batch of self-heal reloads — don't all poll
-          // at the 60s cache boundary and stampede /api/oauth/usage into a 429.
+          // that started together — e.g. a batch of windows reloaded at once — don't all
+          // poll at the 60s cache boundary and stampede /api/oauth/usage into a 429.
           const delay = this.intervalMs + Math.floor(Math.random() * this.intervalMs * 0.5);
           this.timer = setTimeout(runAndReschedule, delay);
           this.timer.unref?.();

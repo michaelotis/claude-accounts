@@ -1,6 +1,6 @@
 # Claude Accounts + Usage
 
-Multi-account **Claude Code** for **Linux / WSL / Remote-SSH**: live usage (5h / 7d / **Fable**), per-window isolation, workspace → account auto-select, optional CLI / panel failover.
+Multi-account **Claude Code** for **Linux / WSL / Remote-SSH**: live usage (5h / 7d / **Fable**), per-window isolation, workspace → account auto-select, optional post-turn panel failover.
 
 ## What this is for
 
@@ -9,7 +9,7 @@ Multi-account **Claude Code** for **Linux / WSL / Remote-SSH**: live usage (5h /
 | **Two Claude accounts at once**      | Work in one VS Code window, personal in another — each has its own `CLAUDE_CONFIG_DIR` and credential copy                                                                                                            |
 | **Open a folder → right account**    | `workspaceRoutes` (or Switch Account once) pins a tree to an email; preferred over “last used anywhere”                                                                                                               |
 | **See usage live**                   | Status bar: 5h session, 7d all-models, Fable (and other model-scoped limits)                                                                                                                                          |
-| **Failover when an account is hot**  | Notify, CLI PATH orchestrator for **new** `claude` processes, optional **post-turn** panel cutover (never mid-stream)                                                                                                 |
+| **Failover when an account is hot**  | Status-bar meter shows the pressure; optional **post-turn** panel cutover switches accounts when a turn settles (never mid-stream)                                                                                    |
 | **Keep one conversation history**    | Shared history store so multi-account does not fragment or hide past chats                                                                                                                                            |
 | **Keep your MCP servers & settings** | User-scope `mcpServers` (from `~/.claude.json`) are merged into each window, and your `~/.claude/settings.json` (auto-compact, model, hooks, …) is shared into every window, so both apply under per-window isolation |
 
@@ -20,7 +20,7 @@ Upstream credit: [Parallel Accounts](https://github.com/DercasDrol/claude-parall
 | Not a goal                                         | Why                                                                                                                                                                                                          |
 | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **Context consolidation across accounts**          | Each account is a separate Anthropic identity. History is shared as **files** so chats are not lost — not a single Claude brain.                                                                             |
-| **One panel, hot-swap mid-turn**                   | Claude Code reads `CLAUDE_CONFIG_DIR` at startup. Account change reloads the window (or only affects **new** CLI processes via the orch).                                                                    |
+| **One panel, hot-swap mid-turn**                   | Claude Code reads `CLAUDE_CONFIG_DIR` at startup, so an account change reloads the window (only when you switch accounts).                                                                                   |
 | **macOS / native Windows Claude**                  | Linux semantics only. Use a **WSL or Linux remote** window; inert elsewhere.                                                                                                                                 |
 | **Replacing Parallel Accounts on Windows UI host** | `extensionKind: workspace` on purpose (avoids UI-host bugs under WSL). Install on the remote/WSL side.                                                                                                       |
 | **Minting OAuth sessions / API proxy**             | Claude Code owns login. We copy credentials into per-window dirs; the usage meter may **refresh access tokens** with the stored refresh token so the poll stays valid — we do not act as an Anthropic proxy. |
@@ -35,7 +35,7 @@ Supported model for more quota: **finish the turn → cut over or open another w
 | ----------------- | ------------------------------------------------------------------------------------------- |
 | Parallel Accounts | Multi-account OK; no usage                                                                  |
 | Claudemeter       | Usage OK; `extensionKind: ui` on **Windows** host under WSL → wrong binary, re-login thrash |
-| This extension    | **workspace** only + usage + workspace pins + CLI/panel failover policy                     |
+| This extension    | **workspace** only + usage + workspace pins + post-turn panel failover                      |
 
 ## Install / update (VSIX from GitHub)
 
@@ -91,7 +91,6 @@ Hard-map directory trees to an email. **Longest matching prefix wins.** Emails m
 
 Under a match:
 
-- CLI orchestrator **always** uses that account (no cross-account failover)
 - VS Code **auto-selects** that account when you open the folder
 - Panel cutover **will not** leave the pin
 
@@ -132,11 +131,12 @@ Longer prefixes win: a specific work tree uses **work**; other repos under `proj
 
 Applies when **no** workspace route matched the cwd. Supports **N accounts**, not just two.
 
-| `failover.mode`        | Behavior                                                                    |
-| ---------------------- | --------------------------------------------------------------------------- |
-| **`notify`** (default) | Toast when a failover-enabled dimension is hot                              |
-| **`cli`**              | PATH shim picks an account via `failover.strategy` on **new** CLI processes |
-| **`off`**              | Meter only for CLI/policy side                                              |
+| `failover.mode`        | Behavior                                                |
+| ---------------------- | ------------------------------------------------------- |
+| **`notify`** (default) | Usage pressure shows on the status-bar meter (no popup) |
+| **`off`**              | Same as `notify` — meter only                           |
+
+`failover.mode` is effectively legacy: both values just show the meter, and neither is read anywhere else since the CLI orchestrator was removed. Account switching is driven entirely by **panel cutover** (below); the failover **flags** (`onSession` / `onWeekly` / `onFable` + thresholds) still decide what counts as "hot".
 
 ### Panel cutover (after the turn finishes)
 
@@ -160,7 +160,7 @@ Turn idle is inferred from **this window’s** session/project file activity (no
 
 ```json
 {
-  "claudeAccounts.failover.mode": "cli",
+  "claudeAccounts.failover.panelCutover": "idleReload",
   "claudeAccounts.failover.strategy": "lowestUsage",
   "claudeAccounts.failover.accountOrder": [
     "personal@example.com",
@@ -186,45 +186,6 @@ Thresholds: `sessionThreshold` / `weeklyThreshold` / `fableThreshold` (default 9
 
 Legacy `primaryEmail` / `secondaryEmail` still seed `accountOrder` if that list is empty.
 
-### Why CLI failover does not reload VS Code
-
-The **panel** reads `CLAUDE_CONFIG_DIR` at startup. Changing env mid-session does not re-auth without a window reload (which kills in-flight turns).
-
-The **orchestrator** only wraps **new process** invocations of `claude` (terminal, hooks, scripts). That is intentional and safe.
-
-## Install CLI orchestrator
-
-```bash
-cd ~/projects/claude-accounts
-npm run install-orch
-# open a new terminal, or:
-export PATH="$HOME/bin:$PATH"
-```
-
-For integrated terminals, in VS Code `settings.json`:
-
-```json
-"terminal.integrated.env.linux": {
-  "PATH": "${env:HOME}/bin:${env:PATH}"
-}
-```
-
-Set **failover.mode** to **`cli`**, set account order / strategy, let usage refresh once (or **Claude Accounts: Refresh Usage**). Then:
-
-```bash
-# with primary hot and secondary cool:
-claude auth status --json   # bills secondary via CLAUDE_CONFIG_DIR
-```
-
-Sticky multi-call agent runs:
-
-```bash
-export CLAUDE_ORCH_STICKY=1
-# subsequent claude calls keep the same account for this shell
-```
-
-Verbose failover logs: `CLAUDE_ORCH_VERBOSE=1`.
-
 ## Safety
 
 - Never discovers reserved sidecars; does not migrate **forgotten** dirs into `~/.claude-shared`
@@ -246,6 +207,6 @@ npm run package
 
 ```text
 src/          extension (TypeScript)
-scripts/      claude-orch + install-orch.sh
+scripts/      install-latest.sh + ship.sh
 test/         node:test suites
 ```

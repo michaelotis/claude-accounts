@@ -143,7 +143,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const applyUsageSettings = () => {
     const cfg = vscode.workspace.getConfiguration('claudeAccounts');
-    const mode = cfg.get<'off' | 'notify' | 'cli'>('failover.mode', 'notify');
+    const mode = cfg.get<'off' | 'notify'>('failover.mode', 'notify');
     const panelMode = cfg.get<PanelCutoverMode>('failover.panelCutover', 'notify');
     const routes = buildWorkspaceRoutes();
     const thresholds = {
@@ -181,9 +181,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       workspaceRoutes: routes,
       nameByEmail,
       storeDirForEmail: (email) => accountByEmail(email)?.dir,
-      // Only the auto-cutover strategies read other accounts' usage; in meter-only
+      // Only auto-cutover (idleReload) reads other accounts' usage; in meter-only
       // mode each window polls just its own account (no cross-account 429 pressure).
-      pollAllAccounts: panelMode === 'idleReload' || mode === 'cli',
+      pollAllAccounts: panelMode === 'idleReload',
     });
     writePolicyCache({
       mode,
@@ -482,13 +482,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         void wizard
           .reconcile()
           .catch((e) => log(`reconcile failed: ${e instanceof Error ? e.message : String(e)}`))
-          .finally(() => {
-            statusBar.reconfirm();
-            // Focus is the "about to use this window" signal and the turn is idle
-            // then — heal a stale shared-account grant now (idle-gated) so the first
-            // turn runs on the live token instead of failing once, then healing.
-            cutover.maybeHeal();
-          });
+          .finally(() => statusBar.reconfirm());
     }),
     statusBar
   );
