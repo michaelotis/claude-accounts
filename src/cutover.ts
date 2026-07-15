@@ -38,12 +38,15 @@ const PENDING_KEY = 'claudeAccounts.pendingIdleCutover';
 /** Min ms between automatic idleReload cutovers (survives reload). */
 const AUTO_COOLDOWN_KEY = 'claudeAccounts.lastAutoCutoverAt';
 const AUTO_COOLDOWN_MS = 5 * 60_000;
+/** Repeat the idle "usage high" log line at most this often while pressure persists. */
+const HIGH_LOG_THROTTLE_MS = 10 * 60_000;
 
 export class IdleCutoverController {
   private watcher: TurnWatcher;
   private pending = false;
   private busy = false;
   private evaluating = false;
+  private lastHighLogAt = 0;
   private startupTimer: ReturnType<typeof setTimeout> | undefined;
 
   private panelMode: PanelCutoverMode = 'off';
@@ -105,9 +108,13 @@ export class IdleCutoverController {
     if (!needsFailover(snap, this.thresholds, this.triggers)) return;
 
     if (this.busy || this.watcher.getPhase() === 'in_turn') {
-      this.pending = true;
-      void this.context.workspaceState.update(PENDING_KEY, true);
-      log(`cutover: pressure during turn — deferred (${reasons.join(', ')})`);
+      // Pressure re-fires on every usage refresh while the account is hot; defer
+      // (and say so) once per turn — pending is already set after the first one.
+      if (!this.pending) {
+        this.pending = true;
+        void this.context.workspaceState.update(PENDING_KEY, true);
+        log(`cutover: pressure during turn — deferred (${reasons.join(', ')})`);
+      }
       return;
     }
     void this.evaluateAndMaybeCutover(reasons);
@@ -143,7 +150,13 @@ export class IdleCutoverController {
       if (this.panelMode !== 'idleReload') {
         this.pending = false;
         await this.context.workspaceState.update(PENDING_KEY, false);
-        log(`cutover: usage high (${reasons.join('; ')}) — meter shows it`);
+        // While the account stays hot this re-evaluates every poll; one line every
+        // ten minutes is plenty — the meter is the live signal, not the log.
+        const now = Date.now();
+        if (now - this.lastHighLogAt >= HIGH_LOG_THROTTLE_MS) {
+          this.lastHighLogAt = now;
+          log(`cutover: usage high (${reasons.join('; ')}) — meter shows it`);
+        }
         return;
       }
 

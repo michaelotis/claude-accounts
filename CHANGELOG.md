@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.9.8
+
+### Fixed
+- **The account watcher no longer treats every `.claude.json` write as an account
+  change.** Claude Code rewrites that file every few seconds during a turn (project
+  state, history), and the watcher fired on each write — running a full reconcile,
+  usage refresh, and policy write ~30×/minute and logging a
+  `usage: cache hit` / `cutover: pressure during turn — deferred` pair every ~2 seconds
+  while an account sat at its threshold. The watcher now fingerprints what it actually
+  guards — the identity email, the home-root identity, and the credential bytes — and
+  fires only when one of those changed (login, logout, forget, token rotation). Routine
+  turn churn no longer triggers anything.
+
+### Changed
+- Quieter logs: the per-read `usage: cache hit` line is gone (real network fetches still
+  log), the "pressure during turn — deferred" line logs once per turn instead of per
+  event, and the idle "usage high — meter shows it" line repeats at most every
+  10 minutes while pressure persists.
+
 ## 0.9.7
 
 ### Changed
