@@ -26,6 +26,8 @@ export class StatusBarManager implements vscode.Disposable {
   private readonly weeklyItem: vscode.StatusBarItem;
   private readonly fableItem: vscode.StatusBarItem;
   private readonly disposables: vscode.Disposable[] = [];
+  /** True while a user-initiated Refresh Usage is fetching (spinner + tooltip note). */
+  private refreshing = false;
 
   constructor(
     private readonly registry: AccountRegistry,
@@ -87,6 +89,12 @@ export class StatusBarManager implements vscode.Disposable {
   reconfirm(): void {
     void this.usage.refresh(this.effectiveDir());
     this.refresh();
+  }
+
+  /** Show/clear the inline "updating usage…" spinner + tooltip note (Refresh Usage). */
+  setRefreshing(on: boolean): void {
+    this.refreshing = on;
+    this.render();
   }
 
   private effectiveDir(): string {
@@ -184,7 +192,9 @@ export class StatusBarManager implements vscode.Disposable {
       const savedByEmail = email ? this.registry.savedForEmail(email) : undefined;
       const isSaved = Boolean(savedName || active || savedByEmail);
       // Account pill only — usage meters are separate items (per-metric color)
-      const main = `$(account) ${email.split('@')[0]}${isSaved ? '' : ' $(circle-outline)'}`;
+      const main = `$(account) ${email.split('@')[0]}${isSaved ? '' : ' $(circle-outline)'}${
+        this.refreshing ? ' $(sync~spin)' : ''
+      }`;
       this.item.text = main.length > 80 ? main.slice(0, 77) + '…' : main;
 
       const unique = this.registry.listUniqueByEmail();
@@ -201,10 +211,16 @@ export class StatusBarManager implements vscode.Disposable {
           : '',
       ].filter(Boolean);
 
+      const freshness = this.refreshing
+        ? '⟳ _Updating usage…_'
+        : this.usage.isRateLimited(dir)
+          ? '⚠ _Usage API is rate-limiting — showing the last known figures; retrying shortly._'
+          : '';
       this.item.tooltip = this.card([
         `**${email}**${usage?.planLabel ? ` · ${usage.planLabel}` : ''}${
           usage?.orgName ? ` · ${usage.orgName}` : ''
         }`,
+        freshness,
         formatUsageTooltip(usage ?? null),
         `This window runs this account. Other windows can run others at the same time.`,
         `Accounts saved: **${unique.length}**${

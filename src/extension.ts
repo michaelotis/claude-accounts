@@ -445,37 +445,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     cmd('claudeProfiles.showLog', () => showLog()),
     cmd('claudeProfiles.refreshUsage', async () => {
       const dir = binding.getEnvDir() ?? defaultSourceDir();
-      // Prefer cache/backoff first. Only force network if nothing fresh.
-      let snap = await usage.refresh(dir, false);
-      if (!snap || snap.fetchedAt === 0) {
-        snap = await usage.refresh(dir, true);
-      }
-      if (!snap) {
-        const detail =
-          usage.lastFailure?.message ??
-          'Could not fetch usage for this window. Sign in with Claude Code first (/login).';
-        // Never toast bare 429 — fetch layer returns best-effort on poll rate limits.
-        if (usage.lastFailure?.kind === 'rate_limited') {
-          void vscode.window.showInformationMessage(
-            'Usage API is rate-limiting polls; showing last known meter. Try again in a few minutes.'
-          );
-          return;
+      // User-initiated: show it updating INLINE (status-bar spinner + tooltip note) and
+      // repaint the meter in place via onChange — no "here's your usage" toast. Force a
+      // fresh fetch, BUT if we're already in the post-429 backoff don't hammer the API
+      // (that just re-stamps the window and keeps the meter stale); a non-force refresh
+      // still adopts a newer cross-window cache and the tooltip shows the rate-limit note.
+      const force = !usage.isRateLimited(dir);
+      let hardMsg: string | undefined;
+      statusBar.setRefreshing(true);
+      try {
+        const snap = await usage.refresh(dir, force);
+        if (!snap && usage.lastFailure && usage.lastFailure.kind !== 'rate_limited') {
+          hardMsg =
+            usage.lastFailure.message ??
+            'Could not fetch usage for this window. Sign in with Claude Code first (/login).';
         }
-        const pick = await vscode.window.showWarningMessage(detail, 'Show log');
-        if (pick === 'Show log') showLog();
-        return;
+      } finally {
+        statusBar.setRefreshing(false); // clear the spinner BEFORE any modal
       }
-      const models = snap.modelLimits.map((m) => `${m.name} ${m.percent}%`).join(', ');
-      const age =
-        snap.fetchedAt > 0
-          ? ` · updated ${Math.max(0, Math.round((Date.now() - snap.fetchedAt) / 1000))}s ago`
-          : ' · cached/placeholder';
-      vscode.window.showInformationMessage(
-        `Usage: 5h ${snap.sessionPercent}% · 7d ${snap.weeklyPercent}%` +
-          (models ? ` · ${models}` : '') +
-          (snap.planLabel ? ` (${snap.planLabel})` : '') +
-          age
-      );
+      // Only a hard failure that isn't a rate-limit (e.g. signed out) surfaces — it needs action.
+      if (hardMsg) {
+        const pick = await vscode.window.showWarningMessage(hardMsg, 'Show log');
+        if (pick === 'Show log') showLog();
+      }
     }),
     // Only the focused window repairs a dir whose account was replaced by a
     // sign-in (it's the window the user signed in from). So a window that was
