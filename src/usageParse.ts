@@ -35,7 +35,7 @@ export interface FailoverThresholds {
 }
 
 /**
- * Which pressure dimensions should trigger account failover (CLI/notify).
+ * Which pressure dimensions should trigger account failover.
  * When a dimension is false, we still surface it in the meter, but do NOT
  * switch accounts for it alone — e.g. Fable-only pressure can be left to
  * Claude Code's model fallback.
@@ -311,7 +311,7 @@ function idOf(a: SelectableAccount): string {
 }
 
 /**
- * Pick an account for CLI failover among candidates.
+ * Pick an account for failover among candidates.
  *
  * - strategy `lowestUsage`: among cool accounts prefer lowest usageScore;
  *   if none cool, pick lowest score overall (least bad).

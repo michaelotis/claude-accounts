@@ -15,28 +15,6 @@ const builds = [
     sourcemap: !isProduction,
     minify: isProduction,
   },
-  // Shared selection logic for scripts/claude-orch (no vscode)
-  {
-    entryPoints: ['src/usageParse.ts'],
-    bundle: true,
-    outfile: 'scripts/lib/usageParse.cjs',
-    format: 'cjs',
-    platform: 'node',
-    target: 'node18',
-    sourcemap: false,
-    minify: false,
-  },
-  // Shared workspace route matching for scripts/pick-account.cjs
-  {
-    entryPoints: ['src/workspaceRoutes.ts'],
-    bundle: true,
-    outfile: 'scripts/lib/workspaceRoutes.cjs',
-    format: 'cjs',
-    platform: 'node',
-    target: 'node18',
-    sourcemap: false,
-    minify: false,
-  },
 ];
 
 async function run() {

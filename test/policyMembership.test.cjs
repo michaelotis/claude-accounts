@@ -4,7 +4,6 @@ const path = require('path');
 const esbuild = require('esbuild');
 const fs = require('fs');
 const os = require('os');
-const { execFileSync } = require('child_process');
 
 /**
  * writePolicyCache lives in usage.ts which imports vscode via log/accounts.
@@ -68,7 +67,7 @@ describe('writePolicyCache membership (credentials on disk)', () => {
   it('keeps account with credentials and drops one without', () => {
     const now = Date.now();
     writePolicyCache({
-      mode: 'cli',
+      mode: 'notify',
       thresholds: { session: 90, weekly: 90, fable: 90 },
       triggers: { session: true, weekly: true, fable: false },
       strategy: 'lowestUsage',
@@ -115,38 +114,5 @@ describe('writePolicyCache membership (credentials on disk)', () => {
     const pol = JSON.parse(fs.readFileSync(policyPath(), 'utf8'));
     const emails = (pol.accounts || []).map((a) => a.email).sort();
     assert.deepEqual(emails, ['keep@example.com']);
-  });
-});
-
-describe('pick-account refuse on missing route account', () => {
-  it('prints refuse sentinel when workspace route email has no dir (does not fall through to env)', () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ca-pick-'));
-    const envDir = path.join(tmp, 'env-account');
-    fs.mkdirSync(envDir, { recursive: true });
-    const policyFile = path.join(tmp, 'policy.json');
-    fs.writeFileSync(
-      policyFile,
-      JSON.stringify({
-        mode: 'cli',
-        thresholds: { session: 90, weekly: 90, fable: 90 },
-        triggers: { session: true, weekly: true, fable: false },
-        workspaceRoutes: [{ pathPrefix: tmp, email: 'missing@example.com' }],
-        accounts: [],
-      })
-    );
-    const pick = path.join(__dirname, '../scripts/pick-account.cjs');
-    const stdout = execFileSync(process.execPath, [pick, policyFile, tmp], {
-      env: { ...process.env, CLAUDE_CONFIG_DIR: envDir },
-      encoding: 'utf8',
-    });
-    assert.ok(
-      stdout.includes('__CLAUDE_ORCH_REFUSE__'),
-      `expected refuse sentinel, got: ${JSON.stringify(stdout)}`
-    );
-    try {
-      fs.rmSync(tmp, { recursive: true, force: true });
-    } catch {
-      /* ignore */
-    }
   });
 });

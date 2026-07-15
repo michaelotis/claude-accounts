@@ -53,7 +53,6 @@ const {
   isStaleAgainstStore,
 } = bundle('../src/workdir.ts', 'workdir.bundle.cjs');
 const { snapshotAccount } = bundle('../src/capture.ts', 'capture.bundle.cjs');
-const { SetupWizard } = bundle('../src/setupWizard.ts', 'setupWizard.bundle.cjs');
 
 // Two DIFFERENT accounts (distinct refresh tokens). Fingerprinting keys on the
 // refresh token — the stable account secret — NOT the access token, which rotates.
@@ -418,8 +417,6 @@ describe('tokenExpiry / isStaleAgainstStore edges', () => {
   });
 });
 
-// ─── healStaleTokenIfNeeded integration (the account-safety + loop-safety path) ───
-
 /** Directory factory bound to a given HOME (shared by the async home helper). */
 function mkInto(home) {
   return (dirName, email, token) => {
@@ -453,148 +450,3 @@ async function withHomeAsync(fn) {
     }
   }
 }
-
-/** SetupWizard over tiny fakes; resets the shared vscode-call recorder. */
-function makeWizard({ envDir, activeName, account, stamp = 0 }) {
-  globalThis.__vscodeCalls = { commands: [], reloadCount: 0 };
-  const state = { stamp };
-  const context = {
-    workspaceState: {
-      get: (k, d) => (k === 'claudeProfiles.lastAutoReload' ? state.stamp : d),
-      update: (k, v) => {
-        if (k === 'claudeProfiles.lastAutoReload') state.stamp = v;
-        return Promise.resolve();
-      },
-    },
-    globalState: { get: () => undefined, update: () => Promise.resolve() },
-  };
-  const binding = { getEnvDir: () => envDir, getActiveName: () => activeName };
-  const registry = {
-    get: (name) => (account && name === account.name ? account : undefined),
-    emailOf: (a) => a && a.email,
-  };
-  return new SetupWizard(registry, binding, context);
-}
-
-// One account "a@", grant rotated old→new (different refresh tokens, newer expiry);
-// FGN is a foreign grant with the highest expiry.
-const A_OLD = JSON.stringify({
-  claudeAiOauth: { accessToken: 'a1', refreshToken: 'RT_A_OLD', expiresAt: 1000 },
-});
-const A_NEW = JSON.stringify({
-  claudeAiOauth: { accessToken: 'a2', refreshToken: 'RT_A_NEW', expiresAt: 2000 },
-});
-const FGN = JSON.stringify({
-  claudeAiOauth: { accessToken: 'f', refreshToken: 'RT_FGN', expiresAt: 3000 },
-});
-const acc = (dir) => ({ name: 'a', dir, email: 'a@example.com' });
-
-describe('healStaleTokenIfNeeded', () => {
-  it('heals a stale window once (re-stocks token + reloads), then is a no-op (loop guard)', async () => {
-    await withHomeAsync(async (home, mk) => {
-      const store = mk('.claude-a', 'a@example.com', A_NEW);
-      const wd = mk(path.join('.claude-windows', 'w1'), 'a@example.com', A_OLD);
-      const wiz = makeWizard({ envDir: wd, activeName: 'a', account: acc(store) });
-
-      const healed = await wiz.healStaleTokenIfNeeded();
-      assert.equal(healed, true);
-      assert.equal(globalThis.__vscodeCalls.reloadCount, 1);
-      assert.equal(
-        fs.readFileSync(path.join(wd, '.credentials.json'), 'utf8'),
-        A_NEW,
-        'window token re-stocked from the store BEFORE the reload (loop guard)'
-      );
-      // .claude.json (identity/project state) must be left as the window's own.
-      assert.ok(fs.existsSync(path.join(wd, '.claude.json')));
-
-      // Second call: dir now equals the store → not stale → no second reload.
-      const again = await wiz.healStaleTokenIfNeeded();
-      assert.equal(again, false);
-      assert.equal(globalThis.__vscodeCalls.reloadCount, 1);
-    });
-  });
-
-  it('does NOT heal when the store grant belongs to a different account (contamination guard)', async () => {
-    await withHomeAsync(async (home, mk) => {
-      // a@'s store holds a FOREIGN grant that also lives under b@ (dual-homed → caught).
-      const store = mk('.claude-a', 'a@example.com', FGN);
-      mk('.claude-b', 'b@example.com', FGN);
-      const wd = mk(path.join('.claude-windows', 'w1'), 'a@example.com', A_OLD);
-      const wiz = makeWizard({ envDir: wd, activeName: 'a', account: acc(store) });
-
-      const healed = await wiz.healStaleTokenIfNeeded();
-      assert.equal(healed, false);
-      assert.equal(globalThis.__vscodeCalls.reloadCount, 0);
-      assert.equal(
-        fs.readFileSync(path.join(wd, '.credentials.json'), 'utf8'),
-        A_OLD,
-        'window must not be re-stocked from a foreign-token store'
-      );
-    });
-  });
-
-  it('does NOT heal across identity drift (reconcile owns that)', async () => {
-    await withHomeAsync(async (home, mk) => {
-      const store = mk('.claude-a', 'a@example.com', A_NEW);
-      // Window identity says b@ but it is bound to a@ — drift.
-      const wd = mk(path.join('.claude-windows', 'w1'), 'b@example.com', A_OLD);
-      const wiz = makeWizard({ envDir: wd, activeName: 'a', account: acc(store) });
-
-      assert.equal(await wiz.healStaleTokenIfNeeded(), false);
-      assert.equal(globalThis.__vscodeCalls.reloadCount, 0);
-    });
-  });
-
-  it('skips (no partial heal) when it reloaded within the cooldown', async () => {
-    await withHomeAsync(async (home, mk) => {
-      const store = mk('.claude-a', 'a@example.com', A_NEW);
-      const wd = mk(path.join('.claude-windows', 'w1'), 'a@example.com', A_OLD);
-      const wiz = makeWizard({
-        envDir: wd,
-        activeName: 'a',
-        account: acc(store),
-        stamp: Date.now(),
-      });
-
-      assert.equal(await wiz.healStaleTokenIfNeeded(), false);
-      assert.equal(globalThis.__vscodeCalls.reloadCount, 0);
-      assert.equal(
-        fs.readFileSync(path.join(wd, '.credentials.json'), 'utf8'),
-        A_OLD,
-        'metered skip must leave the dir untouched'
-      );
-    });
-  });
-
-  it('defers (does not reload) when a turn resumed since the idle edge (isBusy)', async () => {
-    await withHomeAsync(async (home, mk) => {
-      const store = mk('.claude-a', 'a@example.com', A_NEW);
-      const wd = mk(path.join('.claude-windows', 'w1'), 'a@example.com', A_OLD);
-      const wiz = makeWizard({ envDir: wd, activeName: 'a', account: acc(store) });
-
-      assert.equal(await wiz.healStaleTokenIfNeeded(() => true), false);
-      assert.equal(globalThis.__vscodeCalls.reloadCount, 0);
-      assert.equal(
-        fs.readFileSync(path.join(wd, '.credentials.json'), 'utf8'),
-        A_OLD,
-        'no destructive step before the final turn re-check'
-      );
-    });
-  });
-
-  it('does not heal when the store has no credentials', async () => {
-    await withHomeAsync(async (home, mk) => {
-      const store = path.join(home, '.claude-a');
-      fs.mkdirSync(store, { recursive: true });
-      fs.writeFileSync(
-        path.join(store, '.claude.json'),
-        JSON.stringify({ oauthAccount: { emailAddress: 'a@example.com' } })
-      );
-      const wd = mk(path.join('.claude-windows', 'w1'), 'a@example.com', A_OLD);
-      const wiz = makeWizard({ envDir: wd, activeName: 'a', account: acc(store) });
-
-      assert.equal(await wiz.healStaleTokenIfNeeded(), false);
-      assert.equal(globalThis.__vscodeCalls.reloadCount, 0);
-    });
-  });
-});

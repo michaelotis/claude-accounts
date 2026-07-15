@@ -5,7 +5,6 @@ module.exports = tseslint.config(
   {
     ignores: [
       'dist/**',
-      'scripts/lib/**',
       'node_modules/**',
       '**/*.vsix',
       'esbuild.js',

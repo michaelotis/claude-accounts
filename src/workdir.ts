@@ -195,13 +195,13 @@ export function tokenExpiry(buf: Buffer): number | null {
  * True when `candidate` is a STRICTLY-OLDER, DIFFERENT grant than `reference` —
  * i.e. `reference` is the fresher of two grants for one account.
  *
- * This is the whole basis of the self-healing token model. When two windows run
- * the same account, each holds a copy of the store's grant; when either refreshes,
+ * Used by reconcile to refuse propagating a stale grant: when two windows run the
+ * same account, each holds a copy of the store's grant; when either refreshes,
  * Anthropic rotates the refresh token, so the copies diverge into a newer grant
  * (the one that refreshed) and one or more older, now-dead ones. "Same account,
  * different refresh token, older expiry" is exactly that stale copy — and never a
- * legitimate state to propagate. The same-lineage case (`sameCredential`, e.g. an
- * access-token refresh in place) is NOT stale; nor is an equal/newer expiry.
+ * legitimate state to mirror into ~/.claude. The same-lineage case (`sameCredential`,
+ * e.g. an access-token refresh in place) is NOT stale; nor is an equal/newer expiry.
  */
 export function isStaleAgainstStore(candidate: Buffer, reference: Buffer): boolean {
   if (sameCredential(candidate, reference)) return false;
@@ -337,27 +337,6 @@ export async function refreshStore(account: Account, workingDir: string): Promis
     }
   } catch (err) {
     log(`workdir: could not refresh store of ${account.name}: ${(err as Error).message}`);
-  }
-}
-
-/**
- * Copies ONLY the token (`.credentials.json`) from `storeDir` into `workingDir`,
- * leaving the dir's `.claude.json` (its live per-project state — trusted folders,
- * allowed tools, project-scope MCP) untouched. The self-heal uses this instead of a
- * full `materialize`: only the credential is stale, and re-copying the store's
- * frozen `.claude.json` would revert the window's accumulated project state. Returns
- * true when the token is in place afterward.
- */
-export function restockTokenOnly(storeDir: string, workingDir: string): boolean {
-  try {
-    const src = path.join(storeDir, '.credentials.json');
-    if (!fs.existsSync(src)) return false;
-    fs.mkdirSync(workingDir, { recursive: true, mode: 0o700 });
-    copyFileAtomic(src, path.join(workingDir, '.credentials.json'), 0o600);
-    return hasCredentials(workingDir);
-  } catch (err) {
-    log(`workdir: could not restock token into ${workingDir}: ${(err as Error).message}`);
-    return false;
   }
 }
 
