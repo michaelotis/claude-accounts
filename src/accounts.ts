@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -81,6 +82,32 @@ export function readIdentity(dir: string): AccountIdentity | null {
 /** True if the dir looks like a logged-in Claude Code config dir. */
 export function hasCredentials(dir: string): boolean {
   return fs.existsSync(path.join(dir, '.credentials.json'));
+}
+
+/**
+ * Content fingerprint of the account state the AccountWatcher guards: this dir's
+ * identity email, the home-root identity email, and the credential grant bytes.
+ * Claude Code rewrites .claude.json every few seconds during a turn (project
+ * state, history), so mtime is useless as a change signal — only these fields
+ * mean the ACCOUNT changed (login, logout, forget, token rotation).
+ * homeIdentityFile is injectable for tests only.
+ */
+export function accountFingerprint(
+  dir: string,
+  homeIdentityFile = path.join(os.homedir(), '.claude.json')
+): string {
+  const own = readIdentity(dir)?.email?.toLowerCase() ?? '';
+  const home = readIdentityFile(homeIdentityFile)?.email?.toLowerCase() ?? '';
+  let creds = '';
+  try {
+    creds = crypto
+      .createHash('sha1')
+      .update(fs.readFileSync(path.join(dir, '.credentials.json')))
+      .digest('hex');
+  } catch {
+    // Absent or unreadable credentials = signed out; the empty string is that state.
+  }
+  return `${own}|${home}|${creds}`;
 }
 
 /** Expands a leading ~ to the home directory. */

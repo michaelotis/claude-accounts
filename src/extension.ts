@@ -494,12 +494,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // its shadow copy, save a newly-seen account, and — if a sign-in landed on top
   // of the account this dir held — move the new account into a dir of its own and
   // restore the displaced one. Then repaint the bar so it never lags behind.
-  const watcher = new AccountWatcher(binding, () => {
-    void wizard
+  const watcher = new AccountWatcher(binding, () =>
+    // Returned (not voided) so the watcher can re-read the fingerprint after the
+    // reconcile settles — the latch must reflect any in-place repair it made.
+    wizard
       .reconcile()
       .catch((e) => log(`reconcile failed: ${e instanceof Error ? e.message : String(e)}`))
-      .finally(() => statusBar.reconfirm());
-  });
+      .finally(() => statusBar.reconfirm())
+  );
   watcher.start();
   context.subscriptions.push(watcher);
 

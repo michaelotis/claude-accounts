@@ -547,7 +547,8 @@ export async function fetchUsageDetailed(
   if (!opts.forceNetwork) {
     const fresh = getCachedSnap(key, USAGE_CACHE_TTL_MS);
     if (fresh) {
-      log(`usage: cache hit ${key}`);
+      // Served silently: this is the overwhelmingly common path, and a log line per
+      // cache read buries the real events. Network fetches still log below.
       return { ok: true, snap: { ...fresh, configDir: dir } };
     }
   }
