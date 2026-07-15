@@ -167,6 +167,19 @@ export class IdleCutoverController {
       }
       const reasons = [currentSnap.email ?? '', ...hint].filter(Boolean);
 
+      // Meter-only: there's nothing to switch to compute, so skip picking a cooler
+      // account entirely. pickNextAccount fan-fetches /api/oauth/usage for EVERY
+      // registered account, and it ran on every pressure event while the active
+      // account was hot — piling cross-account calls onto the same rate budget right
+      // as the account climbed to its limit. The status-bar meter already shows the
+      // pressure; the user switches manually. Only idleReload needs the pick.
+      if (this.panelMode !== 'idleReload') {
+        this.pending = false;
+        await this.context.workspaceState.update(PENDING_KEY, false);
+        log(`cutover: usage high (${reasons.join('; ')}) — meter shows it`);
+        return;
+      }
+
       const next = await this.pickNextAccount(currentSnap.email ?? undefined);
       if (!next) {
         // No popup — the status-bar meter already shows the pressure, and switching
@@ -186,15 +199,12 @@ export class IdleCutoverController {
 
       const nextEmail = this.registry.emailOf(next) ?? next.name;
 
-      if (this.panelMode === 'notify') {
-        // Meter-only: surface pressure through the status-bar meter, never a popup.
-        // The user switches when they choose; `idleReload` is the opt-in for
-        // automatic post-turn switching.
+      // pickNextAccount above fetches every account and can take seconds; re-check the
+      // mode in case the user turned off idleReload mid-evaluation (mirrors the busy /
+      // mutating re-checks below, which guard the same async gap).
+      if (this.panelMode !== 'idleReload') {
         this.pending = false;
         await this.context.workspaceState.update(PENDING_KEY, false);
-        log(
-          `cutover: cooler account ${nextEmail} available (${reasons.join('; ')}) — meter shows it`
-        );
         return;
       }
 
