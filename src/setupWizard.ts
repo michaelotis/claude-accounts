@@ -15,6 +15,7 @@ import {
   restockTokenOnly,
   syncMcpServers,
   linkUserSettings,
+  linkUserAssets,
   foreignTokenConflict,
   sameCredential,
   isStaleAgainstStore,
@@ -487,6 +488,7 @@ export class SetupWizard {
     // Propagate newly-added home MCP servers into already-stocked windows.
     syncMcpServers(dir);
     linkUserSettings(dir);
+    linkUserAssets(dir);
     const changed = active !== account.name;
     if (changed) await this.binding.bind(account);
 

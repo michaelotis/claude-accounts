@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.9.10
+
+### Added
+- **Personal skills, agents, and slash commands now work in every account.** Claude
+  Code looks for them under `CLAUDE_CONFIG_DIR`, and a managed window points that at
+  its own per-window dir — so anything in `~/.claude/skills`, `~/.claude/agents`, or
+  `~/.claude/commands` silently vanished in managed windows. Those three dirs are now
+  linked into every window (same linking approach as the shared `settings.json` —
+  symlink + one-time backup — but a directory of your files is never deleted): one
+  source of truth in `~/.claude`, visible under every account. A real local dir that a
+  window already had is preserved as `<name>.bak`. `plugins/` deliberately stays
+  per-window — Claude Code manages live state there. Claude Code reads these at
+  startup, so each window shows them from its next reload after upgrading.
+
+### Docs
+- README: skills/agents/commands sharing documented; the stale "skills are unrelated"
+  row corrected; the 0.9.9 stale-token restock added to Safety.
+
 ## 0.9.9
 
 ### Fixed
