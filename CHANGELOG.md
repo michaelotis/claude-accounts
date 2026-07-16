@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.9.9
+
+### Fixed
+- **"OAuth session expired and could not be refreshed" after working a while.** With
+  the same account in more than one window, any window refreshing the token makes
+  Anthropic rotate the refresh token — every other window's private copy silently dies,
+  and that window hits this error once its access token expires. The account store
+  always keeps the newest grant, but since 0.9.7 (no automatic reloads) nothing brought
+  a *running* window's copy back in step; a reload fixed it only because folder-pinned
+  windows restock from the store at startup. Now every window bound to a saved account
+  watches that account's store, and when another window rotates the grant it quietly
+  rewrites its own token **file** from the store within a couple of seconds — no
+  process kill, no reload, no popup. If Claude Code's in-memory copy still trips the error before its next restart,
+  the status-bar tooltip explains it inline, and one reload (which boots straight onto
+  the live token) clears it.
+
+### Internal
+- `restockTokenOnly` is back (token file only — never the store's frozen
+  `.claude.json`, which would revert live per-project state), now without the SIGKILL +
+  reload it shipped with in 0.9.3. It reads the store grant once and writes exactly
+  those bytes, compare-and-swaps against the dir's judged grant (a `/login` or
+  `/logout` racing the reconcile bails out instead of being clobbered or resurrected),
+  and refuses a store grant that also lives in another account's store. The `~/.claude`
+  fallback mirror stays skipped for stale dirs — the window holding the live grant
+  keeps it fresh, as before.
+
 ## 0.9.8
 
 ### Fixed

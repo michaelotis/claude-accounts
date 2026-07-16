@@ -49,6 +49,7 @@ const {
   sameCredential,
   credentialFingerprint,
   materialize,
+  restockTokenOnly,
   tokenExpiry,
   isStaleAgainstStore,
 } = bundle('../src/workdir.ts', 'workdir.bundle.cjs');
@@ -225,16 +226,37 @@ describe('refreshStore contamination guard', () => {
     });
   });
 
-  it('writes a legitimately refreshed same-account grant through', async () => {
+  it('writes a legitimately refreshed same-account grant through (newer expiry)', async () => {
     await withHomeAsync(async (home, mk) => {
-      // b's own access-token refresh (same refresh token) must write through.
+      // b's own access-token refresh (same refresh token, newer expiry — the shape
+      // every real refresh has) must write through.
       const b = mk('.claude-b', 'b@example.com', TOKEN_B);
       const refreshed = JSON.stringify({
-        claudeAiOauth: { accessToken: 'ACCESS_B2', refreshToken: 'REFRESH_B' },
+        claudeAiOauth: { accessToken: 'ACCESS_B2', refreshToken: 'REFRESH_B', expiresAt: 99 },
       });
       const wd = mk('wd', 'b@example.com', refreshed);
       await refreshStore({ name: 'b', dir: b, email: 'b@example.com' }, wd);
       assert.equal(fs.readFileSync(path.join(b, '.credentials.json'), 'utf8'), refreshed);
+    });
+  });
+
+  it('refuses an OLDER same-lineage copy (store-watch flap guard, 0.9.9)', async () => {
+    await withHomeAsync(async (home, mk) => {
+      // Store holds b's refreshed grant; a lagging window still carries the older
+      // access token of the SAME lineage. Writing it through would regress the
+      // store — and with every window watching the store, two idle windows would
+      // re-trigger each other and flap it indefinitely. It must be refused.
+      const refreshed = JSON.stringify({
+        claudeAiOauth: { accessToken: 'ACCESS_B2', refreshToken: 'REFRESH_B', expiresAt: 99 },
+      });
+      const b = mk('.claude-b', 'b@example.com', refreshed);
+      const wd = mk('wd', 'b@example.com', TOKEN_B); // expiresAt: 1 — older, same lineage
+      await refreshStore({ name: 'b', dir: b, email: 'b@example.com' }, wd);
+      assert.equal(
+        fs.readFileSync(path.join(b, '.credentials.json'), 'utf8'),
+        refreshed,
+        'store keeps the newer grant'
+      );
     });
   });
 });
@@ -275,6 +297,80 @@ describe('materialize (force overwrites a foreign token under a matching identit
       const wrote = materialize({ name: 'b', dir: bStore, email: 'b@example.com' }, wd, false);
       assert.equal(wrote, false);
       assert.equal(fs.readFileSync(path.join(wd, '.credentials.json'), 'utf8'), TOKEN_A);
+    });
+  });
+});
+
+describe('restockTokenOnly (silent stale-token restock, 0.9.9)', () => {
+  it('copies ONLY the credential file — the dir keeps its live .claude.json', () => {
+    withHome((home, mk) => {
+      const store = mk('.claude-a', 'a@example.com', GRANT_NEW);
+      const wd = mk('wd', 'a@example.com', GRANT_OLD);
+      // Live per-project state a frozen store copy must never revert.
+      const liveConfig = JSON.stringify({
+        oauthAccount: { emailAddress: 'a@example.com' },
+        projects: { '/p': { trusted: true } },
+      });
+      fs.writeFileSync(path.join(wd, '.claude.json'), liveConfig);
+      assert.ok(restockTokenOnly(store, wd));
+      assert.equal(fs.readFileSync(path.join(wd, '.credentials.json'), 'utf8'), GRANT_NEW);
+      assert.equal(fs.readFileSync(path.join(wd, '.claude.json'), 'utf8'), liveConfig);
+    });
+  });
+
+  it('returns false and leaves the dir untouched when the store has no token', () => {
+    withHome((home, mk) => {
+      const store = path.join(home, '.claude-empty');
+      fs.mkdirSync(store, { recursive: true });
+      const wd = mk('wd', 'a@example.com', GRANT_OLD);
+      assert.equal(restockTokenOnly(store, wd), false);
+      assert.equal(fs.readFileSync(path.join(wd, '.credentials.json'), 'utf8'), GRANT_OLD);
+    });
+  });
+
+  it('creates a missing working dir and reports success only with a token in place', () => {
+    withHome((home, mk) => {
+      const store = mk('.claude-a', 'a@example.com', GRANT_NEW);
+      const wd = path.join(home, 'wd-new');
+      assert.ok(restockTokenOnly(store, wd));
+      assert.equal(fs.readFileSync(path.join(wd, '.credentials.json'), 'utf8'), GRANT_NEW);
+    });
+  });
+
+  it('CAS: bails when the dir token rotated since the verdict (a /login raced in)', () => {
+    withHome((home, mk) => {
+      const store = mk('.claude-a', 'a@example.com', GRANT_NEW);
+      // Verdict was made on GRANT_OLD, but a fresh login (TOKEN_B) landed since.
+      const wd = mk('wd', 'b@example.com', TOKEN_B);
+      assert.equal(restockTokenOnly(store, wd, Buffer.from(GRANT_OLD)), false);
+      assert.equal(
+        fs.readFileSync(path.join(wd, '.credentials.json'), 'utf8'),
+        TOKEN_B,
+        'the raced-in login is preserved'
+      );
+    });
+  });
+
+  it('CAS: bails when the dir was emptied since the verdict (a /logout raced in)', () => {
+    withHome((home, mk) => {
+      const store = mk('.claude-a', 'a@example.com', GRANT_NEW);
+      const wd = mk('wd', 'a@example.com', GRANT_OLD);
+      fs.rmSync(path.join(wd, '.credentials.json'));
+      assert.equal(restockTokenOnly(store, wd, Buffer.from(GRANT_OLD)), false);
+      assert.equal(
+        fs.existsSync(path.join(wd, '.credentials.json')),
+        false,
+        'a revoked token is never resurrected'
+      );
+    });
+  });
+
+  it('CAS: proceeds when the dir still holds exactly the judged grant', () => {
+    withHome((home, mk) => {
+      const store = mk('.claude-a', 'a@example.com', GRANT_NEW);
+      const wd = mk('wd', 'a@example.com', GRANT_OLD);
+      assert.ok(restockTokenOnly(store, wd, Buffer.from(GRANT_OLD)));
+      assert.equal(fs.readFileSync(path.join(wd, '.credentials.json'), 'utf8'), GRANT_NEW);
     });
   });
 });

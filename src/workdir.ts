@@ -28,9 +28,11 @@ import { writeFileAtomic, copyFileAtomic, withLockAsync } from './fsSafe';
  *   • "which window signed in?" is answered by construction — the one whose
  *     working dir changed hands. No heuristics, no shared state, no races.
  *
- * The duplicated credentials this implies are safe, and that is not an
- * assumption: verified against the live API that copies of a token authenticate
- * independently, and that refreshing one does not invalidate the other.
+ * The duplicated credentials this implies are safe for ACCESS: copies of a token
+ * authenticate independently (verified against the live API). But they are not
+ * safe forever — Anthropic ROTATES the refresh token on refresh, so the first
+ * copy to refresh strands every other copy of that grant (0.9.3's store
+ * newest-wins and 0.9.9's silent stale restock exist to manage exactly that).
  */
 
 /** workspaceState key holding this window's working-dir id (folderless windows). */
@@ -211,6 +213,58 @@ export function isStaleAgainstStore(candidate: Buffer, reference: Buffer): boole
 }
 
 /**
+ * Copies ONLY the credential file from an account store into a working dir —
+ * never the store's frozen `.claude.json`, which would revert the window's live
+ * per-project state. Used to quietly bring a window whose grant another window
+ * rotated past back onto the live token: file only, no process kill, no reload
+ * (the running Claude Code may keep its in-memory copy until restart — the
+ * status bar carries the "reload if it errors" note). Returns true only when the
+ * dir actually holds credentials afterwards.
+ *
+ * `expected` is a compare-and-swap guard on the DIR file: the caller's staleness
+ * verdict was made from a snapshot taken before awaits (store-lock contention can
+ * stall the reconcile for seconds). If the dir changed underneath — a /login
+ * rotated it to another account, or a /logout emptied it — overwriting would
+ * clobber the fresh sign-in or resurrect a revoked token, so bail; the account
+ * watcher re-fires reconcile on the new state and it is judged afresh.
+ *
+ * `source` as a Buffer writes exactly those bytes — callers that tripwire-check
+ * the store grant first pass the checked buffer, so the write can never pick up
+ * a store rewrite the check didn't see. A string is a store dir to read from.
+ */
+export function restockTokenOnly(
+  source: string | Buffer,
+  workingDir: string,
+  expected?: Buffer
+): boolean {
+  try {
+    // Hold the grant bytes in memory and write exactly them: an exists-then-copy
+    // pair could no-op on a store deleted in between while the old file still made
+    // the dir "look" credentialed — a false success that would fire the healed note
+    // for a window still on the dead grant.
+    const src = Buffer.isBuffer(source)
+      ? source
+      : fs.readFileSync(path.join(source, '.credentials.json'));
+    const dst = path.join(workingDir, '.credentials.json');
+    if (expected) {
+      let cur: Buffer;
+      try {
+        cur = fs.readFileSync(dst);
+      } catch {
+        return false; // emptied since the verdict (logout) — never resurrect
+      }
+      if (!cur.equals(expected)) return false; // rotated since the verdict (new login)
+    }
+    fs.mkdirSync(workingDir, { recursive: true, mode: 0o700 });
+    writeFileAtomic(dst, src, { mode: 0o600 });
+    return true;
+  } catch (err) {
+    log(`workdir: could not restock token into ${workingDir}: ${(err as Error).message}`);
+    return false;
+  }
+}
+
+/**
  * Cross-account contamination tripwire. Returns the path of another account
  * store that already holds this exact OAuth grant under a DIFFERENT identity, or
  * null.
@@ -298,23 +352,24 @@ export async function refreshStore(account: Account, workingDir: string): Promis
         if (fs.existsSync(dst)) {
           const cur = fs.readFileSync(dst);
           if (cur.equals(incoming)) return;
-          // Never regress the store. A same-lineage refresh (same refresh token)
-          // always writes through. A DIFFERENT grant is adopted only when it is a
-          // VALID grant (parseable expiry) AND either the store's current grant is
-          // unparseable/invalid or the incoming is strictly newer. This stops the
-          // multi-window flap (two windows writing divergent copies every reconcile)
-          // and refuses a corrupt/older/equal copy — while still letting a valid
-          // grant repair an unparseable store.
-          if (!sameCredential(incoming, cur)) {
-            const inExp = tokenExpiry(incoming);
-            const curExp = tokenExpiry(cur);
-            const adopt = inExp != null && (curExp == null || inExp > curExp);
-            if (!adopt) {
-              log(
-                `workdir: kept store of ${account.email ?? account.name} — incoming grant is not confirmably newer`
-              );
-              return;
-            }
+          // Never regress the store — same lineage or not. A grant is adopted only
+          // when it is VALID (parseable expiry) AND either the store's current
+          // grant is unparseable or the incoming is strictly newer. A same-lineage
+          // in-place access refresh has a newer expiry, so it still writes through;
+          // an OLDER same-lineage copy (another window's lagging duplicate) is
+          // refused — with every window now watching the store (0.9.9), a
+          // write-through of older copies would let two idle windows re-trigger
+          // each other and flap the store indefinitely. Refusing keeps the store
+          // quiescent (a refused write changes nothing, so no watcher re-fires)
+          // while a valid grant can still repair an unparseable store.
+          const inExp = tokenExpiry(incoming);
+          const curExp = tokenExpiry(cur);
+          const adopt = inExp != null && (curExp == null || inExp > curExp);
+          if (!adopt) {
+            log(
+              `workdir: kept store of ${account.email ?? account.name} — incoming grant is not confirmably newer`
+            );
+            return;
           }
         }
         const conflict = foreignTokenConflict(account.dir, incoming, account.email);

@@ -242,6 +242,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
 
   const statusBar = new StatusBarManager(registry, binding, usage);
+  // Reconcile quietly restocked this window's rotated-away token (file only, no
+  // reload) — surface it inline in the tooltip so an auth error, if Claude Code's
+  // in-memory copy still bites, is a one-reload non-mystery.
+  wizard.onStaleRestock = () => statusBar.noteStaleRestock();
   context.subscriptions.push(
     { dispose: () => cutover.dispose() },
     vscode.workspace.onDidChangeConfiguration((e) => {
@@ -490,17 +494,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   statusBar.initialize();
 
   // When this window's account state changes on disk (a /login or /logout inside
-  // this window, or a forget from another one), reconcile: mirror the token into
-  // its shadow copy, save a newly-seen account, and — if a sign-in landed on top
+  // this window, a forget from another one, or another window rotating the bound
+  // account's STORE grant), reconcile: mirror the token into its shadow copy, save
+  // a newly-seen account, restock a stale grant, and — if a sign-in landed on top
   // of the account this dir held — move the new account into a dir of its own and
   // restore the displaced one. Then repaint the bar so it never lags behind.
-  const watcher = new AccountWatcher(binding, () =>
-    // Returned (not voided) so the watcher can re-read the fingerprint after the
-    // reconcile settles — the latch must reflect any in-place repair it made.
-    wizard
-      .reconcile()
-      .catch((e) => log(`reconcile failed: ${e instanceof Error ? e.message : String(e)}`))
-      .finally(() => statusBar.reconfirm())
+  const watcher = new AccountWatcher(
+    binding,
+    () =>
+      // Returned (not voided) so the watcher can re-read the fingerprint after the
+      // reconcile settles — the latch must reflect any in-place repair it made.
+      wizard
+        .reconcile()
+        .catch((e) => log(`reconcile failed: ${e instanceof Error ? e.message : String(e)}`))
+        .finally(() => statusBar.reconfirm()),
+    () => {
+      const name = binding.getActiveName();
+      return name ? registry.get(name)?.dir : undefined;
+    }
   );
   watcher.start();
   context.subscriptions.push(watcher);

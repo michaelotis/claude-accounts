@@ -122,4 +122,20 @@ describe('accountFingerprint', () => {
     writeIdentity(dir, 'a@x.COM');
     assert.equal(accountFingerprint(dir, home), before);
   });
+
+  it('changes when the account STORE grant rotates (another window refreshed)', () => {
+    const dir = freshDir();
+    const home = path.join(dir, 'home.claude.json');
+    const storeCreds = path.join(freshDir(), '.credentials.json');
+    writeIdentity(dir, 'a@x.com');
+    fs.writeFileSync(path.join(dir, '.credentials.json'), JSON.stringify({ t: 'GRANT_A' }));
+    fs.writeFileSync(storeCreds, JSON.stringify({ t: 'GRANT_A' }));
+    const before = accountFingerprint(dir, home, storeCreds);
+    const beforeWithoutStore = accountFingerprint(dir, home);
+    // Another window rotates the store grant; this dir's own files are untouched.
+    fs.writeFileSync(storeCreds, JSON.stringify({ t: 'GRANT_A_ROTATED' }));
+    assert.notEqual(accountFingerprint(dir, home, storeCreds), before);
+    // Without the store component the rotation is invisible — the watch matters.
+    assert.equal(accountFingerprint(dir, home), beforeWithoutStore);
+  });
 });
