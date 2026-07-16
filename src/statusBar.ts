@@ -28,6 +28,8 @@ export class StatusBarManager implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   /** True while a user-initiated Refresh Usage is fetching (spinner + tooltip note). */
   private refreshing = false;
+  /** Set when this window's stale token was quietly restocked; cleared by reload. */
+  private staleTokenNote = false;
 
   constructor(
     private readonly registry: AccountRegistry,
@@ -94,6 +96,17 @@ export class StatusBarManager implements vscode.Disposable {
   /** Show/clear the inline "updating usage…" spinner + tooltip note (Refresh Usage). */
   setRefreshing(on: boolean): void {
     this.refreshing = on;
+    this.render();
+  }
+
+  /**
+   * Inline note: another window rotated this account's token and reconcile
+   * restocked this window's copy. The running Claude Code may hold the old grant
+   * in memory until restart, so tell the user what to do IF it errors — in the
+   * tooltip, never a toast, never an automatic reload. Cleared by window reload.
+   */
+  noteStaleRestock(): void {
+    this.staleTokenNote = true;
     this.render();
   }
 
@@ -216,11 +229,16 @@ export class StatusBarManager implements vscode.Disposable {
         : this.usage.isRateLimited(dir)
           ? '⚠ _Usage API is rate-limiting — showing the last known figures; retrying shortly._'
           : '';
+      const staleNote = this.staleTokenNote
+        ? '$(info) _Your sign-in was refreshed in another window and this window picked up the ' +
+          'new token. If Claude Code still reports an auth error, reload this window once._'
+        : '';
       this.item.tooltip = this.card([
         `**${email}**${usage?.planLabel ? ` · ${usage.planLabel}` : ''}${
           usage?.orgName ? ` · ${usage.orgName}` : ''
         }`,
         freshness,
+        staleNote,
         formatUsageTooltip(usage ?? null),
         `This window runs this account. Other windows can run others at the same time.`,
         `Accounts saved: **${unique.length}**${
@@ -237,6 +255,10 @@ export class StatusBarManager implements vscode.Disposable {
       this.item.backgroundColor = undefined;
       this.renderMetricItems(usage);
     } else if (notLoggedIn) {
+      // A logout ends the "your token was restocked earlier" storyline — without
+      // this, a later re-login would resurrect a note about a grant that no longer
+      // exists.
+      this.staleTokenNote = false;
       const wasEmail = readIdentity(dir)?.email;
       this.item.text = '$(account) Claude: sign in';
       this.item.tooltip = this.card([

@@ -21,6 +21,7 @@ export class AccountWatcher implements vscode.Disposable {
   private readonly watched: string[] = [];
   private timer?: NodeJS.Timeout;
   private dir = '';
+  private storeCredsFile?: string;
   private lastFingerprint = '';
 
   constructor(
@@ -32,7 +33,14 @@ export class AccountWatcher implements vscode.Disposable {
      * that restamps the identity must not leave the pre-repair value latched, or a
      * repeat of the same bad write would compare equal and be ignored).
      */
-    private readonly onIdentityChange: () => void | Promise<unknown>
+    private readonly onIdentityChange: () => void | Promise<unknown>,
+    /**
+     * Durable store dir of the account this window is bound to, if any. Watching
+     * the STORE's credential file is what lets this window notice that another
+     * window rotated the shared grant (the trigger for the silent stale-token
+     * restock) within a poll tick, instead of waiting for the next focus edge.
+     */
+    private readonly storeDir?: () => string | undefined
   ) {}
 
   start(): void {
@@ -52,16 +60,28 @@ export class AccountWatcher implements vscode.Disposable {
     // until the next reload; focus reconcile covers the gap).
     const dir = this.binding.getEnvDir() ?? defaultSourceDir();
     this.dir = dir;
-    this.lastFingerprint = accountFingerprint(dir);
+    // Resolved once, like the env dir: an account switch reloads the window, so a
+    // fresh start() re-resolves it (same known edge as above for suppressed reloads).
+    const store = this.storeDir?.();
+    this.storeCredsFile =
+      store && path.normalize(store) !== path.normalize(dir)
+        ? path.join(store, '.credentials.json')
+        : undefined;
+    this.lastFingerprint = this.fingerprint();
     const files = new Set<string>([
       path.join(dir, '.claude.json'),
       path.join(os.homedir(), '.claude.json'),
       path.join(dir, '.credentials.json'),
     ]);
+    if (this.storeCredsFile) files.add(this.storeCredsFile);
     for (const f of files) {
       fs.watchFile(f, { interval: 2000 }, () => this.schedule());
       this.watched.push(f);
     }
+  }
+
+  private fingerprint(): string {
+    return accountFingerprint(this.dir, undefined, this.storeCredsFile);
   }
 
   private schedule(): void {
@@ -71,7 +91,7 @@ export class AccountWatcher implements vscode.Disposable {
       // during a turn — only fire when the ACCOUNT state (identity email or
       // credential bytes) actually changed, or every write cascades into a
       // reconcile + usage refresh + policy write.
-      const fp = accountFingerprint(this.dir);
+      const fp = this.fingerprint();
       if (fp === this.lastFingerprint) return;
       this.lastFingerprint = fp;
       // A synchronous throw would escape the timer callback before Promise.resolve
@@ -86,7 +106,7 @@ export class AccountWatcher implements vscode.Disposable {
         // Latch what the handler LEFT on disk, not what triggered it: reconcile may
         // have repaired a drifted identity in place, and latching the pre-repair
         // value would make a repeat of the same bad write look like "no change".
-        this.lastFingerprint = accountFingerprint(this.dir);
+        this.lastFingerprint = this.fingerprint();
       });
     }, 400);
   }

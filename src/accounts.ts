@@ -86,28 +86,33 @@ export function hasCredentials(dir: string): boolean {
 
 /**
  * Content fingerprint of the account state the AccountWatcher guards: this dir's
- * identity email, the home-root identity email, and the credential grant bytes.
- * Claude Code rewrites .claude.json every few seconds during a turn (project
- * state, history), so mtime is useless as a change signal — only these fields
- * mean the ACCOUNT changed (login, logout, forget, token rotation).
+ * identity email, the home-root identity email, the dir's credential grant
+ * bytes, and — when the window is bound to a saved account — the account STORE's
+ * credential bytes. Claude Code rewrites .claude.json every few seconds during a
+ * turn (project state, history), so mtime is useless as a change signal — only
+ * these fields mean the ACCOUNT changed (login, logout, forget, token rotation).
+ * The store component is what lets a window notice that ANOTHER window rotated
+ * the shared grant, instead of waiting for the next focus edge.
  * homeIdentityFile is injectable for tests only.
  */
 export function accountFingerprint(
   dir: string,
-  homeIdentityFile = path.join(os.homedir(), '.claude.json')
+  homeIdentityFile = path.join(os.homedir(), '.claude.json'),
+  storeCredsFile?: string
 ): string {
   const own = readIdentity(dir)?.email?.toLowerCase() ?? '';
   const home = readIdentityFile(homeIdentityFile)?.email?.toLowerCase() ?? '';
-  let creds = '';
-  try {
-    creds = crypto
-      .createHash('sha1')
-      .update(fs.readFileSync(path.join(dir, '.credentials.json')))
-      .digest('hex');
-  } catch {
-    // Absent or unreadable credentials = signed out; the empty string is that state.
-  }
-  return `${own}|${home}|${creds}`;
+  const hash = (file: string): string => {
+    try {
+      return crypto.createHash('sha1').update(fs.readFileSync(file)).digest('hex');
+    } catch {
+      // Absent or unreadable credentials = signed out; the empty string is that state.
+      return '';
+    }
+  };
+  const creds = hash(path.join(dir, '.credentials.json'));
+  const store = storeCredsFile ? hash(storeCredsFile) : '';
+  return `${own}|${home}|${creds}|${store}`;
 }
 
 /** Expands a leading ~ to the home directory. */

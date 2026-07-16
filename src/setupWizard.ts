@@ -12,6 +12,7 @@ import {
   refreshStore,
   allWorkingDirs,
   materialize,
+  restockTokenOnly,
   syncMcpServers,
   linkUserSettings,
   foreignTokenConflict,
@@ -48,6 +49,14 @@ export class SetupWizard {
     private readonly binding: WindowBinding,
     private readonly context: vscode.ExtensionContext
   ) {}
+
+  /**
+   * Fired after reconcile quietly restocks this window's stale token file from
+   * the store (another window rotated the grant). The extension surfaces it as
+   * an inline status-bar note — the running Claude Code may still hold the dead
+   * grant in memory until its next restart, and we never reload for it.
+   */
+  onStaleRestock?: (email?: string) => void;
 
   /**
    * The ONLY way any flow in this extension reloads the window.
@@ -445,15 +454,32 @@ export class SetupWizard {
       // cross-contaminate; refreshStore also carries the tripwire as defence in
       // depth). And keep Claude Code's own default dir signed in as this account, so
       // losing the extension never leaves the user signed out — UNLESS this dir holds
-      // a STALE grant (an older copy another window already rotated past). Mirroring a
-      // stale grant would regress ~/.claude (the vanilla-Claude-Code safety net) to a
-      // dead token, so skip the mirror while stale. ~/.claude is re-mirrored by whichever
-      // window still holds the live grant; this stale window can't refresh the rotated-
-      // away grant itself, so it recovers via Switch Account or a fresh /login.
+      // a STALE grant (an older copy another window already rotated past): that dir
+      // is restocked from the store (token file only, no process kill, no reload —
+      // 0.9.7 retired those), and the mirror stays skipped either way. Mirroring from
+      // this window could push a just-superseded grant over ~/.claude during a
+      // concurrent rotation; the window that holds the live grant keeps ~/.claude
+      // fresh, exactly as before 0.9.9.
       await refreshStore(account, dir);
       const storeTok = this.readToken(account.dir);
       if (ndTok && storeTok && isStaleAgainstStore(ndTok, storeTok)) {
-        log(`reconcile: dir grant is stale vs store — not mirroring the stale grant to default`);
+        // Defence in depth against the dual-home blind spot: never pull a store
+        // grant that also lives in ANOTHER account's store (a contaminated store
+        // must not spread through the heal path).
+        const storeForeign = foreignTokenConflict(account.dir, storeTok, email);
+        if (storeForeign) {
+          log(
+            `reconcile: store grant for ${email} also lives in ${storeForeign} — refusing to restock`
+          );
+        } else if (restockTokenOnly(storeTok, dir, ndTok)) {
+          // A running Claude Code may hold the dead grant in memory until its next
+          // restart, so the status bar shows a "reload if it errors" note instead
+          // of us interrupting anything.
+          log(`reconcile: dir grant was stale vs store — restocked live token (file only)`);
+          this.onStaleRestock?.(email);
+        } else {
+          log(`reconcile: dir grant is stale vs store and restock was not applied`);
+        }
       } else {
         mirrorToDefault(dir, readIdentity(dir));
       }
