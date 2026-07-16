@@ -475,6 +475,59 @@ export function syncMcpServers(workingDir: string): void {
  * so a change made anywhere applies everywhere. A real per-window settings.json is
  * backed up to `settings.json.bak` before we take over, so nothing is lost.
  */
+/**
+ * User-scope Claude Code asset dirs shared into every managed window. Claude Code
+ * looks these up under CLAUDE_CONFIG_DIR, so without the links a user's personal
+ * skills/agents/commands exist only in ~/.claude and silently vanish in managed
+ * windows. Deliberately NOT plugins/: Claude Code writes live state there
+ * (marketplaces, caches) and sharing it would race across windows; plugin assets
+ * materialize per-window on their own. hooks/ needs no link — the shared
+ * settings.json references hooks by absolute path.
+ */
+const USER_ASSET_DIRS = ['skills', 'agents', 'commands'];
+
+/**
+ * Symlinks ~/.claude/{skills,agents,commands} into a managed working dir, same
+ * pattern as linkUserSettings: link when the source exists, never when the
+ * working dir IS ~/.claude, one-time .bak rename for a real local dir. Unlike
+ * settings.json (where the shared file is authoritative and a superseded local
+ * copy is deleted), a real local DIR that reappears after its .bak was taken is
+ * left alone and logged — these are user-authored files; the LINKING path never
+ * deletes a directory of them. (Uninstall still removes working dirs wholesale,
+ * .bak included — per-window leftovers, never the ~/.claude sources.)
+ */
+export function linkUserAssets(workingDir: string): void {
+  let home: string;
+  try {
+    home = path.join(os.homedir(), '.claude');
+    if (path.normalize(workingDir) === path.normalize(home)) return; // source itself
+  } catch {
+    return;
+  }
+  for (const name of USER_ASSET_DIRS) {
+    try {
+      const src = path.join(home, name);
+      if (!fs.existsSync(src)) continue; // nothing to share (yet)
+      const dst = path.join(workingDir, name);
+      const st = fs.lstatSync(dst, { throwIfNoEntry: false });
+      if (st?.isSymbolicLink()) {
+        if (path.normalize(fs.readlinkSync(dst)) === path.normalize(src)) continue;
+        fs.unlinkSync(dst); // stale link elsewhere — replace with ours
+      } else if (st) {
+        const bak = `${dst}.bak`;
+        if (fs.existsSync(bak)) {
+          log(`workdir: ${dst} exists alongside its .bak — leaving both, not linking ${name}`);
+          continue;
+        }
+        fs.renameSync(dst, bak);
+      }
+      fs.symlinkSync(src, dst);
+    } catch (err) {
+      log(`workdir: could not link ${name} into ${workingDir}: ${(err as Error).message}`);
+    }
+  }
+}
+
 export function linkUserSettings(workingDir: string): void {
   try {
     const src = path.join(os.homedir(), '.claude', 'settings.json');

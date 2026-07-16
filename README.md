@@ -12,6 +12,7 @@ Multi-account **Claude Code** for **Linux / WSL / Remote-SSH**: live usage (5h /
 | **Failover when an account is hot**  | Status-bar meter shows the pressure; optional **post-turn** panel cutover switches accounts when a turn settles (never mid-stream)                                                                                    |
 | **Keep one conversation history**    | Shared history store so multi-account does not fragment or hide past chats                                                                                                                                            |
 | **Keep your MCP servers & settings** | User-scope `mcpServers` (from `~/.claude.json`) are merged into each window, and your `~/.claude/settings.json` (auto-compact, model, hooks, …) is shared into every window, so both apply under per-window isolation |
+| **Keep your skills everywhere**      | Your personal `~/.claude/skills`, `agents`, and `commands` are linked into every window, so they work in every account (`plugins/` stays per-window — Claude Code manages live state there)                           |
 
 Upstream credit: [Parallel Accounts](https://github.com/DercasDrol/claude-parallel-profiles) + usage patterns from [Claudemeter](https://github.com/hyperi-io/claudemeter) (both MIT). See `NOTICE`.
 
@@ -24,7 +25,7 @@ Upstream credit: [Parallel Accounts](https://github.com/DercasDrol/claude-parall
 | **macOS / native Windows Claude**                  | Linux semantics only. Use a **WSL or Linux remote** window; inert elsewhere.                                                                                                                                 |
 | **Replacing Parallel Accounts on Windows UI host** | `extensionKind: workspace` on purpose (avoids UI-host bugs under WSL). Install on the remote/WSL side.                                                                                                       |
 | **Minting OAuth sessions / API proxy**             | Claude Code owns login. We copy credentials into per-window dirs; the usage meter may **refresh access tokens** with the stored refresh token so the poll stays valid — we do not act as an Anthropic proxy. |
-| **Project memory / CLAUDE.md / skills**            | Unrelated. Use Claude Code and your own repo docs.                                                                                                                                                           |
+| **Project memory / CLAUDE.md**                     | Repo-scoped by Claude Code itself; unrelated to accounts. (Personal `~/.claude` skills/agents/commands ARE shared — see above.)                                                                              |
 | **Hiding usage from Anthropic**                    | Meter reads the same usage the product exposes; failover only picks which **saved account** runs next.                                                                                                       |
 
 Supported model for more quota: **finish the turn → cut over or open another window on a cool account** — not transparent context merge.
@@ -192,6 +193,7 @@ Legacy `primaryEmail` / `secondaryEmail` still seed `accountOrder` if that list 
 - Refuses Windows `/mnt/c` config paths for usage
 - Resolves Linux `claude` only for `auth status`
 - Does **not** mint OAuth sessions (Claude Code owns login); usage poll may refresh access tokens via the stored refresh token
+- Same account in several windows: a token refresh in one window rotates the grant; the others quietly re-stock their **token file** from the account store (no reload, no popup — the tooltip explains if Claude Code errors once before its next restart)
 - **Forget** still signs out that **email** everywhere — use carefully
 - Shared history is for **not losing chats**, not consolidating identity/context across accounts
 
