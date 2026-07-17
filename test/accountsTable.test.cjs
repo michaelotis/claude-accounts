@@ -36,6 +36,7 @@ function snap(overrides = {}) {
     planLabel: null,
     fetchedAt: Date.now(),
     configDir: '/tmp/x',
+    ...overrides,
   };
 }
 
@@ -51,7 +52,11 @@ describe('formatAccountsTable', () => {
     assert.match(lines[2], /^\| \*\*motis\*\* • \| /, 'active row bolded + marked');
     assert.match(lines[2], /\*\*62%\*\* 1h \d+m/, 'percent bold with inline reset');
     assert.match(lines[2], /\*\*55%\*\*/, 'fable percent present');
-    assert.match(lines[3], /^\| michaelotis \| /, 'secondary row unmarked');
+    assert.match(
+      lines[3],
+      /^\| michaelotis \| \*\*10%\*\*/,
+      'secondary row unmarked, override applied'
+    );
   });
 
   it('escapes pipes and markdown-active characters in labels', () => {
