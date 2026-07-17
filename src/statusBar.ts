@@ -3,18 +3,37 @@ import { AccountRegistry, readIdentity, hasCredentials } from './accounts';
 import { log } from './log';
 import { WindowBinding } from './binding';
 import { defaultSourceDir } from './capture';
-import { UsageMonitor, formatUsageBar, formatUsageTooltip, type UsageSnapshot } from './usage';
+import {
+  UsageMonitor,
+  formatUsageBar,
+  formatAccountsTable,
+  type AccountUsageRow,
+  type UsageSnapshot,
+} from './usage';
 
 /** Marketplace / local id — hover links to the extension page when published. */
 const EXTENSION_ID = 'michaelotis.claude-accounts';
 
 const ERROR_BG = new vscode.ThemeColor('statusBarItem.errorBackground');
 const WARN_BG = new vscode.ThemeColor('statusBarItem.warningBackground');
+/** Tooltip rows older than this get a "(stale)" hint (2× the background tier). */
+const STALE_ROW_MS = 10 * 60_000;
+
+/** Compact "12s" / "3m" / "1h 05m" age for the tooltip's Refreshed line. */
+function formatAgo(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${String(m % 60).padStart(2, '0')}m`;
+}
 
 /**
- * Status bar: active account + usage (5h / 7d / Fable…) for THIS window.
- * Usage is read via OAuth API against the window's CLAUDE_CONFIG_DIR only —
- * never a Windows Claude binary.
+ * Status bar: active account + usage (5h / 7d / Fable…) for THIS window, plus an
+ * all-accounts table in the tooltip. Usage comes from the machine-wide shared
+ * cache (one coordinated fetch per account, any window) — never a Windows
+ * Claude binary.
  *
  * Account name is one item; each usage metric is its own item so only the
  * over-threshold number gets a warning/error background (VS Code cannot
@@ -89,7 +108,9 @@ export class StatusBarManager implements vscode.Disposable {
   }
 
   reconfirm(): void {
-    void this.usage.refresh(this.effectiveDir());
+    // Repaint only. Focus/reconcile used to force a usage refresh here, which
+    // multiplied fetch attempts across windows; the central poll + cache watcher
+    // own data freshness now, and a repaint reads the shared result.
     this.refresh();
   }
 
@@ -192,6 +213,34 @@ export class StatusBarManager implements vscode.Disposable {
     }
   }
 
+  /**
+   * Rows for the all-accounts tooltip table: the window's own account first,
+   * then every other saved account, each with its last-known snapshot from the
+   * shared cache (fed machine-wide by whichever window fetched it).
+   */
+  private accountRows(activeEmail: string): AccountUsageRow[] {
+    const byEmail = this.usage.getAllCachedByEmail();
+    const activeLower = activeEmail.toLowerCase();
+    const rows: AccountUsageRow[] = [];
+    const seen = new Set<string>();
+    const push = (emailLower: string, label: string, active: boolean) => {
+      if (!emailLower || seen.has(emailLower)) return;
+      seen.add(emailLower);
+      const snap = byEmail.get(emailLower) ?? null;
+      const stale = Boolean(snap && snap.fetchedAt && Date.now() - snap.fetchedAt > STALE_ROW_MS);
+      rows.push({ label, active, snap, stale });
+    };
+    const activeAccount = this.registry.savedForEmail(activeEmail);
+    push(activeLower, activeAccount?.name ?? activeEmail.split('@')[0], true);
+    const others = this.registry
+      .listUniqueByEmail()
+      .map((a) => ({ a, email: (this.registry.emailOf(a) || '').toLowerCase() }))
+      .filter((x) => x.email && x.email !== activeLower)
+      .sort((x, y) => x.a.name.localeCompare(y.a.name));
+    for (const { a, email } of others) push(email, a.name, false);
+    return rows;
+  }
+
   private render(): void {
     const dir = this.effectiveDir();
     const active = this.binding.getActiveName();
@@ -233,19 +282,19 @@ export class StatusBarManager implements vscode.Disposable {
         ? '$(info) _Your sign-in was refreshed in another window and this window picked up the ' +
           'new token. If Claude Code still reports an auth error, reload this window once._'
         : '';
+      const refreshedLine =
+        usage && usage.fetchedAt
+          ? `_Refreshed ${formatAgo(Date.now() - usage.fetchedAt)} ago_`
+          : '';
       this.item.tooltip = this.card([
         `**${email}**${usage?.planLabel ? ` · ${usage.planLabel}` : ''}${
           usage?.orgName ? ` · ${usage.orgName}` : ''
         }`,
         freshness,
         staleNote,
-        formatUsageTooltip(usage ?? null),
-        `This window runs this account. Other windows can run others at the same time.`,
-        `Accounts saved: **${unique.length}**${
-          this.binding.rememberedForFolder()
-            ? ' · _auto-selected: this folder used it last time_'
-            : ''
-        }`,
+        formatAccountsTable(this.accountRows(email)),
+        refreshedLine,
+        this.binding.rememberedForFolder() ? '_auto-selected: this folder used it last time_' : '',
         !isSaved
           ? '_$(circle-outline) Not saved yet — saving lets you switch back to it later._'
           : '',

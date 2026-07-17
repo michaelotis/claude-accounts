@@ -16,7 +16,13 @@ import { WindowBinding } from './binding';
 import { SetupWizard } from './setupWizard';
 import { log } from './log';
 import { TurnWatcher } from './turnWatcher';
-import { fetchUsage, type UsageSnapshot } from './usage';
+import {
+  BACKGROUND_TTL_MS,
+  fetchUsageCoordinated,
+  getUsageFromCache,
+  usageCacheKey,
+  type UsageSnapshot,
+} from './usage';
 import {
   selectFailoverAccount,
   needsFailover,
@@ -38,6 +44,13 @@ const PENDING_KEY = 'claudeAccounts.pendingIdleCutover';
 /** Min ms between automatic idleReload cutovers (survives reload). */
 const AUTO_COOLDOWN_KEY = 'claudeAccounts.lastAutoCutoverAt';
 const AUTO_COOLDOWN_MS = 5 * 60_000;
+/**
+ * How stale a cached snapshot may be for a cutover decision — tied to the
+ * central poll's background tier: that is the freshness the poll actually
+ * guarantees for every saved account. Anything older is "unknown", which
+ * excludes the account rather than treating it as cool or hot.
+ */
+const CUTOVER_SNAP_MAX_AGE_MS = BACKGROUND_TTL_MS;
 /** Repeat the idle "usage high" log line at most this often while pressure persists. */
 const HIGH_LOG_THROTTLE_MS = 10 * 60_000;
 
@@ -132,8 +145,17 @@ export class IdleCutoverController {
     this.evaluating = true;
     try {
       const currentDir = this.binding.getEnvDir() ?? defaultSourceDir();
-      const currentSnap = await fetchUsage(currentDir);
-      if (!currentSnap || !needsFailover(currentSnap, this.thresholds, this.triggers)) {
+      // Cache-only: a threshold decision tolerates minutes-old figures, and this
+      // path fires on every turn-transition while hot — it must never hit the
+      // network or the backoff log. The central poll owns freshness.
+      const currentSnap = getUsageFromCache(usageCacheKey(currentDir), CUTOVER_SNAP_MAX_AGE_MS);
+      if (!currentSnap) {
+        // No cached data yet (fresh activation / long 429) — keep pending and wait
+        // for the poll to land; the next pressure or idle edge re-evaluates.
+        log('cutover: no fresh usage snapshot yet — keeping pending');
+        return;
+      }
+      if (!needsFailover(currentSnap, this.thresholds, this.triggers)) {
         this.pending = false;
         await this.context.workspaceState.update(PENDING_KEY, false);
         log('cutover: no longer needs failover — cleared pending');
@@ -142,11 +164,9 @@ export class IdleCutoverController {
       const reasons = [currentSnap.email ?? '', ...hint].filter(Boolean);
 
       // Meter-only: there's nothing to switch to compute, so skip picking a cooler
-      // account entirely. pickNextAccount fan-fetches /api/oauth/usage for EVERY
-      // registered account, and it ran on every pressure event while the active
-      // account was hot — piling cross-account calls onto the same rate budget right
-      // as the account climbed to its limit. The status-bar meter already shows the
-      // pressure; the user switches manually. Only idleReload needs the pick.
+      // account entirely (it's cache reads now, but still pointless work on every
+      // pressure event). The status-bar meter already shows the pressure; the user
+      // switches manually. Only idleReload needs the pick.
       if (this.panelMode !== 'idleReload') {
         this.pending = false;
         await this.context.workspaceState.update(PENDING_KEY, false);
@@ -179,10 +199,44 @@ export class IdleCutoverController {
 
       const nextEmail = this.registry.emailOf(next) ?? next.name;
 
-      // pickNextAccount above fetches every account and can take seconds; re-check the
-      // mode in case the user turned off idleReload mid-evaluation (mirrors the busy
-      // re-check below, which guards the same async gap).
+      // Re-check the mode in case the user turned off idleReload mid-evaluation
+      // (mirrors the busy re-check below, which guards the same async gap).
       if (this.panelMode !== 'idleReload') {
+        this.pending = false;
+        await this.context.workspaceState.update(PENDING_KEY, false);
+        return;
+      }
+
+      // The pick came from the shared cache, which may be minutes old for an idle
+      // account — an auto-switch (a window RELOAD) must not land on an account
+      // that heated up since. Re-validate the target with ONE coordinated fetch
+      // (cache-fresh within a minute, else a single locked network call).
+      const fresh = await fetchUsageCoordinated(
+        { dir: next.dir, email: nextEmail },
+        { freshForMs: 60_000 }
+      );
+      const freshSnap = fresh.result.ok ? fresh.result.snap : null;
+      // FAIL CLOSED on recency: a lock-skip or backoff serves best-effort, which
+      // can be an old snap or literal zeros — and zeros read as maximally cool.
+      // Only a snapshot demonstrably from the last ~90s may authorize a switch.
+      const isRecent = Boolean(freshSnap && Date.now() - freshSnap.fetchedAt <= 90_000);
+      const stillCool =
+        isRecent &&
+        freshSnap &&
+        accountIsCool(
+          {
+            id: nextEmail,
+            email: nextEmail,
+            dir: next.dir,
+            sessionPercent: freshSnap.sessionPercent,
+            weeklyPercent: freshSnap.weeklyPercent,
+            fablePercent: freshSnap.modelLimits.find((m) => /fable/i.test(m.name))?.percent ?? null,
+          },
+          this.thresholds,
+          this.triggers
+        );
+      if (!stillCool) {
+        log(`cutover: target ${nextEmail} is no longer cool on a live check — staying put`);
         this.pending = false;
         await this.context.workspaceState.update(PENDING_KEY, false);
         return;
@@ -240,10 +294,12 @@ export class IdleCutoverController {
     for (const a of accounts) {
       const email = this.registry.emailOf(a);
       if (!email || !a.dir || !fs.existsSync(a.dir)) continue;
-      const snap = await fetchUsage(a.dir);
+      // Cache-only (the central poll keeps every saved account ≤5 min fresh):
+      // no data / too stale = unknown, not 100% — exclude from auto selection,
+      // exactly like the old fetch-failed rule. Never fan out network calls here.
+      const snap = getUsageFromCache(usageCacheKey(a.dir, email), CUTOVER_SNAP_MAX_AGE_MS);
       if (!snap) {
-        // Fetch failed — unknown, not 100%. Exclude from auto selection.
-        log(`cutover: skip ${email} (usage fetch failed)`);
+        log(`cutover: skip ${email} (no fresh cached usage)`);
         continue;
       }
       rows.push({

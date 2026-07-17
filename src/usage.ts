@@ -3,6 +3,7 @@
  * Workspace extension only (WSL/Linux) — never Windows UI host.
  */
 
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -14,6 +15,8 @@ import {
   buildSnapshot,
   formatUsageBar,
   formatUsageTooltip,
+  formatAccountsTable,
+  type AccountUsageRow,
   type FailoverThresholds,
   type FailoverTriggers,
   type FailoverStrategy,
@@ -30,9 +33,11 @@ import {
 } from './usageParse';
 
 export type { UsageSnapshot, FailoverThresholds, FailoverTriggers, FailoverStrategy };
+export type { AccountUsageRow };
 export {
   formatUsageBar,
   formatUsageTooltip,
+  formatAccountsTable,
   DEFAULT_THRESHOLDS,
   DEFAULT_TRIGGERS,
   DEFAULT_STRATEGY,
@@ -59,6 +64,15 @@ const CLAUDE_OAUTH_TOKEN_URL = 'https://console.anthropic.com/v1/oauth/token';
  * self-imposed guess, not a measured limit, and a real 429 still backs off below.
  */
 export const USAGE_CACHE_TTL_MS = 60_000;
+/**
+ * Freshness tier for accounts not active in this window. An account active in ANY
+ * window gets 60s freshness machine-wide from that window's cycle; accounts open
+ * nowhere still refresh every 5 min so the tooltip table stays meaningful. Total
+ * machine-wide budget: ~1 call/min per active account + ~1 per 5 min per idle one.
+ */
+export const BACKGROUND_TTL_MS = 300_000;
+/** Two manual refreshes within this window coalesce into one network call. */
+const FORCE_COALESCE_MS = 5_000;
 /**
  * After a poll 429, serve the last cache and don't re-poll for this long. Kept to a
  * single poll cycle: a longer freeze (this was 5 min) is exactly what left the meter
@@ -147,10 +161,43 @@ function writeCredsAtomic(configDir: string, creds: CredsFile): void {
   writeFileAtomic(file, JSON.stringify(creds, null, 2), { mode: 0o600 });
 }
 
-function cacheKeyForDir(configDir: string): string {
-  const email = readIdentity(configDir)?.email?.trim().toLowerCase();
+/**
+ * Stable machine-wide cache/lock key for an account. Email-keyed whenever the
+ * email is known — the registry hint wins over the dir's identity file, so a
+ * store with an unreadable identity still shares one key with its windows —
+ * else falls back to the dir path (window-private, no sharing possible anyway).
+ */
+export function usageCacheKey(configDir: string, emailHint?: string | null): string {
+  const email = (emailHint ?? readIdentity(configDir)?.email)?.trim().toLowerCase();
   if (email) return `email:${email}`;
   return `dir:${path.normalize(configDir)}`;
+}
+
+function cacheKeyForDir(configDir: string): string {
+  return usageCacheKey(configDir);
+}
+
+/**
+ * Machine-wide fetch lock for one account. Whichever window acquires it re-checks
+ * the shared cache under the lock and only then fetches — the TTL-recheck-under-
+ * lock IS the single-fetcher discipline; there is no standing leader to elect,
+ * crash-recover, or hand over. A dead holder's lock is reclaimed by PID liveness.
+ */
+function fetchLockFor(key: string): string {
+  const locks = path.join(policyDir(), 'locks');
+  try {
+    fs.mkdirSync(locks, { recursive: true, mode: 0o700 });
+  } catch {
+    /* creation races are fine; withLockAsync fails soft below */
+  }
+  // dir:-keyed accounts embed a whole path; cap the name well under NAME_MAX
+  // and keep it collision-safe with a content hash suffix.
+  const enc = encodeURIComponent(key);
+  const name =
+    enc.length > 120
+      ? `${enc.slice(0, 80)}-${crypto.createHash('sha1').update(key).digest('hex').slice(0, 16)}`
+      : enc;
+  return path.join(locks, `usage-fetch-${name}.lock`);
 }
 
 function readUsageCache(): UsageCacheFile {
@@ -211,6 +258,20 @@ function inRateLimitBackoff(key: string): boolean {
   return at > 0 && Date.now() - at < RATE_LIMIT_BACKOFF_MS;
 }
 
+/**
+ * One log line per backoff episode per process, latched on the 429 stamp itself —
+ * every caller that lands in the backoff branch used to log, which is how a
+ * single rate-limit turned into a wall of identical lines across windows.
+ */
+const backoffLoggedFor = new Map<string, number>();
+function logBackoffOnce(key: string): void {
+  const at = readMeta().rateLimitAt?.[key] || 0;
+  if (!at) return; // not actually in backoff (e.g. the lock-busy fallback path)
+  if (backoffLoggedFor.get(key) === at) return;
+  backoffLoggedFor.set(key, at);
+  log(`usage: rate-limit backoff active — serving best-effort for ${key}`);
+}
+
 function stampRateLimitBackoff(key: string): void {
   withLock(lockFor(metaPath()), () => {
     const m = readMeta();
@@ -235,6 +296,19 @@ function getCachedSnap(key: string, maxAgeMs: number): UsageSnapshot | null {
   if (!entry?.snap || typeof entry.fetchedAt !== 'number') return null;
   if (Date.now() - entry.fetchedAt > maxAgeMs) return null;
   return entry.snap;
+}
+
+/** Read-only view of one account's last cached snapshot (no network, no locks). */
+export function getUsageFromCache(key: string, maxAgeMs: number): UsageSnapshot | null {
+  return getCachedSnap(key, maxAgeMs);
+}
+
+/** All cached entries (read-only; for the tooltip table / cutover / watcher). */
+export function readUsageCacheEntries(): Record<
+  string,
+  { fetchedAt: number; key: string; snap: UsageSnapshot }
+> {
+  return readUsageCache().entries;
 }
 
 function getStaleSnap(key: string): UsageSnapshot | null {
@@ -556,10 +630,23 @@ export async function fetchUsageDetailed(
   // (2) Backoff after poll 429 — skip re-poll until window expires
   if (inRateLimitBackoff(key) && !opts.forceNetwork) {
     const snap = bestEffortSnap(dir, key);
-    log(`usage: rate-limit backoff active — serving best-effort for ${key}`);
+    logBackoffOnce(key);
     return { ok: true, snap: { ...snap, configDir: dir } };
   }
 
+  return fetchUsageNetwork(dir, key);
+}
+
+/**
+ * Steps 3–7 of the poll sequence: token, GET /usage, 401-retry, 429 stamp, parse
+ * + cache. No pre-checks — callers (fetchUsageDetailed legacy path and the
+ * coordinator) decide when a network call is warranted.
+ */
+async function fetchUsageNetwork(dir: string, key: string): Promise<UsageFetchResult> {
+  // The one permanent line at the network moment — with the coordinator, the
+  // union of every window's log shows ~one of these per account per TTL,
+  // machine-wide. Cache hits stay silent by design.
+  log(`usage: FETCH ${key} pid=${process.pid}`);
   // (3) PRELIMINARY call path: ensureFreshToken (OAuth refresh when near expiry)
   let token: string;
   try {
@@ -669,6 +756,102 @@ export async function fetchUsageDetailed(
 export async function fetchUsage(configDir?: string): Promise<UsageSnapshot | null> {
   const r = await fetchUsageDetailed(configDir);
   return r.ok ? r.snap : null;
+}
+
+export interface CoordinatedResult {
+  result: UsageFetchResult;
+  /** True only when THIS call performed the network fetch (drives policy writes). */
+  fromNetwork: boolean;
+}
+
+/**
+ * The central-repository fetch: at most one network call per account per TTL,
+ * machine-wide, no matter how many windows poll. Every window keeps its own
+ * jittered timer; whoever finds the shared cache stale takes the per-account
+ * fetch lock, RE-CHECKS the cache under it (another window may have fetched in
+ * between), and only then hits the network + writes the shared cache. Everyone
+ * else serves the cache; the cache-file watcher repaints them when it advances.
+ *
+ * Poll path skips if the lock stays busy for 5s (winner is already fetching;
+ * serve stale and let the watcher deliver). Manual path (forceNetwork) waits up
+ * to 15s, coalesces refreshes landing within FORCE_COALESCE_MS into one call,
+ * and past that ALSO skips — it never runs the network unlocked.
+ */
+export async function fetchUsageCoordinated(
+  target: { dir: string; email?: string | null },
+  opts: {
+    forceNetwork?: boolean;
+    freshForMs?: number;
+    /** Test seam: replaces the network step. */
+    _network?: (dir: string, key: string) => Promise<UsageFetchResult>;
+  } = {}
+): Promise<CoordinatedResult> {
+  const dir = resolveConfigDir(target.dir);
+  if (isWindowsPath(dir)) {
+    return {
+      result: failure(
+        'windows_path',
+        'Usage cannot use a Windows Claude path. Open this folder in a WSL/Linux window.'
+      ),
+      fromNetwork: false,
+    };
+  }
+  const key = usageCacheKey(dir, target.email);
+  const freshForMs = opts.freshForMs ?? USAGE_CACHE_TTL_MS;
+  const network = opts._network ?? fetchUsageNetwork;
+
+  const fromCache = (maxAgeMs: number): CoordinatedResult | null => {
+    const fresh = getCachedSnap(key, maxAgeMs);
+    return fresh
+      ? { result: { ok: true, snap: { ...fresh, configDir: dir } }, fromNetwork: false }
+      : null;
+  };
+  const bestEffort = (): CoordinatedResult => {
+    logBackoffOnce(key);
+    return {
+      result: { ok: true, snap: { ...bestEffortSnap(dir, key), configDir: dir } },
+      fromNetwork: false,
+    };
+  };
+
+  if (!opts.forceNetwork) {
+    const hit = fromCache(freshForMs);
+    if (hit) return hit;
+    if (inRateLimitBackoff(key)) return bestEffort();
+  }
+
+  // BOTH paths skip when the lock stays busy past capMs: without skipIfUnacquired,
+  // withLockAsync falls back to running the section UNLOCKED — a manual refresh
+  // during another window's slow fetch would run a second concurrent network call,
+  // the exact double-fetch this coordinator exists to prevent. A skipped caller
+  // serves the holder's result via the cache re-check below or the cache watcher.
+  // The manual path just waits longer before giving up. staleMs > worst-case hold
+  // (~50s: token refresh + usage + 401-retry) so a LIVE slow fetch is never
+  // reclaimed mid-flight; a dead holder is PID-reclaimed instantly.
+  const lockOpts = opts.forceNetwork
+    ? { capMs: 15_000, stepMs: 250, staleMs: 120_000, skipIfUnacquired: true }
+    : { capMs: 5_000, stepMs: 250, staleMs: 120_000, skipIfUnacquired: true };
+
+  const { locked, result } = await withLockAsync(
+    fetchLockFor(key),
+    async (): Promise<CoordinatedResult> => {
+      // Double-checked under the lock: the winner of the race we just lost may
+      // have already written a fresh entry. Forced refreshes coalesce within
+      // FORCE_COALESCE_MS (two humans clicking refresh in two windows = 1 call).
+      const recheck = fromCache(opts.forceNetwork ? FORCE_COALESCE_MS : freshForMs);
+      if (recheck) return recheck;
+      if (!opts.forceNetwork && inRateLimitBackoff(key)) return bestEffort();
+      const r = await network(dir, key);
+      return { result: r, fromNetwork: true };
+    },
+    lockOpts
+  );
+
+  if (locked && result) return result as CoordinatedResult;
+  // Lock stayed busy past capMs (poll or manual): the fetching window very likely
+  // finished while we waited — serve its result; else last-known, and the cache
+  // watcher repaints when the holder's write lands.
+  return fromCache(freshForMs) ?? bestEffort();
 }
 
 export interface PolicyAccount {
@@ -833,6 +1016,12 @@ export function prunePolicyEmails(emails: string[]): void {
 }
 
 export class UsageMonitor {
+  /**
+   * In-memory snapshots keyed by usageCacheKey (email:… / dir:…) — the SAME
+   * keying as the shared disk cache, so a snap fetched via the account store
+   * resolves for a status bar asking about the window's workdir, and the disk
+   * watcher can feed every account's entry into one map.
+   */
   private cache = new Map<string, UsageSnapshot | null>();
   private inflight = new Map<string, Promise<UsageSnapshot | null>>();
   /** Guards refreshAllAccounts against the interval re-entering a live run. */
@@ -854,14 +1043,20 @@ export class UsageMonitor {
   /** Map email → durable account store dir (not window workdir). */
   private storeDirForEmail?: (email: string) => string | undefined;
   private lastNotifyKey = '';
+  /** Cache-file watcher state (readers see other windows' fetches within ~2.4s). */
+  private cacheWatchTimer: NodeJS.Timeout | null = null;
+  private watchingCache = false;
+  private lastSeenFetchedAt = new Map<string, number>();
+
   /**
-   * Poll every registered account (not just this window's) each cycle. Only the
-   * auto-cutover target selection consumes that data, so it's off unless
-   * panelCutover=idleReload needs it. In meter-only mode every window polling every
-   * account just multiplied /api/oauth/usage calls and tripped 429 with nothing
-   * reading the result.
+   * Carries this window's workdir grant into the account store when the workdir
+   * holds the NEWER one (idempotent newest-wins; wired to refreshStore by the
+   * extension). MANDATORY store-lag guard: usage fetches run against the STORE
+   * token, and the CLI rotates the WORKDIR copy first — polling the store inside
+   * that ~2.4s lag would POST an already-rotated-away refresh token and raise a
+   * false "sign in again".
    */
-  private pollAllAccounts = false;
+  preSyncStore?: (email: string, workdir: string) => Promise<void>;
 
   /** Default poll cadence — matches USAGE_CACHE_TTL_MS. */
   constructor(private readonly intervalMs = USAGE_CACHE_TTL_MS) {}
@@ -875,7 +1070,6 @@ export class UsageMonitor {
     workspaceRoutes?: WorkspaceRoutePolicy[];
     nameByEmail?: Record<string, string>;
     storeDirForEmail?: (email: string) => string | undefined;
-    pollAllAccounts?: boolean;
   }): void {
     if (opts.thresholds) this.thresholds = opts.thresholds;
     if (opts.triggers) this.triggers = opts.triggers;
@@ -885,7 +1079,6 @@ export class UsageMonitor {
     if (opts.workspaceRoutes !== undefined) this.workspaceRoutes = opts.workspaceRoutes;
     if (opts.nameByEmail) this.nameByEmail = opts.nameByEmail;
     if (opts.storeDirForEmail) this.storeDirForEmail = opts.storeDirForEmail;
-    if (opts.pollAllAccounts !== undefined) this.pollAllAccounts = opts.pollAllAccounts;
   }
 
   getThresholds(): FailoverThresholds {
@@ -921,8 +1114,16 @@ export class UsageMonitor {
   }
 
   getCached(dir?: string): UsageSnapshot | null | undefined {
-    const d = resolveConfigDir(dir);
-    return this.cache.get(d);
+    return this.cache.get(usageCacheKey(resolveConfigDir(dir)));
+  }
+
+  /** Last-known snapshot per email (watcher-fed) — the tooltip table's rows. */
+  getAllCachedByEmail(): Map<string, UsageSnapshot> {
+    const out = new Map<string, UsageSnapshot>();
+    for (const [key, snap] of this.cache) {
+      if (snap && key.startsWith('email:')) out.set(key.slice('email:'.length), snap);
+    }
+    return out;
   }
 
   /**
@@ -973,31 +1174,76 @@ export class UsageMonitor {
 
   async refresh(dir?: string, forceNetwork = false): Promise<UsageSnapshot | null> {
     const d = resolveConfigDir(dir ?? this.currentDir);
-    const inflightKey = forceNetwork ? `${d}#force` : d;
+    // Fetch via the account STORE whenever one exists: one credentials file, one
+    // lock, one extension-driven rotation source per account. The workdir copy
+    // converges through the store-watch → restock chain; it is never the token
+    // the poll refreshes. Unbound/unsaved windows keep the workdir path.
+    const email = readIdentity(d)?.email ?? null;
+    const store = email ? this.storeDirForEmail?.(email) : undefined;
+    const fetchDir = store && path.normalize(store) !== path.normalize(d) ? store : d;
+    const key = usageCacheKey(fetchDir, email);
+    const inflightKey = forceNetwork ? `${key}#force` : key;
     const existing = this.inflight.get(inflightKey);
     if (existing) return existing;
-    const p = fetchUsageDetailed(d, { forceNetwork })
-      .then((result) => {
-        if (!result.ok) {
-          this.lastFailure = result.failure;
-          // Keep last good in-memory gauge if any (do not blank on 429).
-          if (!this.cache.get(d)) this.cache.set(d, null);
-          this.emit();
-          return null;
+    const p = (async (): Promise<UsageSnapshot | null> => {
+      if (fetchDir !== d && email && hasCredentials(d)) {
+        // Store-lag guard: never poll a store the CLI's rotation left behind.
+        try {
+          await this.preSyncStore?.(email, d);
+        } catch (err) {
+          log(`usage: pre-sync failed — ${err instanceof Error ? err.message : String(err)}`);
         }
-        this.lastFailure = null;
-        const snap = result.snap;
-        this.cache.set(d, snap);
-        const store = snap.email ? this.storeDirForEmail?.(snap.email) : undefined;
+      }
+      let { result, fromNetwork } = await fetchUsageCoordinated(
+        { dir: fetchDir, email },
+        { forceNetwork }
+      );
+      if (
+        !result.ok &&
+        result.failure.kind === 'token_rejected' &&
+        fetchDir !== d &&
+        email &&
+        hasCredentials(d)
+      ) {
+        // Store-lag race: the CLI can rotate the WORKDIR grant between our
+        // pre-sync and the store POST, making the store's refresh token look
+        // revoked. Carry the newer grant over and retry ONCE before surfacing —
+        // a genuinely revoked account fails the retry too and still escalates.
+        try {
+          await this.preSyncStore?.(email, d);
+        } catch (err) {
+          log(`usage: retry pre-sync failed — ${err instanceof Error ? err.message : String(err)}`);
+        }
+        ({ result, fromNetwork } = await fetchUsageCoordinated(
+          { dir: fetchDir, email },
+          { forceNetwork }
+        ));
+      }
+      if (!result.ok) {
+        this.lastFailure = result.failure;
+        // Keep last good in-memory gauge if any (do not blank on 429).
+        if (!this.cache.get(key)) this.cache.set(key, null);
+        this.emit();
+        return null;
+      }
+      this.lastFailure = null;
+      const snap = result.snap;
+      // The disk-cache watcher owns lastSeenFetchedAt — deliberately NOT stamped
+      // here: a wall-clock stamp taken after a racing window's write could mark
+      // that GENUINELY NEWER entry as already-seen and freeze this window on
+      // stale data for a whole tier. One redundant repaint per own fetch is the
+      // cheap alternative.
+      this.cache.set(key, snap);
+      if (fromNetwork) {
         const forPolicy = store ? { ...snap, configDir: store } : snap;
         this.policyWrite([forPolicy]);
-        this.emitPressure(snap);
-        this.emit();
-        return snap;
-      })
-      .finally(() => {
-        this.inflight.delete(inflightKey);
-      });
+      }
+      this.emitPressure(snap);
+      this.emit();
+      return snap;
+    })().finally(() => {
+      this.inflight.delete(inflightKey);
+    });
     this.inflight.set(inflightKey, p);
     return p;
   }
@@ -1017,77 +1263,101 @@ export class UsageMonitor {
   }
 
   private async refreshAllAccountsOnce(): Promise<void> {
-    // Meter-only mode: poll just this window's bound account. refresh() feeds the
-    // in-memory gauge, writes policy, and emits pressure for the active account —
-    // everything the meter needs — without touching the other accounts' APIs.
-    const listed = this.pollAllAccounts ? (this.listAccountsToPoll?.() ?? []) : [];
-    if (!listed.length) {
-      await this.refresh(this.currentDir);
-      return;
-    }
-    // One network path per email — duplicate dirs with the same token were
-    // hammering /api/oauth/usage and tripping 429.
-    const byEmail = new Map<string, { email: string; dir: string; name?: string }>();
-    for (const a of listed) {
-      if (!a.dir || !fs.existsSync(a.dir)) continue;
-      const em = (a.email || '').trim().toLowerCase();
-      if (!em) continue;
-      if (!byEmail.has(em)) byEmail.set(em, { email: a.email, dir: a.dir, name: a.name });
-    }
-    const snaps: UsageSnapshot[] = [];
-    let activeSnap: UsageSnapshot | null = null;
-    const activeDir = this.currentDir ? path.normalize(this.currentDir) : '';
+    // Active account first — refresh() resolves the store, runs the pre-sync
+    // guard, feeds the gauge, writes policy on a real fetch, and emits pressure.
     let activeEmail = '';
     if (this.currentDir) {
       activeEmail = (readIdentity(this.currentDir)?.email || '').trim().toLowerCase();
+      await this.refresh(this.currentDir);
     }
 
+    // Then every other saved account at the background tier. The shared fetch
+    // lock + TTL-recheck make this ~one network call per account per tier
+    // MACHINE-WIDE, no matter how many windows run this same loop.
+    const listed = this.listAccountsToPoll?.() ?? [];
+    const byEmail = new Map<string, { email: string; dir: string }>();
+    for (const a of listed) {
+      const em = (a.email || '').trim().toLowerCase();
+      if (!em || em === activeEmail) continue;
+      if (!a.dir || !fs.existsSync(a.dir) || !hasCredentials(a.dir)) continue;
+      if (!byEmail.has(em)) byEmail.set(em, { email: a.email, dir: a.dir });
+    }
+    const netSnaps: UsageSnapshot[] = [];
+    let changed = false;
     for (const a of byEmail.values()) {
-      const result = await fetchUsageDetailed(a.dir);
+      const { result, fromNetwork } = await fetchUsageCoordinated(
+        { dir: a.dir, email: a.email },
+        { freshForMs: BACKGROUND_TTL_MS }
+      );
       if (!result.ok) {
-        if (result.failure.kind === 'rate_limited') {
-          this.lastFailure = result.failure;
-          log(`usage: rate limited while polling — using cache only for remaining`);
-        }
-        // Still try cache-only for this email via fetchUsageDetailed (stale inside).
+        // Soft-fail: a background account must never raise the sign-in UI — its
+        // store heals via reconcile and the next cycle retries. Only the active
+        // account (refresh() above) escalates failures to lastFailure.
+        log(`usage: background poll ${a.email}: ${result.failure.kind} — skipped`);
         continue;
       }
-      const snap = result.snap;
-      const forPolicy = { ...snap, configDir: a.dir, email: snap.email || a.email };
-      if (!forPolicy.email) forPolicy.email = a.email;
-      snaps.push(forPolicy);
-      const em = (forPolicy.email || '').trim().toLowerCase();
-      if (em && em === activeEmail) activeSnap = forPolicy;
-      if (path.normalize(a.dir) === activeDir) activeSnap = forPolicy;
+      const snap = { ...result.snap, email: result.snap.email || a.email };
+      const key = usageCacheKey(a.dir, a.email);
+      this.cache.set(key, snap); // watcher owns lastSeenFetchedAt (see refresh())
+      changed = true;
+      if (fromNetwork) netSnaps.push(snap);
     }
+    if (netSnaps.length) this.policyWrite(netSnaps);
+    if (changed) this.emit();
+  }
 
-    // Active workdir may differ from store path — cache-first, no extra burst.
-    if (this.currentDir) {
-      const curResult = await fetchUsageDetailed(this.currentDir);
-      if (curResult.ok) {
-        const cur = curResult.snap;
-        // Feed the IN-MEMORY cache the status bar reads (getCached) — not just disk +
-        // policy. Without this a background poll fetched fresh figures and emit()'d,
-        // but the re-render read a stale in-memory snap, so the meter only ever moved
-        // on focus/manual refresh and could sit at an old percent for minutes.
-        this.cache.set(resolveConfigDir(this.currentDir), cur);
-        const store = cur.email ? this.storeDirForEmail?.(cur.email) : undefined;
-        activeSnap = store ? { ...cur, configDir: store } : cur;
-        if (activeSnap.email && !snaps.some((s) => s.email === activeSnap!.email)) {
-          snaps.push(activeSnap);
-        }
-        this.lastFailure = null;
-      } else if (curResult.failure.kind === 'rate_limited') {
-        this.lastFailure = curResult.failure;
-      }
+  /**
+   * Seed the in-memory map from the shared disk cache so the first paint after
+   * activation shows last-known figures for EVERY account before any fetch runs.
+   */
+  private hydrateFromDisk(): void {
+    for (const [key, entry] of Object.entries(readUsageCacheEntries())) {
+      if (!entry?.snap || typeof entry.fetchedAt !== 'number') continue;
+      this.lastSeenFetchedAt.set(key, entry.fetchedAt);
+      if (!this.cache.get(key)) this.cache.set(key, entry.snap);
     }
-    if (snaps.length) this.policyWrite(snaps);
-    if (activeSnap) this.emitPressure(activeSnap);
-    this.emit();
+  }
+
+  /**
+   * Readers' half of the central repository: watch the shared cache file and fold
+   * advanced entries into memory, so a fetch by ANY window repaints every window
+   * within ~2.4s (2s poll + debounce). Advance-only (fetchedAt must move); the
+   * fetching window accepts one redundant repaint of its own write — the watcher
+   * alone owns the latch, so a racing window's newer entry can never be missed.
+   */
+  private startCacheWatcher(): void {
+    this.watchingCache = true;
+    fs.watchFile(usageCachePath(), { interval: 2000 }, () => this.scheduleCacheRead());
+  }
+
+  private scheduleCacheRead(): void {
+    if (this.cacheWatchTimer) clearTimeout(this.cacheWatchTimer);
+    this.cacheWatchTimer = setTimeout(() => {
+      this.cacheWatchTimer = null;
+      if (!this.watchingCache) return;
+      const advanced = diffCacheAdvances(readUsageCacheEntries(), this.lastSeenFetchedAt);
+      if (!advanced.length) return;
+      for (const { key, fetchedAt, snap } of advanced) {
+        this.lastSeenFetchedAt.set(key, fetchedAt);
+        this.cache.set(key, snap);
+      }
+      this.emit();
+    }, 400);
+  }
+
+  private stopCacheWatcher(): void {
+    this.watchingCache = false;
+    if (this.cacheWatchTimer) {
+      clearTimeout(this.cacheWatchTimer);
+      this.cacheWatchTimer = null;
+    }
+    fs.unwatchFile(usageCachePath());
   }
 
   start(getDir: () => string | undefined): void {
     this.stop();
+    this.hydrateFromDisk();
+    this.startCacheWatcher();
     this.polling = true;
     const gen = ++this.pollGen;
     const runAndReschedule = () => {
@@ -1115,6 +1385,7 @@ export class UsageMonitor {
 
   stop(): void {
     this.polling = false;
+    this.stopCacheWatcher();
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -1126,4 +1397,23 @@ export class UsageMonitor {
     this.listeners.clear();
     this.cache.clear();
   }
+}
+
+/**
+ * Pure diff of the shared cache against what a window has already seen — the
+ * watcher folds in only entries whose fetchedAt ADVANCED, so identical rewrites
+ * and a window's own just-recorded fetches never cause an extra repaint.
+ */
+export function diffCacheAdvances(
+  entries: Record<string, { fetchedAt: number; snap: UsageSnapshot }>,
+  lastSeen: ReadonlyMap<string, number>
+): { key: string; fetchedAt: number; snap: UsageSnapshot }[] {
+  const out: { key: string; fetchedAt: number; snap: UsageSnapshot }[] = [];
+  for (const [key, entry] of Object.entries(entries)) {
+    if (!entry?.snap || typeof entry.fetchedAt !== 'number') continue;
+    if (entry.fetchedAt > (lastSeen.get(key) ?? 0)) {
+      out.push({ key, fetchedAt: entry.fetchedAt, snap: entry.snap });
+    }
+  }
+  return out;
 }
