@@ -57,11 +57,18 @@ function snapFor(email, session = 10) {
   };
 }
 
-/** Fresh isolated HOME per test (policyDir/usage-cache live under it). */
+/**
+ * Fresh isolated HOME per test (policyDir/usage-cache live under it). Also holds
+ * a REF'D keepalive interval for the test's duration: withLockAsync's wait
+ * sleeps on unref'd timers (correct in the extension — never hold the host
+ * open), but under node:test an unref'd timer lets the event loop drain
+ * mid-await and cancels the whole file ("promise still pending").
+ */
 async function withHome(fn) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ca-central-home-'));
   const prev = process.env.HOME;
   process.env.HOME = home;
+  const keepalive = setInterval(() => {}, 50);
   try {
     const dir = path.join(home, 'wd');
     fs.mkdirSync(dir, { recursive: true });
@@ -71,6 +78,7 @@ async function withHome(fn) {
     );
     return await fn({ home, dir });
   } finally {
+    clearInterval(keepalive);
     process.env.HOME = prev;
     try {
       fs.rmSync(home, { recursive: true, force: true });
