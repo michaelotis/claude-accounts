@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.9.11
+
+### Changed
+- **Usage is a central repository now: one fetch per account machine-wide.** Every
+  window used to poll usage — and refresh OAuth tokens — against its own private copy
+  of the account, so N windows meant N pollers and N independent token refreshes.
+  Anthropic rotates the refresh token on every refresh, so those parallel refreshes
+  kept stranding each other's copies (the "OAuth session expired" churn) and piled
+  onto one rate budget (the 429s). Now whichever window finds the shared cache stale
+  takes a per-account lock, re-checks under it, fetches once, and writes the shared
+  cache; every other window just reads it, and a cache watcher repaints all windows
+  within a couple of seconds of any fetch. For saved accounts, token refreshes run
+  against the account STORE's credentials — one extension-driven rotation source per
+  account (an unsaved window still uses its own copy); window copies converge through
+  the 0.9.9 store-watch restock. Note: windows still on older versions keep the old
+  per-window behavior until reloaded, so update every window promptly.
+- **Every saved account is polled again — once, centrally.** The 0.9.6 change stopped
+  cross-account polling because every window was doing it; with the central fetcher
+  it costs one call per account (active accounts each minute, idle ones every five),
+  so the tooltip can show all accounts without rate pressure. Cutover target picks
+  and turn-transition checks read the shared cache and never touch the network.
+- **Tooltip is a compact all-accounts table.** Account | 5h | 7d | Fable, one row per
+  saved account with reset countdowns inline — including your secondary account — in
+  place of the old multi-paragraph block. The toolbar's four items are unchanged.
+
+### Fixed
+- "rate-limit backoff active" now logs once per backoff episode instead of per call,
+  and focus/reconcile no longer trigger usage fetches at all (repaint only).
+
 ## 0.9.10
 
 ### Added

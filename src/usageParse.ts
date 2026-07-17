@@ -406,6 +406,58 @@ export function formatUsageBar(u: UsageSnapshot | null | undefined): string {
   return parts.join(' · ');
 }
 
+/** One tooltip-table row: an account's label and its last-known snapshot. */
+export interface AccountUsageRow {
+  /** Registry short name (falls back to email). */
+  label: string;
+  /** True for the window's own account — bolded and marked in the table. */
+  active: boolean;
+  /** Last-known snapshot, or null when nothing has been fetched yet. */
+  snap: UsageSnapshot | null;
+  /** Render a staleness hint next to the label (data older than its tier). */
+  stale?: boolean;
+}
+
+/**
+ * Markdown-table cells break on raw pipes, and stray emphasis characters in an
+ * account name would mangle the row — escape everything markdown-active.
+ */
+function escapeTableCell(s: string): string {
+  return s.replace(/[\\|*_`[\]]/g, (c) => `\\${c}`);
+}
+
+/**
+ * The all-accounts usage table for the status-bar tooltip: one row per saved
+ * account — `| Account | 5h | 7d | Fable |` — percents bold with each bucket's
+ * reset countdown inline. Compact by design: this replaces the old multi-
+ * paragraph per-account block.
+ */
+export function formatAccountsTable(rows: AccountUsageRow[]): string {
+  const cell = (percent: number | null | undefined, resetsAt: string | null | undefined) => {
+    if (percent == null) return '—';
+    const reset = formatReset(resetsAt ?? null);
+    return `**${percent}%**${reset ? ` ${reset}` : ''}`;
+  };
+  const lines = ['| Account | 5h | 7d | Fable |', '| --- | --- | --- | --- |'];
+  for (const row of rows) {
+    const name = escapeTableCell(row.label);
+    const label = `${row.active ? `**${name}** •` : name}${row.stale ? ' _(stale)_' : ''}`;
+    if (!row.snap) {
+      lines.push(`| ${label} | — | — | — |`);
+      continue;
+    }
+    const s = row.snap;
+    const fable = s.modelLimits.find((m) => /fable/i.test(m.name));
+    lines.push(
+      `| ${label} | ${cell(s.sessionPercent, s.sessionResetsAt)} | ${cell(
+        s.weeklyPercent,
+        s.weeklyResetsAt
+      )} | ${fable ? cell(fable.percent, fable.resetsAt) : '—'} |`
+    );
+  }
+  return lines.join('\n');
+}
+
 export function formatUsageTooltip(u: UsageSnapshot | null | undefined): string {
   if (!u) return '_Usage unavailable — sign in with Claude Code, or wait for refresh._';
   const lines: string[] = [];

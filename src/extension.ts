@@ -9,7 +9,7 @@ import { SetupWizard, NOTICE_KEY } from './setupWizard';
 import { ensureSharedHistory } from './sharedHistory';
 import { defaultSourceDir } from './capture';
 import { AccountWatcher } from './accountWatcher';
-import { allWorkingDirs, foreignTokenConflict } from './workdir';
+import { allWorkingDirs, foreignTokenConflict, refreshStore } from './workdir';
 import { log, showLog } from './log';
 import { UsageMonitor, writePolicyCache, type WorkspaceRoutePolicy } from './usage';
 import { isSidecarConfigDir } from './sidecars';
@@ -111,6 +111,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return registry.list().find((a) => normalizeEmail(registry.emailOf(a) || a.email) === want);
   };
 
+  // Store-lag guard for the central usage poll: usage fetches run against the
+  // account STORE token, but the CLI rotates the WORKDIR copy first — carry a
+  // newer workdir grant into the store (newest-wins no-op otherwise) before the
+  // poll can POST a rotated-away refresh token and false-alarm a sign-out.
+  usage.preSyncStore = async (email, workdir) => {
+    const account = accountByEmail(email);
+    if (account?.dir) await refreshStore(account, workdir);
+  };
+
   /** Settings routes + learned folder→account map (from prior Switch Account). */
   const buildWorkspaceRoutes = (): WorkspaceRoutePolicy[] => {
     const cfg = vscode.workspace.getConfiguration('claudeAccounts');
@@ -144,7 +153,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const applyUsageSettings = () => {
     const cfg = vscode.workspace.getConfiguration('claudeAccounts');
     const mode = cfg.get<'off' | 'notify'>('failover.mode', 'notify');
-    const panelMode = cfg.get<PanelCutoverMode>('failover.panelCutover', 'notify');
     const routes = buildWorkspaceRoutes();
     const thresholds = {
       session: cfg.get<number>('failover.sessionThreshold', 90),
@@ -181,9 +189,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       workspaceRoutes: routes,
       nameByEmail,
       storeDirForEmail: (email) => accountByEmail(email)?.dir,
-      // Only auto-cutover (idleReload) reads other accounts' usage; in meter-only
-      // mode each window polls just its own account (no cross-account 429 pressure).
-      pollAllAccounts: panelMode === 'idleReload',
     });
     writePolicyCache({
       mode,
