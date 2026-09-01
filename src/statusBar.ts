@@ -195,6 +195,18 @@ export class StatusBarManager implements vscode.Disposable {
     this.weeklyItem.tooltip = this.item.tooltip;
     this.fableItem.tooltip = this.item.tooltip;
 
+    // fetchedAt 0 is emptySnap / never-fetched — 0% would look like a real reading.
+    if (usage.fetchedAt === 0) {
+      this.sessionItem.text = '5h –';
+      this.sessionItem.backgroundColor = undefined;
+      this.sessionItem.show();
+      this.weeklyItem.text = '7d –';
+      this.weeklyItem.backgroundColor = undefined;
+      this.weeklyItem.show();
+      this.fableItem.hide();
+      return;
+    }
+
     this.sessionItem.text = `5h ${usage.sessionPercent}%`;
     this.sessionItem.backgroundColor = this.metricBackground(usage.sessionPercent, 65);
     this.sessionItem.show();
@@ -226,7 +238,9 @@ export class StatusBarManager implements vscode.Disposable {
     const push = (emailLower: string, label: string, active: boolean) => {
       if (!emailLower || seen.has(emailLower)) return;
       seen.add(emailLower);
-      const snap = byEmail.get(emailLower) ?? null;
+      const cached = byEmail.get(emailLower) ?? null;
+      // fetchedAt 0 is emptySnap / never-fetched — the table's null path renders "—".
+      const snap = cached && cached.fetchedAt !== 0 ? cached : null;
       const stale = Boolean(snap && snap.fetchedAt && Date.now() - snap.fetchedAt > STALE_ROW_MS);
       rows.push({ label, active, snap, stale });
     };
@@ -273,19 +287,25 @@ export class StatusBarManager implements vscode.Disposable {
           : '',
       ].filter(Boolean);
 
+      const rateNote =
+        !usage || usage.fetchedAt === 0
+          ? '⚠ _Usage API is rate-limiting — retrying shortly._'
+          : '⚠ _Usage API is rate-limiting — showing the last known figures; retrying shortly._';
       const freshness = this.refreshing
         ? '⟳ _Updating usage…_'
         : this.usage.isRateLimited(dir)
-          ? '⚠ _Usage API is rate-limiting — showing the last known figures; retrying shortly._'
+          ? rateNote
           : '';
       const staleNote = this.staleTokenNote
         ? '$(info) _Your sign-in was refreshed in another window and this window picked up the ' +
           'new token. If Claude Code still reports an auth error, reload this window once._'
         : '';
       const refreshedLine =
-        usage && usage.fetchedAt
-          ? `_Refreshed ${formatAgo(Date.now() - usage.fetchedAt)} ago_`
-          : '';
+        usage && usage.fetchedAt === 0
+          ? '_Usage not fetched yet — the first poll is pending or failed; see the log._'
+          : usage && usage.fetchedAt
+            ? `_Refreshed ${formatAgo(Date.now() - usage.fetchedAt)} ago_`
+            : '';
       this.item.tooltip = this.card([
         `**${email}**${usage?.planLabel ? ` · ${usage.planLabel}` : ''}${
           usage?.orgName ? ` · ${usage.orgName}` : ''
@@ -363,20 +383,21 @@ export class StatusBarManager implements vscode.Disposable {
       await vscode.commands.executeCommand('claudeProfiles.captureAccount');
       return;
     }
-    // Single account: show usage detail
+    // Single account: show usage detail. A never-fetched snap (fetchedAt 0) is
+    // not a real reading — same message as a missing cache, then kick a refresh.
     const u = this.usageFor(dir);
-    if (u) {
+    if (!u || u.fetchedAt === 0) {
+      vscode.window.showInformationMessage(
+        `${email} is your only saved account. To add another: /login as it in Claude Code. Usage will appear after refresh.`
+      );
+      void this.usage.refresh(dir);
+    } else {
       vscode.window.showInformationMessage(
         `${email}: ${formatUsageBar(u)}` +
           (u.modelLimits.length
             ? ` · models: ${u.modelLimits.map((m) => `${m.name} ${m.percent}%`).join(', ')}`
             : '')
       );
-    } else {
-      vscode.window.showInformationMessage(
-        `${email} is your only saved account. To add another: /login as it in Claude Code. Usage will appear after refresh.`
-      );
-      void this.usage.refresh(dir);
     }
   }
 

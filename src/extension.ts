@@ -9,7 +9,12 @@ import { SetupWizard, NOTICE_KEY } from './setupWizard';
 import { ensureSharedHistory } from './sharedHistory';
 import { defaultSourceDir } from './capture';
 import { AccountWatcher } from './accountWatcher';
-import { allWorkingDirs, foreignTokenConflict, refreshStore } from './workdir';
+import {
+  allWorkingDirs,
+  foreignTokenConflict,
+  refreshStore,
+  sweepStaleWorkingLocks,
+} from './workdir';
 import { log, showLog } from './log';
 import { UsageMonitor, writePolicyCache, type WorkspaceRoutePolicy } from './usage';
 import { isSidecarConfigDir } from './sidecars';
@@ -190,7 +195,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       nameByEmail,
       storeDirForEmail: (email) => accountByEmail(email)?.dir,
     });
-    writePolicyCache({
+    void writePolicyCache({
       mode,
       thresholds,
       triggers,
@@ -332,6 +337,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Pick up any accounts already logged in on disk, then re-resolve the folder
   // route (discovery may have added the mapped email) and bind again if needed.
   await registry.discoverAndMerge();
+  try {
+    sweepStaleWorkingLocks();
+  } catch (err) {
+    log(`could not sweep stale working locks: ${(err as Error).message}`);
+  }
   const preferredAfter = resolveFolderPreferred();
   if (preferredAfter?.account) {
     const workDir = binding.workingDir();

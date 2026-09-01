@@ -71,14 +71,14 @@ In a **WSL** VS Code window:
 
 ### Pushing updates (maintainers)
 
+Every change lands through a pull request. Bump `package.json` and add the `## X.Y.Z` section to `CHANGELOG.md` in that PR; once it is merged, tag the release from a clean, up-to-date `main`:
+
 ```bash
-# commit your changes first, then:
-npm run ship          # patch bump → tag vX.Y.Z → push → GH Release + VSIX
-npm run ship -- minor
-npm run ship -- 0.6.0
+git checkout main && git pull
+npm run ship          # tags v<package.json version> and pushes only the tag
 ```
 
-CI runs tests on every push to `main`. Tag `v*` builds the VSIX and attaches it to a [GitHub Release](https://github.com/michaelotis/claude-accounts/releases).
+`ship.sh` refuses unless HEAD equals `origin/main`, the tree is clean, the changelog has the matching section, and the tag does not exist yet. Tag `v*` builds the VSIX and attaches it to a [GitHub Release](https://github.com/michaelotis/claude-accounts/releases). CI runs tests on every pull request and on every push to `main`.
 
 Status bar example:
 
