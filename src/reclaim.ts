@@ -183,6 +183,32 @@ export function claudeSessionsByDir(): Map<string, number[]> {
 }
 
 /**
+ * Working directories of live `claude` processes bound to `dir`, read from
+ * `/proc/<pid>/cwd`. Empty when /proc is unavailable or no matching process
+ * is running. Used to scope turn-activity walks to this window's project slugs
+ * instead of the shared store.
+ */
+export function claudeCwdsForDir(dir: string): string[] {
+  const target = path.normalize(dir);
+  const cwds = new Set<string>();
+  let pids: string[];
+  try {
+    pids = fs.readdirSync('/proc').filter((p) => /^\d+$/.test(p));
+  } catch {
+    return []; // no /proc on this platform
+  }
+  for (const pid of pids) {
+    if (configDirForPid(pid) !== target) continue;
+    try {
+      cwds.add(fs.readlinkSync(path.join('/proc', pid, 'cwd')));
+    } catch {
+      /* process gone or cwd unreadable */
+    }
+  }
+  return [...cwds];
+}
+
+/**
  * Interrupts every live `claude` session running against any of the given dirs,
  * so a forceful forget leaves no process alive on a just-deleted token. Uses
  * SIGKILL on purpose: on a graceful SIGTERM shutdown Claude Code flushes its

@@ -61,6 +61,9 @@ export class IdleCutoverController {
   private evaluating = false;
   private lastHighLogAt = 0;
   private startupTimer: ReturnType<typeof setTimeout> | undefined;
+  private started = false;
+  private watching = false;
+  private disposed = false;
 
   private panelMode: PanelCutoverMode = 'off';
   private thresholds: FailoverThresholds = { ...DEFAULT_THRESHOLDS };
@@ -76,7 +79,9 @@ export class IdleCutoverController {
     private readonly wizard: SetupWizard,
     getConfigDir: () => string | undefined
   ) {
-    this.watcher = new TurnWatcher(getConfigDir);
+    this.watcher = new TurnWatcher(getConfigDir, {
+      getFallbackCwds: () => (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
+    });
     this.watcher.onBusy = () => {
       this.busy = true;
     };
@@ -100,12 +105,18 @@ export class IdleCutoverController {
     if (opts.strategy) this.strategy = opts.strategy;
     if (opts.accountOrder !== undefined) this.accountOrder = opts.accountOrder;
     if (opts.workspaceRoutes) this.workspaceRoutes = opts.workspaceRoutes;
+    if (this.started) {
+      if (this.panelMode === 'idleReload' && !this.watching) this.startWatcher();
+      else if (this.panelMode !== 'idleReload' && this.watching) this.stopWatcher();
+    }
   }
 
   start(): void {
+    this.started = true;
     this.pending = Boolean(this.context.workspaceState.get(PENDING_KEY));
-    this.watcher.start();
-    // If we restored pending and already idle, evaluate (no busy→idle edge)
+    if (this.panelMode === 'idleReload') this.startWatcher();
+    // If we restored pending and already idle, evaluate (no busy→idle edge).
+    // Watcher is stopped (phase idle) unless panelMode is idleReload.
     this.startupTimer = setTimeout(() => {
       this.startupTimer = undefined;
       if (this.pending && this.watcher.getPhase() === 'idle' && !this.busy) {
@@ -113,6 +124,18 @@ export class IdleCutoverController {
       }
     }, 2_000);
     if (typeof this.startupTimer.unref === 'function') this.startupTimer.unref();
+  }
+
+  private startWatcher(): void {
+    if (this.watching) return;
+    this.watcher.start();
+    this.watching = true;
+  }
+
+  private stopWatcher(): void {
+    this.watcher.stop();
+    this.busy = false;
+    this.watching = false;
   }
 
   /** Call when usage sees failover pressure — independent of failover.mode. */
@@ -215,6 +238,13 @@ export class IdleCutoverController {
         { dir: next.dir, email: nextEmail },
         { freshForMs: 60_000 }
       );
+      if (this.disposed) return; // keep pending persisted so a reload can resume it
+      if (!this.watching || this.panelMode !== 'idleReload') {
+        this.pending = false;
+        await this.context.workspaceState.update(PENDING_KEY, false);
+        log('cutover: idleReload turned off during evaluation — staying put');
+        return;
+      }
       const freshSnap = fresh.result.ok ? fresh.result.snap : null;
       // FAIL CLOSED on recency: a lock-skip or backoff serves best-effort, which
       // can be an old snap or literal zeros — and zeros read as maximally cool.
@@ -266,6 +296,13 @@ export class IdleCutoverController {
       this.pending = false;
       await this.context.workspaceState.update(PENDING_KEY, false);
       await this.context.workspaceState.update(AUTO_COOLDOWN_KEY, now);
+      // The two state writes above yield to the event loop: a mode change or
+      // dispose that landed meanwhile has already stopped the watcher, so this
+      // is the last gate before the reload.
+      if (this.disposed || !this.watching || this.panelMode !== 'idleReload') {
+        log('cutover: idleReload turned off before switch — staying put');
+        return;
+      }
       log(`cutover: idleReload → ${nextEmail}`);
       void vscode.window.setStatusBarMessage(
         `Claude Accounts: switching to ${nextEmail} after idle turn…`,
@@ -333,10 +370,12 @@ export class IdleCutoverController {
   }
 
   dispose(): void {
+    this.disposed = true;
+    this.started = false;
     if (this.startupTimer !== undefined) {
       clearTimeout(this.startupTimer);
       this.startupTimer = undefined;
     }
-    this.watcher.dispose();
+    this.stopWatcher();
   }
 }
