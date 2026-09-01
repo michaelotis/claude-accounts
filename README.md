@@ -150,7 +150,7 @@ Never switches mid-stream. Watches session file activity + `claude` processes; w
 | **`off`**               | No panel cutover                                                                                   |
 
 Workspace routes still **block** auto panel cutover.  
-Turn idle is inferred from **this window’s** session/project file activity (not other windows; process-alone is not “busy”).
+Turn idle is inferred from **this window’s own** transcripts only: the watcher finds this window’s live `claude` processes, maps their working directories to `projects/<slug>`, and looks for recent writes there (workspace folders are the fallback). Other windows’ activity never counts, and a live process alone is not “busy”. The watcher runs only while `panelCutover` is `idleReload`.
 
 ### Strategy (how to pick among many accounts)
 
