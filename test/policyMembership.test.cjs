@@ -40,11 +40,16 @@ describe('writePolicyCache membership (credentials on disk)', () => {
   let prevHome;
   let keepDir;
   let dropDir;
+  let keepalive;
 
   before(() => {
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'ca-policy-'));
     prevHome = process.env.HOME;
     process.env.HOME = tmpHome;
+    // REF'D keepalive: withLockAsync waits on unref'd timers (correct in the
+    // extension — never hold the host open), but under node:test an unref'd
+    // timer lets the event loop drain mid-await ("promise still pending").
+    keepalive = setInterval(() => {}, 50);
     // Intentionally do NOT pre-create ~/.config/claude-accounts: the first write
     // must create it through the lock path, guarding the fresh-machine case.
     keepDir = path.join(tmpHome, '.claude-keep');
@@ -56,6 +61,7 @@ describe('writePolicyCache membership (credentials on disk)', () => {
   });
 
   after(() => {
+    clearInterval(keepalive);
     process.env.HOME = prevHome;
     try {
       fs.rmSync(tmpHome, { recursive: true, force: true });
@@ -64,9 +70,9 @@ describe('writePolicyCache membership (credentials on disk)', () => {
     }
   });
 
-  it('keeps account with credentials and drops one without', () => {
+  it('keeps account with credentials and drops one without', async () => {
     const now = Date.now();
-    writePolicyCache({
+    await writePolicyCache({
       mode: 'notify',
       thresholds: { session: 90, weekly: 90, fable: 90 },
       triggers: { session: true, weekly: true, fable: false },

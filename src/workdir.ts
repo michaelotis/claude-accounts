@@ -400,11 +400,98 @@ export function allWorkingDirs(): string[] {
   try {
     return fs
       .readdirSync(workingRoot(), { withFileTypes: true })
-      .filter((e) => e.isDirectory())
+      .filter((e) => e.isDirectory() && !e.name.endsWith('.lock'))
       .map((e) => path.join(workingRoot(), e.name));
   } catch {
     return []; // nothing created yet
   }
+}
+
+/** Same-host liveness. EPERM means alive-but-not-ours; only ESRCH means gone. */
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/** Mirror of fsSafe's owner-write gap — a missing owner.json is only stale after this. */
+const LOCK_OWNER_WRITE_GRACE_MS = 5_000;
+/** Cross-host liveness is unknowable; treat as live unless older than this. */
+const FOREIGN_HOST_STALE_MS = 15 * 60_000;
+
+/**
+ * Whether a leftover working-dir lock may be removed. Mirrors fsSafe.isLockStale:
+ * a same-host live pid is never stale; a foreign-host owner is stale only after
+ * 15 minutes; a missing/unreadable owner.json is stale only once the dir is older
+ * than the owner-write grace (a live acquirer has a brief gap before writing it).
+ * A parseable owner that lacks a string host or a numeric at is treated like a
+ * missing owner (mtime grace) rather than stuck on the foreign-host branch.
+ * A vanished dir is not stale — nothing to remove.
+ */
+function isWorkingLockStale(dir: string): boolean {
+  let owner: { pid?: unknown; host?: unknown; at?: unknown } | null = null;
+  try {
+    owner = JSON.parse(fs.readFileSync(path.join(dir, 'owner.json'), 'utf-8')) as {
+      pid?: unknown;
+      host?: unknown;
+      at?: unknown;
+    };
+  } catch {
+    /* missing/unreadable owner.json */
+  }
+  if (owner) {
+    if (owner.host === os.hostname()) {
+      return typeof owner.pid !== 'number' || !processAlive(owner.pid);
+    }
+    if (typeof owner.host === 'string' && typeof owner.at === 'number') {
+      return Date.now() - owner.at > FOREIGN_HOST_STALE_MS;
+    }
+    // Malformed owner (no string host, or no numeric at) — same as missing.
+  }
+  try {
+    return Date.now() - fs.statSync(dir).mtimeMs > LOCK_OWNER_WRITE_GRACE_MS;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Remove leftover `<id>.lock` dirs under ~/.claude-windows from an older lock
+ * scheme. Those names used to be picked up as windows and got shared-history
+ * symlinks planted in them. Only dirs that are stale (see isWorkingLockStale)
+ * AND whose entries are exclusively symlinks and/or owner.json are removed —
+ * anything holding real files is left and logged, so the "contents are only
+ * symlinks" claim stays honest. A failed rmSync is logged and the sweep continues.
+ */
+export function sweepStaleWorkingLocks(): number {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(workingRoot(), { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const e of entries) {
+    if (!e.isDirectory() || !e.name.endsWith('.lock')) continue;
+    const dir = path.join(workingRoot(), e.name);
+    try {
+      if (!isWorkingLockStale(dir)) continue;
+      const kids = fs.readdirSync(dir, { withFileTypes: true });
+      if (!kids.every((k) => k.isSymbolicLink() || k.name === 'owner.json')) {
+        log(`workdir: leaving ${dir} — holds real files`);
+        continue;
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
+      removed++;
+    } catch (err) {
+      log(`workdir: could not remove ${dir}: ${(err as Error).message}`);
+    }
+  }
+  if (removed > 0) log(`workdir: swept ${removed} stale .lock dir(s)`);
+  return removed;
 }
 
 function copyFile(src: string, dst: string): void {

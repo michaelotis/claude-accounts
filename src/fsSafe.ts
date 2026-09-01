@@ -136,7 +136,7 @@ function tryAcquire(lockDir: string, staleMs: number): boolean {
     /* parent already exists or cannot be created — the mkdir below reports it */
   }
   try {
-    fs.mkdirSync(lockDir); // atomic exclusive create — the one real gate
+    fs.mkdirSync(lockDir, { mode: 0o700 }); // atomic exclusive create — the one real gate
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
     if (!isLockStale(lockDir, staleMs)) return false; // live holder — wait
@@ -145,7 +145,7 @@ function tryAcquire(lockDir: string, staleMs: number): boolean {
     // can be weaker). One reclaimer at a time.
     const token = `${lockDir}.reclaim`;
     try {
-      fs.mkdirSync(token);
+      fs.mkdirSync(token, { mode: 0o700 });
     } catch {
       // Token busy — another reclaimer holds it, or one crashed. Clear a stale
       // token and let a later round retry; never reclaim without the token.
@@ -166,7 +166,7 @@ function tryAcquire(lockDir: string, staleMs: number): boolean {
         /* ignore */
       }
       try {
-        fs.mkdirSync(lockDir);
+        fs.mkdirSync(lockDir, { mode: 0o700 });
       } catch {
         return false; // a fresh holder took it between the rm and here — wait
       }

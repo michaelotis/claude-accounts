@@ -3,6 +3,23 @@
 ## 0.9.12
 
 ### Fixed
+- **A never-fetched usage reading no longer shows as 0%.** When the first poll fails
+  with no cache to fall back on, the pills show `5h –` / `7d –`, the tooltip table
+  shows `—`, and the single-account click says usage is pending, instead of a
+  confident 0% that looked like a real reading.
+- **Shared-file writers no longer block the extension host.** The usage cache, backoff
+  stamps and the policy file are written under the async lock, so a contended lock
+  waits on the event loop instead of freezing the window for up to two seconds.
+- **Leftover `~/.claude-windows/<id>.lock` directories from an older lock scheme** were
+  being treated as windows and given shared-history symlinks. They are swept at
+  activation when their owner is gone (symlink-only contents, live and foreign-host
+  owners are left alone) and ignored by the working-dir list. Lock directories are now
+  created 0700.
+
+### Changed
+- **`scripts/ship.sh` only tags.** It refuses unless `main` is clean and equal to
+  `origin/main`, requires the matching `## X.Y.Z` changelog heading, and pushes only the
+  tag — version bumps land through a pull request like every other change.
 - **The turn watcher walked every account's history, in every window, every 2 s.** The
   session dirs it scanned (`projects`, `sessions`, `session-env`, `file-history`,
   `shell-snapshots`) are symlinks into the shared store, so each window did ~1,200

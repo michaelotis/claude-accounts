@@ -9,7 +9,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { log } from './log';
 import { readIdentity, hasCredentials } from './accounts';
-import { writeFileAtomic, withLock, withLockAsync } from './fsSafe';
+import { writeFileAtomic, withLockAsync } from './fsSafe';
 import { isWindowsPath } from './sidecars';
 import {
   buildSnapshot,
@@ -272,23 +272,31 @@ function logBackoffOnce(key: string): void {
   log(`usage: rate-limit backoff active — serving best-effort for ${key}`);
 }
 
-function stampRateLimitBackoff(key: string): void {
-  withLock(lockFor(metaPath()), () => {
-    const m = readMeta();
-    const map = m.rateLimitAt ?? {};
-    map[key] = Date.now();
-    writeMeta({ ...m, rateLimitAt: map });
-  });
+async function stampRateLimitBackoff(key: string): Promise<void> {
+  await withLockAsync(
+    lockFor(metaPath()),
+    () => {
+      const m = readMeta();
+      const map = m.rateLimitAt ?? {};
+      map[key] = Date.now();
+      writeMeta({ ...m, rateLimitAt: map });
+    },
+    { staleMs: 15_000, capMs: 2_000, stepMs: 25 }
+  );
 }
 
-function clearRateLimitBackoff(key: string): void {
-  withLock(lockFor(metaPath()), () => {
-    const m = readMeta();
-    if (!m.rateLimitAt?.[key] && m.lastRateLimitAt === undefined) return;
-    if (m.rateLimitAt) delete m.rateLimitAt[key];
-    delete m.lastRateLimitAt;
-    writeMeta(m);
-  });
+async function clearRateLimitBackoff(key: string): Promise<void> {
+  await withLockAsync(
+    lockFor(metaPath()),
+    () => {
+      const m = readMeta();
+      if (!m.rateLimitAt?.[key] && m.lastRateLimitAt === undefined) return;
+      if (m.rateLimitAt) delete m.rateLimitAt[key];
+      delete m.lastRateLimitAt;
+      writeMeta(m);
+    },
+    { staleMs: 15_000, capMs: 2_000, stepMs: 25 }
+  );
 }
 
 function getCachedSnap(key: string, maxAgeMs: number): UsageSnapshot | null {
@@ -316,14 +324,18 @@ function getStaleSnap(key: string): UsageSnapshot | null {
   return entry?.snap ?? null;
 }
 
-function putCachedSnap(key: string, snap: UsageSnapshot): void {
+async function putCachedSnap(key: string, snap: UsageSnapshot): Promise<void> {
   // Lock the read-modify-write: another window caching a different key must not
   // drop this entry (unique temp names stop torn writes, not lost updates).
-  withLock(lockFor(usageCachePath()), () => {
-    const cache = readUsageCache();
-    cache.entries[key] = { key, fetchedAt: Date.now(), snap };
-    writeUsageCache(cache);
-  });
+  await withLockAsync(
+    lockFor(usageCachePath()),
+    () => {
+      const cache = readUsageCache();
+      cache.entries[key] = { key, fetchedAt: Date.now(), snap };
+      writeUsageCache(cache);
+    },
+    { staleMs: 15_000, capMs: 2_000, stepMs: 25 }
+  );
 }
 
 /** Fall back to policy.json account rows (last successful poll from any version). */
@@ -714,7 +726,7 @@ async function fetchUsageNetwork(dir: string, key: string): Promise<UsageFetchRe
 
     // (6) 429 poll rate-limit — keep previous usage, stamp backoff
     if (status === 429) {
-      stampRateLimitBackoff(key);
+      await stampRateLimitBackoff(key);
       const snap = bestEffortSnap(dir, key);
       log(
         `usage: HTTP 429 (poll rate-limit) — serving best-effort (5h ${snap.sessionPercent}% 7d ${snap.weeklyPercent}%), NOT treating as sign-out`
@@ -728,7 +740,7 @@ async function fetchUsageNetwork(dir: string, key: string): Promise<UsageFetchRe
     }
 
     // (7) Success
-    clearRateLimitBackoff(key);
+    await clearRateLimitBackoff(key);
     const usage = data as Record<string, unknown>;
     // Identity from dir (no second profile HTTP call — avoids extra 429s)
     const identity = readIdentity(dir);
@@ -739,7 +751,7 @@ async function fetchUsageNetwork(dir: string, key: string): Promise<UsageFetchRe
         }
       : null;
     const snap = buildSnapshot(usage, profile, dir);
-    putCachedSnap(key, snap);
+    await putCachedSnap(key, snap);
     log(
       `usage(${dir}): 5h=${snap.sessionPercent}% 7d=${snap.weeklyPercent}% models=${
         snap.modelLimits.map((m) => `${m.name}:${m.percent}%`).join(',') || 'none'
@@ -900,7 +912,7 @@ export interface PolicyCache {
 }
 
 /** Merge usage snapshots + workspace routes into the on-disk cross-window policy cache. */
-export function writePolicyCache(opts: {
+export async function writePolicyCache(opts: {
   mode: 'off' | 'notify';
   thresholds: FailoverThresholds;
   triggers: FailoverTriggers;
@@ -912,103 +924,111 @@ export function writePolicyCache(opts: {
   snapshots: UsageSnapshot[];
   /** Drop these emails entirely (e.g. after Forget). */
   removeEmails?: string[];
-}): void {
+}): Promise<void> {
   try {
     // Lock the whole read-modify-write: policy.json is one machine-wide file
     // every window rewrites, so an unlocked RMW loses a concurrent window's
     // update (and unique temp names only stop torn writes, not lost updates).
-    withLock(lockFor(policyPath()), () => {
-      fs.mkdirSync(policyDir(), { recursive: true, mode: 0o700 });
-      let prev: Partial<PolicyCache> = {};
-      if (fs.existsSync(policyPath())) {
-        try {
-          prev = JSON.parse(fs.readFileSync(policyPath(), 'utf-8')) as PolicyCache;
-        } catch {
-          prev = {};
-        }
-      }
-      const byEmail = new Map<string, PolicyAccount>();
-      for (const a of prev.accounts || []) {
-        if (a.email) byEmail.set(a.email, a);
-      }
-      for (const e of opts.removeEmails || []) {
-        byEmail.delete(e);
-      }
-      for (const s of opts.snapshots) {
-        if (!s.email) continue;
-        const fable = s.modelLimits.find((m) => /fable/i.test(m.name))?.percent ?? null;
-        const prevDir = byEmail.get(s.email)?.dir;
-        let dir = s.configDir;
-        // Prefer durable account store over per-window workdir
-        if (dir.includes(`${path.sep}.claude-windows${path.sep}`)) {
-          if (prevDir && !prevDir.includes(`${path.sep}.claude-windows${path.sep}`)) {
-            dir = prevDir;
+    await withLockAsync(
+      lockFor(policyPath()),
+      () => {
+        fs.mkdirSync(policyDir(), { recursive: true, mode: 0o700 });
+        let prev: Partial<PolicyCache> = {};
+        if (fs.existsSync(policyPath())) {
+          try {
+            prev = JSON.parse(fs.readFileSync(policyPath(), 'utf-8')) as PolicyCache;
+          } catch {
+            prev = {};
           }
         }
-        const name = opts.nameByEmail?.[s.email] || byEmail.get(s.email)?.name;
-        byEmail.set(s.email, {
-          id: s.email,
-          email: s.email,
-          name,
-          dir,
-          sessionPercent: s.sessionPercent,
-          weeklyPercent: s.weeklyPercent,
-          fablePercent: fable,
-          hot: needsFailover(s, opts.thresholds, opts.triggers),
-          reasons: failoverReasons(s, opts.thresholds, opts.triggers),
-          planLabel: s.planLabel,
-          fetchedAt: s.fetchedAt,
-        });
-      }
-      // Membership is decided by disk, not by this window's globalState view of
-      // the account list (which does not propagate between windows): keep a row
-      // only while its store still holds a credential. A window that has not yet
-      // discovered an account — or forgot it locally — must not delete it out
-      // from under another window that is legitimately still polling it. Explicit
-      // Forget removes rows through removeEmails / prunePolicyEmails.
-      for (const [em, acc] of [...byEmail.entries()]) {
-        if (!acc.dir || !hasCredentials(acc.dir)) byEmail.delete(em);
-      }
-      let accountOrder =
-        opts.accountOrder !== undefined ? opts.accountOrder : prev.accountOrder || [];
-      if (!accountOrder.length) {
-        const legacy: string[] = [];
-        const prevAny = prev as { primaryEmail?: string; secondaryEmail?: string };
-        if (prevAny.primaryEmail) legacy.push(prevAny.primaryEmail);
-        if (prevAny.secondaryEmail) legacy.push(prevAny.secondaryEmail);
-        accountOrder = legacy;
-      }
-      const policy: PolicyCache = {
-        version: 3,
-        updatedAt: Date.now(),
-        mode: opts.mode,
-        thresholds: opts.thresholds,
-        triggers: opts.triggers,
-        strategy: opts.strategy || prev.strategy || DEFAULT_STRATEGY,
-        accountOrder,
-        workspaceRoutes:
-          opts.workspaceRoutes !== undefined ? opts.workspaceRoutes : prev.workspaceRoutes || [],
-        accounts: [...byEmail.values()],
-      };
-      writeFileAtomic(policyPath(), JSON.stringify(policy, null, 2), { mode: 0o600 });
-    });
+        const byEmail = new Map<string, PolicyAccount>();
+        for (const a of prev.accounts || []) {
+          if (a.email) byEmail.set(a.email, a);
+        }
+        for (const e of opts.removeEmails || []) {
+          byEmail.delete(e);
+        }
+        for (const s of opts.snapshots) {
+          if (!s.email) continue;
+          const fable = s.modelLimits.find((m) => /fable/i.test(m.name))?.percent ?? null;
+          const prevDir = byEmail.get(s.email)?.dir;
+          let dir = s.configDir;
+          // Prefer durable account store over per-window workdir
+          if (dir.includes(`${path.sep}.claude-windows${path.sep}`)) {
+            if (prevDir && !prevDir.includes(`${path.sep}.claude-windows${path.sep}`)) {
+              dir = prevDir;
+            }
+          }
+          const name = opts.nameByEmail?.[s.email] || byEmail.get(s.email)?.name;
+          byEmail.set(s.email, {
+            id: s.email,
+            email: s.email,
+            name,
+            dir,
+            sessionPercent: s.sessionPercent,
+            weeklyPercent: s.weeklyPercent,
+            fablePercent: fable,
+            hot: needsFailover(s, opts.thresholds, opts.triggers),
+            reasons: failoverReasons(s, opts.thresholds, opts.triggers),
+            planLabel: s.planLabel,
+            fetchedAt: s.fetchedAt,
+          });
+        }
+        // Membership is decided by disk, not by this window's globalState view of
+        // the account list (which does not propagate between windows): keep a row
+        // only while its store still holds a credential. A window that has not yet
+        // discovered an account — or forgot it locally — must not delete it out
+        // from under another window that is legitimately still polling it. Explicit
+        // Forget removes rows through removeEmails / prunePolicyEmails.
+        for (const [em, acc] of [...byEmail.entries()]) {
+          if (!acc.dir || !hasCredentials(acc.dir)) byEmail.delete(em);
+        }
+        let accountOrder =
+          opts.accountOrder !== undefined ? opts.accountOrder : prev.accountOrder || [];
+        if (!accountOrder.length) {
+          const legacy: string[] = [];
+          const prevAny = prev as { primaryEmail?: string; secondaryEmail?: string };
+          if (prevAny.primaryEmail) legacy.push(prevAny.primaryEmail);
+          if (prevAny.secondaryEmail) legacy.push(prevAny.secondaryEmail);
+          accountOrder = legacy;
+        }
+        const policy: PolicyCache = {
+          version: 3,
+          updatedAt: Date.now(),
+          mode: opts.mode,
+          thresholds: opts.thresholds,
+          triggers: opts.triggers,
+          strategy: opts.strategy || prev.strategy || DEFAULT_STRATEGY,
+          accountOrder,
+          workspaceRoutes:
+            opts.workspaceRoutes !== undefined ? opts.workspaceRoutes : prev.workspaceRoutes || [],
+          accounts: [...byEmail.values()],
+        };
+        writeFileAtomic(policyPath(), JSON.stringify(policy, null, 2), { mode: 0o600 });
+      },
+      { staleMs: 15_000, capMs: 2_000, stepMs: 25 }
+    );
   } catch (err) {
     log(`policy write failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
 /** Remove one or more emails from the policy cache (Forget). */
-export function prunePolicyEmails(emails: string[]): void {
+export async function prunePolicyEmails(emails: string[]): Promise<void> {
   if (!emails.length || !fs.existsSync(policyPath())) return;
   try {
-    withLock(lockFor(policyPath()), () => {
-      const prev = JSON.parse(fs.readFileSync(policyPath(), 'utf-8')) as PolicyCache;
-      const drop = new Set(emails);
-      prev.accounts = (prev.accounts || []).filter((a) => !drop.has(a.email));
-      prev.accountOrder = (prev.accountOrder || []).filter((id) => !drop.has(id));
-      prev.updatedAt = Date.now();
-      writeFileAtomic(policyPath(), JSON.stringify(prev, null, 2), { mode: 0o600 });
-    });
+    await withLockAsync(
+      lockFor(policyPath()),
+      () => {
+        const prev = JSON.parse(fs.readFileSync(policyPath(), 'utf-8')) as PolicyCache;
+        const drop = new Set(emails);
+        prev.accounts = (prev.accounts || []).filter((a) => !drop.has(a.email));
+        prev.accountOrder = (prev.accountOrder || []).filter((id) => !drop.has(id));
+        prev.updatedAt = Date.now();
+        writeFileAtomic(policyPath(), JSON.stringify(prev, null, 2), { mode: 0o600 });
+      },
+      { staleMs: 15_000, capMs: 2_000, stepMs: 25 }
+    );
     log(`policy: pruned ${emails.join(', ')}`);
   } catch (err) {
     log(`policy prune failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -1139,8 +1159,8 @@ export class UsageMonitor {
     this.currentDir = dir;
   }
 
-  private policyWrite(snapshots: UsageSnapshot[]): void {
-    writePolicyCache({
+  private async policyWrite(snapshots: UsageSnapshot[]): Promise<void> {
+    await writePolicyCache({
       mode: this.mode,
       thresholds: this.thresholds,
       triggers: this.triggers,
@@ -1236,7 +1256,7 @@ export class UsageMonitor {
       this.cache.set(key, snap);
       if (fromNetwork) {
         const forPolicy = store ? { ...snap, configDir: store } : snap;
-        this.policyWrite([forPolicy]);
+        await this.policyWrite([forPolicy]);
       }
       this.emitPressure(snap);
       this.emit();
@@ -1302,7 +1322,7 @@ export class UsageMonitor {
       changed = true;
       if (fromNetwork) netSnaps.push(snap);
     }
-    if (netSnaps.length) this.policyWrite(netSnaps);
+    if (netSnaps.length) await this.policyWrite(netSnaps);
     if (changed) this.emit();
   }
 
