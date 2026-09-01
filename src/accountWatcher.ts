@@ -7,15 +7,35 @@ import { WindowBinding } from './binding';
 import { defaultSourceDir } from './capture';
 
 /**
+ * Files whose account-state changes should wake the watcher. Always includes
+ * ~/.claude/.credentials.json so a sign-out of the default dir wakes every
+ * window (fingerprint then filters content-only rewrites — a takeover in
+ * another window must not). ~/.claude.json is included only for the default
+ * dir. `storeCredsFile` is appended when given (deduped).
+ */
+export function watchTargets(dir: string, storeCredsFile?: string): string[] {
+  const defaultDir = defaultSourceDir();
+  const files = new Set<string>([
+    path.join(dir, '.claude.json'),
+    path.join(dir, '.credentials.json'),
+    path.join(defaultDir, '.credentials.json'),
+  ]);
+  if (path.normalize(dir) === path.normalize(defaultDir)) {
+    files.add(path.join(os.homedir(), '.claude.json'));
+  }
+  if (storeCredsFile) files.add(storeCredsFile);
+  return [...files];
+}
+
+/**
  * Keeps the status bar honest by repainting it the moment this window's account
  * identity changes on disk — e.g. the user runs `/login` inside this window,
  * which (because our binding wins the activation race) rewrites the bound dir's
  * identity. Without this the bar would lag until the next focus/TTL tick.
  *
- * It deliberately does NOT compare against the default `~/.claude` account:
- * once Claude Code reads `CLAUDE_CONFIG_DIR` at activation, the account this
- * window uses IS the bound dir, not the ambient default — so the default file
- * is irrelevant here and comparing to it only produces false "diverged" alarms.
+ * A bound window's identity is its own dir; the home-root ~/.claude.json
+ * matters only while unbound on the default dir. Every window also watches
+ * the default dir's token file so a sign-out there can refill it.
  */
 export class AccountWatcher implements vscode.Disposable {
   private readonly watched: string[] = [];
@@ -44,11 +64,11 @@ export class AccountWatcher implements vscode.Disposable {
   ) {}
 
   start(): void {
-    // Watch the identity file backing this window's account: the bound dir's
-    // .claude.json, or — for an unbound window — the home-root ~/.claude.json
-    // where the default account keeps its identity. watchFile (poll-based)
-    // survives the atomic temp+rename writes that break fs.watch, and fires on
-    // deletion too.
+    // Watch the identity/credential files for this window's dir, the default
+    // dir's token (sign-out refill), and ~/.claude.json only while unbound
+    // on the default dir.
+    // watchFile (poll-based) survives the atomic temp+rename writes that break
+    // fs.watch, and fires on deletion too.
     //
     // The TOKEN file is watched as well, and it's the one that actually decides
     // whether this window is signed in: a `/logout`, or a forget performed in
@@ -68,20 +88,14 @@ export class AccountWatcher implements vscode.Disposable {
         ? path.join(store, '.credentials.json')
         : undefined;
     this.lastFingerprint = this.fingerprint();
-    const files = new Set<string>([
-      path.join(dir, '.claude.json'),
-      path.join(os.homedir(), '.claude.json'),
-      path.join(dir, '.credentials.json'),
-    ]);
-    if (this.storeCredsFile) files.add(this.storeCredsFile);
-    for (const f of files) {
+    for (const f of watchTargets(dir, this.storeCredsFile)) {
       fs.watchFile(f, { interval: 2000 }, () => this.schedule());
       this.watched.push(f);
     }
   }
 
   private fingerprint(): string {
-    return accountFingerprint(this.dir, undefined, this.storeCredsFile);
+    return accountFingerprint(this.dir, this.storeCredsFile);
   }
 
   private schedule(): void {

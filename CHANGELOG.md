@@ -3,6 +3,30 @@
 ## 0.9.12
 
 ### Fixed
+- **Two windows on different accounts no longer rewrite `~/.claude` once a second
+  forever.** Each window's reconcile used to mirror its account into the default
+  dir, and each window watched `~/.claude.json`, so window A writing account X
+  made window B reconcile and write Y, which made A fire again. `~/.claude` now
+  follows the last explicitly chosen account (Switch Account, Save, a real
+  in-window /login); a passive reconcile only refills an empty default or
+  refreshes the same account with a newer grant, and a named token-less default
+  is refilled only by that account after five minutes counted from first
+  observed absence (so a live `claude /login` that still names the account is not overwritten).
+  An `idleReload` auto-cutover goes through Switch and therefore also moves the
+  default. The fix takes effect only once every window has reloaded onto 0.9.12; a window still on
+  0.9.11 keeps overwriting `~/.claude` on every reconcile and 0.9.12 will not
+  fight it back.
+- **The turn watcher walked every account's history, in every window, every 2 s.** The
+  session dirs it scanned (`projects`, `sessions`, `session-env`, `file-history`,
+  `shell-snapshots`) are symlinks into the shared store, so each window did ~1,200
+  directory reads per tick over everyone's transcripts, and any window's turn marked
+  every window busy — deferring `idleReload` cutovers while anything on the machine was
+  working. It now walks only `projects/<slug>` for this window's own `claude` processes
+  (working directory via `/proc`, workspace folders as fallback), and it runs only while
+  `failover.panelCutover` is `idleReload` — in the default `notify` mode nothing polls.
+  Because transcript appends are now the only activity signal, the idle settle time
+  rises from 12 s to 30 s so a long silent tool call is less likely to read as idle,
+  and the watcher logs once when it has no transcript directory to watch.
 - **A never-fetched usage reading no longer shows as 0%.** When the first poll fails
   with no cache to fall back on, the pills show `5h –` / `7d –`, the tooltip table
   shows `—`, and the single-account click says usage is pending, instead of a
@@ -20,17 +44,6 @@
 - **`scripts/ship.sh` only tags.** It refuses unless `main` is clean and equal to
   `origin/main`, requires the matching `## X.Y.Z` changelog heading, and pushes only the
   tag — version bumps land through a pull request like every other change.
-- **The turn watcher walked every account's history, in every window, every 2 s.** The
-  session dirs it scanned (`projects`, `sessions`, `session-env`, `file-history`,
-  `shell-snapshots`) are symlinks into the shared store, so each window did ~1,200
-  directory reads per tick over everyone's transcripts, and any window's turn marked
-  every window busy — deferring `idleReload` cutovers while anything on the machine was
-  working. It now walks only `projects/<slug>` for this window's own `claude` processes
-  (working directory via `/proc`, workspace folders as fallback), and it runs only while
-  `failover.panelCutover` is `idleReload` — in the default `notify` mode nothing polls.
-  Because transcript appends are now the only activity signal, the idle settle time
-  rises from 12 s to 30 s so a long silent tool call is less likely to read as idle,
-  and the watcher logs once when it has no transcript directory to watch.
 
 ## 0.9.11
 
