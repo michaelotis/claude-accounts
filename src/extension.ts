@@ -7,7 +7,7 @@ import { WindowBinding } from './binding';
 import { StatusBarManager } from './statusBar';
 import { SetupWizard, NOTICE_KEY } from './setupWizard';
 import { ensureSharedHistory } from './sharedHistory';
-import { defaultSourceDir } from './capture';
+import { defaultSourceDir, disposeMirrorTimers } from './capture';
 import { AccountWatcher } from './accountWatcher';
 import {
   allWorkingDirs,
@@ -604,5 +604,5 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 }
 
 export function deactivate(): void {
-  /* nothing to clean up */
+  disposeMirrorTimers();
 }

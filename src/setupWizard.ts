@@ -187,6 +187,7 @@ export class SetupWizard {
       await this.registry.add(known);
       await refreshStore(known, sourceDir);
       await this.binding.bind(known);
+      mirrorToDefault(sourceDir, { takeover: true });
       if (!opts.quiet) {
         vscode.window.showInformationMessage(`${status.email} — this window is bound to it.`);
       }
@@ -216,6 +217,7 @@ export class SetupWizard {
     target.email = status.email;
     await this.registry.add(target);
     await this.binding.bind(target);
+    mirrorToDefault(sourceDir, { takeover: true });
     if (!opts.quiet) {
       vscode.window.showInformationMessage(`Saved ${status.email} — this window is bound to it.`);
     }
@@ -364,11 +366,16 @@ export class SetupWizard {
           readIdentity(bound.dir) ??
           (boundEmail ? { email: boundEmail, displayName: boundEmail } : undefined);
         if (id) {
-          stampIdentity(dir, id);
-          log(
-            `reconcile: identity-only drift ${boundEmail} → ${email} (token unchanged) — ` +
-              `restamped in place, no reload`
-          );
+          if (stampIdentity(dir, id)) {
+            log(
+              `reconcile: identity-only drift ${boundEmail} → ${email} (token unchanged) — ` +
+                `restamped in place, no reload`
+            );
+          } else {
+            log(
+              `reconcile: identity-only drift ${boundEmail} → ${email} but ${dir}/.claude.json is unreadable — drift NOT repaired`
+            );
+          }
         } else {
           log(`reconcile: identity-only drift but bound identity unreadable — left dir as-is`);
         }
@@ -407,7 +414,7 @@ export class SetupWizard {
         );
         materialize(bound, dir, true);
         if (emailsEqual(readIdentity(dir)?.email, boundEmail)) {
-          mirrorToDefault(dir, readIdentity(dir));
+          mirrorToDefault(dir);
           if (!this.recentlyReloaded()) {
             await this.requestWindowReload(`Restored ${boundEmail ?? bound.name} for this window.`);
           }
@@ -482,7 +489,7 @@ export class SetupWizard {
           log(`reconcile: dir grant is stale vs store and restock was not applied`);
         }
       } else {
-        mirrorToDefault(dir, readIdentity(dir));
+        mirrorToDefault(dir);
       }
     }
     // Propagate newly-added home MCP servers into already-stocked windows.
@@ -698,6 +705,38 @@ export class SetupWizard {
     opts: { userInitiated?: boolean; notice?: string } = {}
   ): Promise<void> {
     await this.binding.bind(account);
+    const wd = this.binding.workingDir();
+    if (opts.userInitiated !== false) {
+      const email = account.email ?? this.registry.emailOf(account);
+      if (!email) {
+        log(`switch: ${account.name} has no resolvable email — default dir left as is`);
+      } else {
+        const hasToken = hasCredentials(wd);
+        const idEmail = readIdentity(wd)?.email;
+        const identityDesc = idEmail
+          ? idEmail
+          : fs.existsSync(path.join(wd, '.claude.json'))
+            ? 'unreadable'
+            : 'missing';
+        if (!hasToken || !emailsEqual(idEmail, email)) {
+          let half: string;
+          if (!hasToken && !emailsEqual(idEmail, email)) {
+            half = `no token, identity is ${identityDesc}`;
+          } else if (!hasToken) {
+            half = 'no token';
+          } else {
+            half = `identity is ${identityDesc}`;
+          }
+          log(`switch: ${email} did not stock ${wd} (${half}) — default dir left as is`);
+        } else if (!mirrorToDefault(wd, { takeover: true })) {
+          log(`switch: default dir did not follow ${email} (see mirror lines above)`);
+        }
+      }
+    } else {
+      // Workspace-route correction is automatic — stay passive so it cannot
+      // flip ~/.claude to the pin without an explicit user choice.
+      mirrorToDefault(wd);
+    }
     await this.requestWindowReload(opts.notice, {
       userInitiated: opts.userInitiated !== false,
     });
@@ -752,7 +791,7 @@ export class SetupWizard {
     // Drop the forgotten email from the policy cache so it is no longer polled
     try {
       const { prunePolicyEmails } = await import('./usage');
-      prunePolicyEmails([email]);
+      await prunePolicyEmails([email]);
     } catch {
       /* non-fatal */
     }

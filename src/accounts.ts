@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { isReservedClaudeDirName } from './sidecars';
 import { writeFileAtomic } from './fsSafe';
+import { log } from './log';
 
 /**
  * An account = a Claude Code data directory (CLAUDE_CONFIG_DIR) that has been
@@ -41,7 +42,7 @@ const REGISTRY_KEY = 'claudeProfiles.accounts';
 const FORGOTTEN_KEY = 'claudeProfiles.forgottenAccounts';
 
 /** Parses oauthAccount identity out of a single .claude.json file. */
-function readIdentityFile(file: string): AccountIdentity | null {
+export function readIdentityFile(file: string): AccountIdentity | null {
   if (!fs.existsSync(file)) return null;
   try {
     const raw = JSON.parse(fs.readFileSync(file, 'utf-8')) as {
@@ -85,34 +86,73 @@ export function hasCredentials(dir: string): boolean {
 }
 
 /**
- * Content fingerprint of the account state the AccountWatcher guards: this dir's
- * identity email, the home-root identity email, the dir's credential grant
- * bytes, and — when the window is bound to a saved account — the account STORE's
- * credential bytes. Claude Code rewrites .claude.json every few seconds during a
- * turn (project state, history), so mtime is useless as a change signal — only
- * these fields mean the ACCOUNT changed (login, logout, forget, token rotation).
- * The store component is what lets a window notice that ANOTHER window rotated
- * the shared grant, instead of waiting for the next focus edge.
- * homeIdentityFile is injectable for tests only.
+ * Content fingerprint of the account state the AccountWatcher guards:
+ *   own          — this dir's identity email (the default dir falls back to
+ *                  ~/.claude.json via readIdentity)
+ *   home         — home-root identity email, ONLY when `dir` is ~/.claude.
+ *                  A bound window must not wake when another window's takeover
+ *                  restamps ~/.claude.json; the default-dir window still must,
+ *                  even if ~/.claude/.claude.json exists with a different email.
+ *   creds        — this dir's credential grant bytes. Absent is ''; a
+ *                  non-ENOENT read error is '?' (must not look signed out).
+ *   store        — the account STORE's credential bytes, when bound (same
+ *                  '' vs '?' distinction)
+ *   defaultToken — '1'/'0'/'?' for whether ~/.claude/.credentials.json EXISTS.
+ *                  '1' when the stat succeeds, '0' when the file is absent, '?'
+ *                  when the stat throws (a permissions error must not read as
+ *                  "signed out"). Presence only, never its bytes: a takeover in
+ *                  another window must not wake this one, but a sign-out (empty
+ *                  default) must, so a bound window can refill it.
+ * Format: ${own}|${home}|${creds}|${store}|${defaultToken}
+ *
+ * Claude Code rewrites .claude.json every few seconds during a turn (project
+ * state, history), so mtime is useless as a change signal — only these fields
+ * mean the ACCOUNT changed (login, logout, forget, token rotation, default
+ * sign-out). The store component is what lets a window notice that ANOTHER
+ * window rotated the shared grant, instead of waiting for the next focus edge.
  */
-export function accountFingerprint(
-  dir: string,
-  homeIdentityFile = path.join(os.homedir(), '.claude.json'),
-  storeCredsFile?: string
-): string {
+export function accountFingerprint(dir: string, storeCredsFile?: string): string {
   const own = readIdentity(dir)?.email?.toLowerCase() ?? '';
-  const home = readIdentityFile(homeIdentityFile)?.email?.toLowerCase() ?? '';
+  const defaultDir = path.join(os.homedir(), '.claude');
+  const isDefault = path.normalize(dir) === path.normalize(defaultDir);
+  const home = isDefault
+    ? (readIdentityFile(path.join(os.homedir(), '.claude.json'))?.email?.toLowerCase() ?? '')
+    : '';
   const hash = (file: string): string => {
     try {
       return crypto.createHash('sha1').update(fs.readFileSync(file)).digest('hex');
-    } catch {
-      // Absent or unreadable credentials = signed out; the empty string is that state.
-      return '';
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return '';
+      const code = (err as NodeJS.ErrnoException).code ?? 'unknown';
+      logFingerprintOnce(
+        `hash:${code}`,
+        `fingerprint: cannot read ${file} (${code}) — credential change detection is blind until this is fixed`
+      );
+      return '?';
     }
   };
   const creds = hash(path.join(dir, '.credentials.json'));
   const store = storeCredsFile ? hash(storeCredsFile) : '';
-  return `${own}|${home}|${creds}|${store}`;
+  let defaultToken: string;
+  try {
+    const st = fs.statSync(path.join(defaultDir, '.credentials.json'), { throwIfNoEntry: false });
+    defaultToken = st ? '1' : '0';
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? 'unknown';
+    logFingerprintOnce(
+      `defaultToken:${code}`,
+      `fingerprint: cannot stat ~/.claude/.credentials.json (${code}) — default sign-out detection is blind until this is fixed`
+    );
+    defaultToken = '?';
+  }
+  return `${own}|${home}|${creds}|${store}|${defaultToken}`;
+}
+
+const fingerprintErrorsLogged = new Set<string>();
+function logFingerprintOnce(key: string, msg: string): void {
+  if (fingerprintErrorsLogged.has(key)) return;
+  fingerprintErrorsLogged.add(key);
+  log(msg);
 }
 
 /** Expands a leading ~ to the home directory. */

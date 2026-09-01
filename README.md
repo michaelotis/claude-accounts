@@ -195,6 +195,7 @@ Legacy `primaryEmail` / `secondaryEmail` still seed `accountOrder` if that list 
 - Does **not** mint OAuth sessions (Claude Code owns login); usage poll may refresh access tokens via the stored refresh token
 - **Usage is fetched centrally**: one call per account machine-wide per cycle (a per-account lock + shared cache dedupe the windows); for saved accounts, token refreshes run against the account **store**, so the extension has one rotation source per account no matter how many windows are open (an unsaved window still uses its own copy)
 - Same account in several windows: a token refresh in one window rotates the grant; the others quietly re-stock their **token file** from the account store (no reload, no popup — the tooltip explains if Claude Code errors once before its next restart)
+- `~/.claude` follows the last explicitly chosen account (Switch Account, Save, in-window /login); a passive reconcile only refills an empty default or refreshes the same account with a newer grant — it never flips between saved accounts
 - **Forget** still signs out that **email** everywhere — use carefully
 - Shared history is for **not losing chats**, not consolidating identity/context across accounts
 
