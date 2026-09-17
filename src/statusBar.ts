@@ -8,7 +8,6 @@ import {
   USAGE_CACHE_TTL_MS,
   formatUsageBar,
   formatAccountsTable,
-  bindingConstraint,
   type AccountUsageRow,
   type UsageSnapshot,
 } from './usage';
@@ -306,17 +305,12 @@ export class StatusBarManager implements vscode.Disposable {
       // Account pill only — usage meters are separate items (per-metric color)
       const prefix = '$(account) ';
       const badges = `${isSaved ? '' : ' $(circle-outline)'}${this.refreshing ? ' $(sync~spin)' : ''}`;
-      // Lead with the limit that will actually cut this account off, not always
-      // 5h: a just-reset 5h of 0% next to a 7d of 100% reads as "plenty left".
-      const binding = usage ? bindingConstraint(usage) : null;
-      const bindingSuffix = binding ? ` · ${binding.label} ${binding.percent}%` : '';
-      // Over budget the NAME gives way, never the percent — the number is the
-      // point. Truncate the name BEFORE composing: slicing the composed string
-      // can cut inside a `$(codicon)` and leave the bar rendering the markup.
-      const room = Math.max(1, 80 - prefix.length - badges.length - bindingSuffix.length);
+      // Truncate the name BEFORE composing: slicing the composed string can cut
+      // inside a `$(codicon)` and leave the bar rendering the markup.
+      const room = Math.max(1, 80 - prefix.length - badges.length);
       const name = email.split('@')[0];
       const shown = name.length > room ? `${name.slice(0, Math.max(0, room - 1))}…` : name;
-      this.item.text = `${prefix}${shown}${badges}${bindingSuffix}`;
+      this.item.text = `${prefix}${shown}${badges}`;
 
       const unique = this.registry.listUniqueByEmail();
       const hasOthers = unique.some((a) => this.registry.emailOf(a) !== email);
@@ -379,12 +373,9 @@ export class StatusBarManager implements vscode.Disposable {
           : '',
         actions.join(' &nbsp;·&nbsp; '),
       ]);
-      // The account item carries the BINDING limit's color, at the SAME warn
-      // threshold that limit's own pill uses — one number must not be amber here
-      // and plain there. Never-fetched stays uncolored.
-      this.item.backgroundColor = binding
-        ? this.metricBackground(binding.percent, binding.label === '5h' ? 65 : 70)
-        : undefined;
+      // Account item never carries usage hot/warn background — each metric pill
+      // colors itself from its own percent.
+      this.item.backgroundColor = undefined;
       this.renderMetricItems(usage);
     } else if (notLoggedIn) {
       // A logout ends the "your token was restocked earlier" storyline — without

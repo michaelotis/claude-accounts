@@ -30,7 +30,6 @@ import {
   pressureReasons,
   selectFailoverAccount,
   usageScore,
-  bindingConstraint,
 } from './usageParse';
 
 export type { UsageSnapshot, FailoverThresholds, FailoverTriggers, FailoverStrategy };
@@ -48,7 +47,6 @@ export {
   pressureReasons,
   selectFailoverAccount,
   usageScore,
-  bindingConstraint,
 };
 
 const API_BASE = 'https://api.anthropic.com';

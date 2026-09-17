@@ -26,15 +26,6 @@
   now simply repaint from the shared cache. A 429 is still never treated as a
   sign-out, and the meter still shows the last known figures while one is in
   force.
-- **The status bar led with 5h even when the 7-day limit was the one about to cut
-  you off.** A just-reset 5h reading of 0% sat next to a 7d of 100% and read as
-  "plenty left". The account item now appends whichever limit is highest — 5h, 7d
-  or a model-scoped bucket — as `$(account) name · 7d 96%`, and takes its
-  warning/error colour from that number; a long account name is truncated before
-  the percent is. The three metric pills are unchanged, so each still shows and
-  colours its own figure. An account whose usage has never been fetched shows no
-  constraint rather than a binding 0%.
-
 ## 0.9.12
 
 ### Fixed

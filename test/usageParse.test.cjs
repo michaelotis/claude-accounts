@@ -18,7 +18,6 @@ esbuild.buildSync({
 const {
   buildSnapshot,
   parseModelLimits,
-  bindingConstraint,
   isHot,
   needsFailover,
   failoverReasons,
@@ -125,62 +124,6 @@ describe('buildSnapshot + triggers', () => {
       needsFailover(snap, DEFAULT_THRESHOLDS, { session: true, weekly: false, fable: false }),
       false
     );
-  });
-});
-
-describe('bindingConstraint (the limit that actually cuts you off)', () => {
-  const snap = (over) => ({
-    sessionPercent: 0,
-    sessionResetsAt: null,
-    weeklyPercent: 0,
-    weeklyResetsAt: null,
-    opusPercent: null,
-    opusResetsAt: null,
-    sonnetPercent: null,
-    sonnetResetsAt: null,
-    modelLimits: [],
-    overagePercent: null,
-    email: 'a@b.com',
-    orgName: null,
-    planLabel: null,
-    fetchedAt: 1_700_000_000_000,
-    configDir: '/tmp/fake',
-    ...over,
-  });
-
-  it('leads with 7d when 5h just reset and the week is spent', () => {
-    assert.deepEqual(bindingConstraint(snap({ sessionPercent: 0, weeklyPercent: 100 })), {
-      label: '7d',
-      percent: 100,
-    });
-  });
-
-  it('leads with a model limit when it exceeds both buckets', () => {
-    const u = snap({
-      sessionPercent: 20,
-      weeklyPercent: 60,
-      modelLimits: [{ name: 'Fable', percent: 96, resetsAt: null, kind: 'weekly_scoped' }],
-    });
-    assert.deepEqual(bindingConstraint(u), { label: 'Fable', percent: 96 });
-  });
-
-  it('ties prefer 5h, then 7d', () => {
-    const both = snap({
-      sessionPercent: 50,
-      weeklyPercent: 50,
-      modelLimits: [{ name: 'Fable', percent: 50, resetsAt: null, kind: 'weekly_scoped' }],
-    });
-    assert.deepEqual(bindingConstraint(both), { label: '5h', percent: 50 });
-    const weekly = snap({
-      sessionPercent: 40,
-      weeklyPercent: 50,
-      modelLimits: [{ name: 'Fable', percent: 50, resetsAt: null, kind: 'weekly_scoped' }],
-    });
-    assert.deepEqual(bindingConstraint(weekly), { label: '7d', percent: 50 });
-  });
-
-  it('never-fetched is null, not a binding 0%', () => {
-    assert.equal(bindingConstraint(snap({ fetchedAt: 0 })), null);
   });
 });
 
