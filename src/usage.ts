@@ -64,10 +64,10 @@ const CLAUDE_OAUTH_TOKEN_URL = 'https://console.anthropic.com/v1/oauth/token';
  * schedule-from-last-success clock: one network call per account per TTL,
  * machine-wide, however many windows are open.
  *
- * 150s is measured, not guessed. Over 34h of 16 windows on 5 accounts (6,837
- * calls, 2,295 of them 429 = 33.6%), P(429) by gap since that account's last
- * success was 54.7% at 60-90s (n=3,948), 19.7% at 90-120s (n=122), 1.3% at
- * 120-150s (n=1,515) and 1.2% at 150-180s (n=665) — the allowance is about one
+ * 150s is measured, not guessed. Over 34h of continuous real use (about a third
+ * of all calls refused), P(429) by gap since that account's last success was
+ * 54.7% at 60-90s, 19.7% at 90-120s, 1.3% at 120-150s and 1.2% at 150-180s —
+ * the allowance is about one
  * successful call per 2 min per account, and asking every ~72s spent half the
  * calls on refusals. 150s sits in the flat part of that curve. The poll timer is
  * separate and unchanged: most of its ticks now repaint from cache.
@@ -92,8 +92,8 @@ const FORCE_COALESCE_MS = 5_000;
 const FORCE_FRESH_ENOUGH_MS = USAGE_CACHE_TTL_MS;
 /**
  * After a poll 429, serve the last cache and don't re-poll for this long. ONE
- * rung, not a ladder: at a >=150s gap refusals measure 1.3% (n=1,515 at 120-150s)
- * and 1.2% (n=665 at 150-180s), and recovery after a 429 is median 73s / p90 89s,
+ * rung, not a ladder: at a >=150s gap refusals measure 1.3% (120-150s) and 1.2%
+ * (150-180s), and recovery after a 429 is median 73s / p90 89s,
  * so a second refusal on this rung is a ~1.3% event and two in a row ~0.02%.
  * Longer rungs are unreachable except through a state bug, and their failure mode
  * is the frozen meter this backoff exists to avoid.
@@ -291,7 +291,7 @@ function metaPath(): string {
 /**
  * readMeta() is on the paint path — render() asks isRateLimited() on every
  * repaint, in every window — and a blocking readFileSync of a machine-wide file
- * per repaint is real jank across 16 windows. The values it carries move on a
+ * per repaint is real jank once several windows are open. The values it carries move on a
  * 150s scale, so a ~1s memo loses nothing. Keyed by path so a test's HOME switch
  * (and a dir change in-process) can never serve another store's meta.
  */
