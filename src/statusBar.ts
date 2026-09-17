@@ -5,8 +5,10 @@ import { WindowBinding } from './binding';
 import { defaultSourceDir } from './capture';
 import {
   UsageMonitor,
+  USAGE_CACHE_TTL_MS,
   formatUsageBar,
   formatAccountsTable,
+  bindingConstraint,
   type AccountUsageRow,
   type UsageSnapshot,
 } from './usage';
@@ -17,7 +19,13 @@ const EXTENSION_ID = 'michaelotis.claude-accounts';
 const ERROR_BG = new vscode.ThemeColor('statusBarItem.errorBackground');
 const WARN_BG = new vscode.ThemeColor('statusBarItem.warningBackground');
 /** Tooltip rows older than this get a "(stale)" hint (2× the background tier). */
-const STALE_ROW_MS = 10 * 60_000;
+const STALE_ROW_MS = 20 * 60_000;
+/**
+ * How long a Refresh Usage receipt stays in the tooltip. It reports what one
+ * click did; past this it is describing a moment that has gone, and a receipt
+ * must never be the reason a live degradation warning isn't shown.
+ */
+const REFRESH_NOTE_TTL_MS = 30_000;
 
 /** Compact "12s" / "3m" / "1h 05m" age for the tooltip's Refreshed line. */
 function formatAgo(ms: number): string {
@@ -49,6 +57,8 @@ export class StatusBarManager implements vscode.Disposable {
   private refreshing = false;
   /** Set when this window's stale token was quietly restocked; cleared by reload. */
   private staleTokenNote = false;
+  /** Outcome line for the last Refresh Usage click, with the time it was set. */
+  private refreshNote: { text: string; at: number; claimsCurrent: boolean } | null = null;
 
   constructor(
     private readonly registry: AccountRegistry,
@@ -117,7 +127,33 @@ export class StatusBarManager implements vscode.Disposable {
   /** Show/clear the inline "updating usage…" spinner + tooltip note (Refresh Usage). */
   setRefreshing(on: boolean): void {
     this.refreshing = on;
+    // A new click supersedes what the last one reported.
+    if (on) this.refreshNote = null;
     this.render();
+  }
+
+  /**
+   * What the last Refresh Usage click actually did — served figures that were
+   * already current, or waited out a rate-limit. Tooltip only: the Refresh Usage
+   * toast was deliberately removed, and a click must not reopen that door.
+   */
+  setRefreshNote(note: string, claimsCurrent = false): void {
+    this.refreshNote = note ? { text: note, at: Date.now(), claimsCurrent } : null;
+    this.render();
+  }
+
+  /**
+   * The click receipt while it still describes the present: gone after its TTL,
+   * and gone the moment a receipt that called the figures current would sit over
+   * a snapshot that has aged past the freshness clock.
+   */
+  private liveRefreshNote(usage: UsageSnapshot | null | undefined): string {
+    const note = this.refreshNote;
+    if (!note) return '';
+    if (Date.now() - note.at >= REFRESH_NOTE_TTL_MS) return '';
+    if (note.claimsCurrent && usage?.fetchedAt && Date.now() - usage.fetchedAt > USAGE_CACHE_TTL_MS)
+      return '';
+    return note.text;
   }
 
   /**
@@ -268,10 +304,19 @@ export class StatusBarManager implements vscode.Disposable {
       const savedByEmail = email ? this.registry.savedForEmail(email) : undefined;
       const isSaved = Boolean(savedName || active || savedByEmail);
       // Account pill only — usage meters are separate items (per-metric color)
-      const main = `$(account) ${email.split('@')[0]}${isSaved ? '' : ' $(circle-outline)'}${
-        this.refreshing ? ' $(sync~spin)' : ''
-      }`;
-      this.item.text = main.length > 80 ? main.slice(0, 77) + '…' : main;
+      const prefix = '$(account) ';
+      const badges = `${isSaved ? '' : ' $(circle-outline)'}${this.refreshing ? ' $(sync~spin)' : ''}`;
+      // Lead with the limit that will actually cut this account off, not always
+      // 5h: a just-reset 5h of 0% next to a 7d of 100% reads as "plenty left".
+      const binding = usage ? bindingConstraint(usage) : null;
+      const bindingSuffix = binding ? ` · ${binding.label} ${binding.percent}%` : '';
+      // Over budget the NAME gives way, never the percent — the number is the
+      // point. Truncate the name BEFORE composing: slicing the composed string
+      // can cut inside a `$(codicon)` and leave the bar rendering the markup.
+      const room = Math.max(1, 80 - prefix.length - badges.length - bindingSuffix.length);
+      const name = email.split('@')[0];
+      const shown = name.length > room ? `${name.slice(0, Math.max(0, room - 1))}…` : name;
+      this.item.text = `${prefix}${shown}${badges}${bindingSuffix}`;
 
       const unique = this.registry.listUniqueByEmail();
       const hasOthers = unique.some((a) => this.registry.emailOf(a) !== email);
@@ -287,15 +332,29 @@ export class StatusBarManager implements vscode.Disposable {
           : '',
       ].filter(Boolean);
 
+      // Say how stale the figures are and when we will ask again, in the numbers
+      // we actually hold: "retrying shortly" was printed over waits of minutes.
+      const waitMs = this.usage.rateLimitWaitMs(dir);
+      const nextAttempt =
+        waitMs != null
+          ? `next attempt in ${Math.ceil(waitMs / 1000)}s`
+          : 'retrying at the next poll';
       const rateNote =
         !usage || usage.fetchedAt === 0
-          ? '⚠ _Usage API is rate-limiting — retrying shortly._'
-          : '⚠ _Usage API is rate-limiting — showing the last known figures; retrying shortly._';
+          ? `⚠ _Usage API is rate-limiting this account — no figures yet, ${nextAttempt}._`
+          : `⚠ _Usage API is rate-limiting this account — last figures are ${formatAgo(
+              Date.now() - usage.fetchedAt
+            )} old, ${nextAttempt}._`;
+      // A live degradation warning outranks a click receipt: the receipt reports
+      // one moment, the warning describes the figures on screen right now.
+      const refreshNote = this.liveRefreshNote(usage);
       const freshness = this.refreshing
         ? '⟳ _Updating usage…_'
         : this.usage.isRateLimited(dir)
           ? rateNote
-          : '';
+          : refreshNote
+            ? `$(info) _${refreshNote}_`
+            : '';
       const staleNote = this.staleTokenNote
         ? '$(info) _Your sign-in was refreshed in another window and this window picked up the ' +
           'new token. If Claude Code still reports an auth error, reload this window once._'
@@ -320,8 +379,12 @@ export class StatusBarManager implements vscode.Disposable {
           : '',
         actions.join(' &nbsp;·&nbsp; '),
       ]);
-      // Account item never carries usage hot/warn background
-      this.item.backgroundColor = undefined;
+      // The account item carries the BINDING limit's color, at the SAME warn
+      // threshold that limit's own pill uses — one number must not be amber here
+      // and plain there. Never-fetched stays uncolored.
+      this.item.backgroundColor = binding
+        ? this.metricBackground(binding.percent, binding.label === '5h' ? 65 : 70)
+        : undefined;
       this.renderMetricItems(usage);
     } else if (notLoggedIn) {
       // A logout ends the "your token was restocked earlier" storyline — without

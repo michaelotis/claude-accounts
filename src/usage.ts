@@ -30,6 +30,7 @@ import {
   pressureReasons,
   selectFailoverAccount,
   usageScore,
+  bindingConstraint,
 } from './usageParse';
 
 export type { UsageSnapshot, FailoverThresholds, FailoverTriggers, FailoverStrategy };
@@ -47,6 +48,7 @@ export {
   pressureReasons,
   selectFailoverAccount,
   usageScore,
+  bindingConstraint,
 };
 
 const API_BASE = 'https://api.anthropic.com';
@@ -57,29 +59,70 @@ const FETCH_TIMEOUT_MS = 15_000;
 const CLAUDE_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const CLAUDE_OAUTH_TOKEN_URL = 'https://console.anthropic.com/v1/oauth/token';
 /**
- * Disk cache TTL for /api/oauth/usage. Shared on-disk across windows, so the poll
- * fetches at most once per TTL per account no matter how many windows are open
- * (a window whose poll finds a fresh cache serves it without a network hit). 1 min
- * keeps the meter responsive; the API tolerates this — the old 5 min was a
- * self-imposed guess, not a measured limit, and a real 429 still backs off below.
+ * Disk cache TTL for /api/oauth/usage. The shared entry is written only after an
+ * HTTP 200, so its fetchedAt is that account's last SUCCESS and this TTL is a
+ * schedule-from-last-success clock: one network call per account per TTL,
+ * machine-wide, however many windows are open.
+ *
+ * 150s is measured, not guessed. Over 34h of 16 windows on 5 accounts (6,837
+ * calls, 2,295 of them 429 = 33.6%), P(429) by gap since that account's last
+ * success was 54.7% at 60-90s (n=3,948), 19.7% at 90-120s (n=122), 1.3% at
+ * 120-150s (n=1,515) and 1.2% at 150-180s (n=665) — the allowance is about one
+ * successful call per 2 min per account, and asking every ~72s spent half the
+ * calls on refusals. 150s sits in the flat part of that curve. The poll timer is
+ * separate and unchanged: most of its ticks now repaint from cache.
  */
-export const USAGE_CACHE_TTL_MS = 60_000;
+export const USAGE_CACHE_TTL_MS = 150_000;
 /**
- * Freshness tier for accounts not active in this window. An account active in ANY
- * window gets 60s freshness machine-wide from that window's cycle; accounts open
- * nowhere still refresh every 5 min so the tooltip table stays meaningful. Total
- * machine-wide budget: ~1 call/min per active account + ~1 per 5 min per idle one.
+ * Freshness tier for accounts not active in any window — they only feed the
+ * tooltip table, so they get the loosest clock that keeps it meaningful. At 10
+ * min an idle account costs ~1 call per 10 min against the same measured ~1
+ * call/2 min per-account allowance, leaving the headroom for the active one.
  */
-export const BACKGROUND_TTL_MS = 300_000;
+export const BACKGROUND_TTL_MS = 600_000;
 /** Two manual refreshes within this window coalesce into one network call. */
 const FORCE_COALESCE_MS = 5_000;
 /**
- * After a poll 429, serve the last cache and don't re-poll for this long. Kept to a
- * single poll cycle: a longer freeze (this was 5 min) is exactly what left the meter
- * stuck at an old percent and missing the climb to 100%. One cycle lets it recover on
- * the next (jittered) poll, which — de-aligned across windows — usually isn't limited.
+ * A forced refresh (Refresh Usage) serves the shared entry instead of calling when
+ * it is younger than this. The measured allowance is ~1 successful call per 2 min
+ * per account, so re-asking inside that window spends the budget to be told the
+ * same figures — or, more often, to be refused. One freshness clock: this is the
+ * cache TTL, not a second number nobody can derive.
  */
-const RATE_LIMIT_BACKOFF_MS = 60_000;
+const FORCE_FRESH_ENOUGH_MS = USAGE_CACHE_TTL_MS;
+/**
+ * After a poll 429, serve the last cache and don't re-poll for this long. ONE
+ * rung, not a ladder: at a >=150s gap refusals measure 1.3% (n=1,515 at 120-150s)
+ * and 1.2% (n=665 at 150-180s), and recovery after a 429 is median 73s / p90 89s,
+ * so a second refusal on this rung is a ~1.3% event and two in a row ~0.02%.
+ * Longer rungs are unreachable except through a state bug, and their failure mode
+ * is the frozen meter this backoff exists to avoid.
+ */
+export const RATE_LIMIT_BACKOFF_MS = USAGE_CACHE_TTL_MS;
+/**
+ * Ceiling on any wait this process will honour, applied at WRITE time (a server
+ * retry-after is clamped into it) and again at READ time. Every timestamp in the
+ * shared files is another window's Date.now() with no monotonic source, and WSL2
+ * host suspend/resume leaves the guest clock wrong — so a corrupt, foreign or
+ * skewed deadline degrades to "call sooner", never "freeze longer".
+ */
+export const MAX_BACKOFF_MS = 300_000;
+
+/**
+ * How far into the future a shared timestamp may sit before it is treated as a
+ * skewed clock rather than a real event — applies to a cache entry's fetchedAt
+ * and to a backoff record's `at`. Every one is another window's Date.now() with
+ * no monotonic source; WSL2 host suspend/resume routinely leaves the guest clock
+ * wrong.
+ */
+const CLOCK_SKEW_TOLERANCE_MS = 60_000;
+/**
+ * This process never issues two usage calls for one key inside this gap, whatever
+ * the shared files say. It is what bounds failing toward calling: if the shared
+ * backoff state is corrupt, locked, dropped by an older build or clock-skewed, the
+ * worst case is one call per account per 2 min per window rather than one per tick.
+ */
+const MIN_CALL_GAP_MS = 120_000;
 /** Refresh access token this long before expiresAt. */
 const TOKEN_HEADROOM_MS = 60_000;
 
@@ -221,41 +264,104 @@ function writeUsageCache(cache: UsageCacheFile): void {
   }
 }
 
+/** One account's post-429 state. `until` is absolute and already clamped on write. */
+interface BackoffRecord {
+  /** Wall clock of the 429 — compared against the cache entry, and logged. */
+  at: number;
+  /** Absolute deadline: no wait is ever derived from anything but this. */
+  until: number;
+  /** Consecutive refusals. DIAGNOSTIC ONLY — never an input to the wait. */
+  count: number;
+}
+
 interface UsageMeta {
   /**
-   * Per-account network backoff: cache-key (email:… / dir:…) → wall clock of its
-   * last poll HTTP 429. Per-account so one account's 429 does not freeze every
-   * other account's meter on stale data for the backoff window.
+   * Per-account post-429 backoff, owned exclusively by this build. Older builds
+   * co-own `rateLimitAt`/`rateLimitStreak`/`rateLimitRetryAfterMs` and rewrite
+   * them on their own cadence; we never read, write or delete those, so no
+   * foreign write can lengthen our wait. They are left to rot in place.
    */
-  rateLimitAt?: Record<string, number>;
-  /** Legacy machine-wide stamp (pre per-account); ignored now, left to expire. */
-  lastRateLimitAt?: number;
+  backoff?: Record<string, BackoffRecord>;
 }
 
 function metaPath(): string {
   return path.join(policyDir(), 'usage-meta.json');
 }
 
+/**
+ * readMeta() is on the paint path — render() asks isRateLimited() on every
+ * repaint, in every window — and a blocking readFileSync of a machine-wide file
+ * per repaint is real jank across 16 windows. The values it carries move on a
+ * 150s scale, so a ~1s memo loses nothing. Keyed by path so a test's HOME switch
+ * (and a dir change in-process) can never serve another store's meta.
+ */
+const META_MEMO_MS = 1_000;
+let metaMemo: { path: string; at: number; meta: UsageMeta } | null = null;
+
 function readMeta(): UsageMeta {
+  const file = metaPath();
+  const now = Date.now();
+  if (metaMemo && metaMemo.path === file && now - metaMemo.at < META_MEMO_MS) return metaMemo.meta;
+  let meta: UsageMeta = {};
   try {
-    return JSON.parse(fs.readFileSync(metaPath(), 'utf-8')) as UsageMeta;
+    meta = JSON.parse(fs.readFileSync(file, 'utf-8')) as UsageMeta;
   } catch {
-    return {};
+    /* missing / corrupt — fail toward calling, never toward waiting */
   }
+  if (!meta || typeof meta !== 'object') meta = {};
+  metaMemo = { path: file, at: now, meta };
+  return meta;
 }
 
+/** Drop the memo so the next read sees what we (or another window) just wrote. */
+function forgetMeta(): void {
+  metaMemo = null;
+}
+
+/** Throws on failure: the backoff writers report it instead of swallowing it. */
 function writeMeta(m: UsageMeta): void {
-  try {
-    fs.mkdirSync(policyDir(), { recursive: true, mode: 0o700 });
-    writeFileAtomic(metaPath(), JSON.stringify(m, null, 2), { mode: 0o600 });
-  } catch (err) {
-    log(`usage-meta write failed: ${err instanceof Error ? err.message : String(err)}`);
-  }
+  fs.mkdirSync(policyDir(), { recursive: true, mode: 0o700 });
+  writeFileAtomic(metaPath(), JSON.stringify(m, null, 2), { mode: 0o600 });
+  forgetMeta();
+}
+
+/**
+ * Ms left in this key's backoff, or null when it may be polled now. Every step
+ * fails toward calling: an unreadable record, an impossible deadline, or any
+ * window's success since the refusal all mean "no backoff", and the survivor is
+ * capped at MAX_BACKOFF_MS so no value on disk can freeze this process longer.
+ */
+function rateLimitWaitMs(key: string): number | null {
+  const rec = readMeta().backoff?.[key];
+  if (!rec || typeof rec !== 'object') return null;
+  if (!Number.isFinite(rec.until)) return null;
+  // A record stamped in the future is a skewed clock, not a refusal we made: it
+  // would also defeat the success check below (no entry can be newer than a
+  // future `at`), so it fails toward calling like every other impossible value.
+  const now = Date.now();
+  // `at` is REQUIRED, not optional: it is the only thing that bounds the deadline
+  // and the only thing the success check can compare against. Missing, garbage or
+  // stamped in the future (a skewed clock) all mean the record cannot be trusted
+  // to expire, so it fails toward calling like every other impossible value —
+  // treating it as "now" would re-arm the cap on every read and freeze forever.
+  if (!Number.isFinite(rec.at) || rec.at > now + CLOCK_SKEW_TOLERANCE_MS) return null;
+  // usage-cache.json is written only after an HTTP 200, by EVERY version of this
+  // extension — so an entry newer than our refusal is someone's success, and the
+  // refusal is spent whoever made the call.
+  const entry = readUsageCache().entries[key];
+  if (entry && typeof entry.fetchedAt === 'number' && entry.fetchedAt > rec.at) return null;
+  // Cap the DEADLINE, not the remainder: capping `until - now` hands back a fresh
+  // MAX_BACKOFF_MS on every read when `until` sits far in the future, which is an
+  // unbounded freeze rather than a bounded one. `stampedAt` never exceeds now, so
+  // the returned wait can never exceed MAX_BACKOFF_MS even for a record stamped
+  // slightly ahead of our clock and accepted by the tolerance above.
+  const stampedAt = Math.min(rec.at, now);
+  const wait = Math.min(rec.until, stampedAt + MAX_BACKOFF_MS) - now;
+  return wait > 0 ? wait : null;
 }
 
 function inRateLimitBackoff(key: string): boolean {
-  const at = readMeta().rateLimitAt?.[key] || 0;
-  return at > 0 && Date.now() - at < RATE_LIMIT_BACKOFF_MS;
+  return rateLimitWaitMs(key) != null;
 }
 
 /**
@@ -265,45 +371,93 @@ function inRateLimitBackoff(key: string): boolean {
  */
 const backoffLoggedFor = new Map<string, number>();
 function logBackoffOnce(key: string): void {
-  const at = readMeta().rateLimitAt?.[key] || 0;
+  const at = readMeta().backoff?.[key]?.at ?? 0;
   if (!at) return; // not actually in backoff (e.g. the lock-busy fallback path)
   if (backoffLoggedFor.get(key) === at) return;
   backoffLoggedFor.set(key, at);
   log(`usage: rate-limit backoff active — serving best-effort for ${key}`);
 }
 
-async function stampRateLimitBackoff(key: string): Promise<void> {
+/**
+ * Persist the deadline this process has already decided to enforce. Returns
+ * whether it reached disk: a 429 is never a hard failure, so this must not throw
+ * into the fetch path — the shared record is an optimisation for the other
+ * windows, and MIN_CALL_GAP_MS keeps this one honest without it.
+ */
+async function stampRateLimitBackoff(key: string, waitMs: number): Promise<boolean> {
+  let ok = false;
   await withLockAsync(
     lockFor(metaPath()),
     () => {
-      const m = readMeta();
-      const map = m.rateLimitAt ?? {};
-      map[key] = Date.now();
-      writeMeta({ ...m, rateLimitAt: map });
+      try {
+        forgetMeta(); // read-modify-write under the lock must see the current file
+        const m = readMeta();
+        const backoff = m.backoff ?? {};
+        const now = Date.now();
+        const prev = backoff[key];
+        const count =
+          (typeof prev?.count === 'number' && Number.isFinite(prev.count) ? prev.count : 0) + 1;
+        backoff[key] = { at: now, until: now + waitMs, count };
+        writeMeta({ ...m, backoff });
+        ok = true;
+        if (count >= 2) {
+          // The wait is flat by design; a repeat refusal on a >=150s gap measured
+          // ~1.3%, so a count that keeps climbing is new evidence, not a schedule.
+          log(`usage: 429 #${count} in a row for ${key} (diagnostic — the wait stays flat)`);
+        }
+      } catch (err) {
+        log(`usage-meta write failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
     },
     { staleMs: 15_000, capMs: 2_000, stepMs: 25 }
   );
+  return ok;
 }
 
-async function clearRateLimitBackoff(key: string): Promise<void> {
+/** Drop this key's record after a 200. Returns whether the file was updated. */
+async function clearRateLimitBackoff(key: string): Promise<boolean> {
+  let ok = false;
   await withLockAsync(
     lockFor(metaPath()),
     () => {
-      const m = readMeta();
-      if (!m.rateLimitAt?.[key] && m.lastRateLimitAt === undefined) return;
-      if (m.rateLimitAt) delete m.rateLimitAt[key];
-      delete m.lastRateLimitAt;
-      writeMeta(m);
+      try {
+        forgetMeta();
+        const m = readMeta();
+        // Legacy keys are another build's business — clearing them would shorten
+        // ITS backoff and push its call rate up.
+        if (m.backoff?.[key] === undefined) {
+          ok = true;
+          return;
+        }
+        delete m.backoff[key];
+        writeMeta(m);
+        ok = true;
+      } catch (err) {
+        log(`usage-meta write failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
     },
     { staleMs: 15_000, capMs: 2_000, stepMs: 25 }
   );
+  return ok;
 }
 
 function getCachedSnap(key: string, maxAgeMs: number): UsageSnapshot | null {
   const entry = readUsageCache().entries[key];
   if (!entry?.snap || typeof entry.fetchedAt !== 'number') return null;
-  if (Date.now() - entry.fetchedAt > maxAgeMs) return null;
+  const age = Date.now() - entry.fetchedAt;
+  // A future-dated entry is fresh forever under a plain age test — refetch it.
+  if (age < -CLOCK_SKEW_TOLERANCE_MS) return null;
+  if (age > maxAgeMs) return null;
   return entry.snap;
+}
+
+/** Age of this key's shared entry, or null when it has never been usably fetched. */
+function cachedSnapAgeMs(key: string): number | null {
+  const entry = readUsageCache().entries[key];
+  if (!entry?.snap || typeof entry.fetchedAt !== 'number') return null;
+  const age = Date.now() - entry.fetchedAt;
+  if (age < -CLOCK_SKEW_TOLERANCE_MS) return null;
+  return Math.max(0, age);
 }
 
 /** Read-only view of one account's last cached snapshot (no network, no locks). */
@@ -574,10 +728,24 @@ function failure(kind: UsageFetchKind, message: string, status?: number): UsageF
 }
 
 /**
- * Usage poll: returns { status, data } for both success and HTTP errors
- * (does not throw on 429). Throws only on network/timeout.
+ * `retry-after` in whole seconds → ms. Null when absent, not a plain integer
+ * (the HTTP-date form tells us nothing about this API's window) or non-positive.
  */
-async function callUsageApi(token: string): Promise<{ status: number; data: unknown }> {
+function parseRetryAfterMs(header: string | null | undefined): number | null {
+  if (!header) return null;
+  const raw = header.trim();
+  if (!/^\d+$/.test(raw)) return null;
+  const secs = Number.parseInt(raw, 10);
+  return secs > 0 ? secs * 1_000 : null;
+}
+
+/**
+ * Usage poll: returns { status, data, retryAfterMs } for both success and HTTP
+ * errors (does not throw on 429). Throws only on network/timeout.
+ */
+async function callUsageApi(
+  token: string
+): Promise<{ status: number; data: unknown; retryAfterMs: number | null }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
@@ -589,14 +757,15 @@ async function callUsageApi(token: string): Promise<{ status: number; data: unkn
     });
     const text = await res.text();
     const status = res.status;
+    const retryAfterMs = parseRetryAfterMs(res.headers?.get('retry-after'));
     if (status === 200) {
       try {
-        return { status, data: JSON.parse(text) };
+        return { status, data: JSON.parse(text), retryAfterMs };
       } catch {
         throw new Error('Invalid JSON from usage API');
       }
     }
-    return { status, data: text.slice(0, 200) };
+    return { status, data: text.slice(0, 200), retryAfterMs };
   } finally {
     clearTimeout(timer);
   }
@@ -604,8 +773,8 @@ async function callUsageApi(token: string): Promise<{ status: number; data: unkn
 
 /**
  * Usage poll sequence:
- *  1. If cache younger than 5 min → return it (no network)
- *  2. If recent poll 429 backoff → return best-effort (no network)
+ *  1. If cache younger than USAGE_CACHE_TTL_MS → return it (no network)
+ *  2. If inside this account's 429 backoff window → return best-effort (no network)
  *  3. PRELIMINARY: ensureFreshToken() — may POST console.anthropic.com/v1/oauth/token
  *  4. GET api.anthropic.com/api/oauth/usage
  *  5. 401/403 → force token refresh once, retry usage
@@ -650,11 +819,46 @@ export async function fetchUsageDetailed(
 }
 
 /**
+ * Last usage ATTEMPT per key in THIS process — 200, 429 or the 401/403 retry.
+ * Independent of every shared file, so it still holds when meta is corrupt,
+ * locked, rewritten by an older build or read through a jumped clock.
+ */
+const lastCallAttemptAt = new Map<string, number>();
+
+/** Ms left on this process's own minimum gap for the key, or null when clear. */
+function callGapWaitMs(key: string): number | null {
+  const at = lastCallAttemptAt.get(key);
+  if (at === undefined) return null;
+  const left = MIN_CALL_GAP_MS - (Date.now() - at);
+  return left > 0 ? left : null;
+}
+
+/**
+ * Test seam: forget the readMeta memo and rewind this process's recorded attempt
+ * times by `ms`, so a test that rewrites the shared files can act as if that much
+ * time had passed. Never called by the extension.
+ */
+export function __ageInProcessStateForTests(ms = 0): void {
+  forgetMeta();
+  for (const [k, at] of lastCallAttemptAt) lastCallAttemptAt.set(k, at - ms);
+}
+
+/**
  * Steps 3–7 of the poll sequence: token, GET /usage, 401-retry, 429 stamp, parse
  * + cache. No pre-checks — callers (fetchUsageDetailed legacy path and the
  * coordinator) decide when a network call is warranted.
  */
 async function fetchUsageNetwork(dir: string, key: string): Promise<UsageFetchResult> {
+  const gap = callGapWaitMs(key);
+  if (gap != null) {
+    // The shared gates said go, this process's own memory says otherwise. This is
+    // what makes failing toward calling bounded rather than a per-tick call.
+    log(
+      `usage: in-process call gap — not re-asking for ${key}, next attempt in ${Math.ceil(gap / 1000)}s`
+    );
+    return { ok: true, snap: { ...bestEffortSnap(dir, key), configDir: dir } };
+  }
+  lastCallAttemptAt.set(key, Date.now());
   // The one permanent line at the network moment — with the coordinator, the
   // union of every window's log shows ~one of these per account per TTL,
   // machine-wide. Cache hits stay silent by design.
@@ -686,7 +890,7 @@ async function fetchUsageNetwork(dir: string, key: string): Promise<UsageFetchRe
 
   try {
     // (4) Usage poll
-    let { status, data } = await callUsageApi(token);
+    let { status, data, retryAfterMs } = await callUsageApi(token);
 
     // (5) 401/403 → force refresh + one retry
     if (status === 401 || status === 403) {
@@ -696,7 +900,10 @@ async function fetchUsageNetwork(dir: string, key: string): Promise<UsageFetchRe
         // per-store lock) then retry once. No unlocked pre-write of expiresAt — it
         // was redundant with force=true and could clobber another window's refresh.
         token = await ensureFreshToken(dir, true);
-        ({ status, data } = await callUsageApi(token));
+        // A second call for this key, sub-second after the first — record it or a
+        // poll tick could chain straight onto it during a rotation storm.
+        lastCallAttemptAt.set(key, Date.now());
+        ({ status, data, retryAfterMs } = await callUsageApi(token));
       } catch (retryErr) {
         log(
           `usage: forced refresh failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`
@@ -726,10 +933,22 @@ async function fetchUsageNetwork(dir: string, key: string): Promise<UsageFetchRe
 
     // (6) 429 poll rate-limit — keep previous usage, stamp backoff
     if (status === 429) {
-      await stampRateLimitBackoff(key);
+      // The server may lengthen the wait up to the cap; it can never shorten it
+      // below the measured allowance, which is where the refusals live.
+      const waitMs = Math.min(
+        Math.max(retryAfterMs ?? RATE_LIMIT_BACKOFF_MS, RATE_LIMIT_BACKOFF_MS),
+        MAX_BACKOFF_MS
+      );
+      const persisted = await stampRateLimitBackoff(key, waitMs);
+      if (!persisted) {
+        // The other windows won't see it, but this one still waits: the attempt
+        // is already in lastCallAttemptAt, and the TTL gate stands either way.
+        log(`usage: FAILED to persist 429 backoff for ${key} — will retry at the TTL`);
+      }
       const snap = bestEffortSnap(dir, key);
       log(
-        `usage: HTTP 429 (poll rate-limit) — serving best-effort (5h ${snap.sessionPercent}% 7d ${snap.weeklyPercent}%), NOT treating as sign-out`
+        `usage: HTTP 429 (poll rate-limit) — serving best-effort (5h ${snap.sessionPercent}% 7d ${snap.weeklyPercent}%), ` +
+          `next attempt in ${Math.ceil(waitMs / 1000)}s, NOT treating as sign-out`
       );
       return { ok: true, snap: { ...snap, configDir: dir } };
     }
@@ -852,7 +1071,13 @@ export async function fetchUsageCoordinated(
       // FORCE_COALESCE_MS (two humans clicking refresh in two windows = 1 call).
       const recheck = fromCache(opts.forceNetwork ? FORCE_COALESCE_MS : freshForMs);
       if (recheck) return recheck;
-      if (!opts.forceNetwork && inRateLimitBackoff(key)) return bestEffort();
+      // Backoff is re-checked on BOTH paths: another window can stamp a 429
+      // between the unlocked check and the moment we take the lock, and the only
+      // forceNetwork caller (Refresh Usage) already declines when in backoff.
+      // Past the memo deliberately — that window is exactly what this re-check is
+      // for, and this runs once per real fetch, not once per repaint.
+      forgetMeta();
+      if (inRateLimitBackoff(key)) return bestEffort();
       const r = await network(dir, key);
       return { result: r, fromNetwork: true };
     },
@@ -1155,6 +1380,15 @@ export class UsageMonitor {
     return inRateLimitBackoff(cacheKeyForDir(resolveConfigDir(dir)));
   }
 
+  /**
+   * Ms until this account may be polled again, or null when it may be polled
+   * now. The Refresh Usage command reports it instead of implying a fetch it
+   * deliberately did not make.
+   */
+  rateLimitWaitMs(dir?: string): number | null {
+    return rateLimitWaitMs(cacheKeyForDir(resolveConfigDir(dir)));
+  }
+
   setActiveDir(dir: string | undefined): void {
     this.currentDir = dir;
   }
@@ -1191,6 +1425,12 @@ export class UsageMonitor {
 
   /** Last failure for the active dir (user-facing; no secrets). */
   lastFailure: UsageFetchFailure | null = null;
+  /**
+   * Age of the entry a forced refresh served instead of calling the API, or null
+   * when the last refresh really went to the network. Lets Refresh Usage say the
+   * figures are already current rather than claim a fetch.
+   */
+  lastServedFromCacheAgeMs: number | null = null;
 
   async refresh(dir?: string, forceNetwork = false): Promise<UsageSnapshot | null> {
     const d = resolveConfigDir(dir ?? this.currentDir);
@@ -1206,6 +1446,20 @@ export class UsageMonitor {
     const existing = this.inflight.get(inflightKey);
     if (existing) return existing;
     const p = (async (): Promise<UsageSnapshot | null> => {
+      this.lastServedFromCacheAgeMs = null;
+      // A forced refresh on figures this fresh is a call we'd spend to be told
+      // the same numbers: the measured allowance is ~1 successful call per 2 min
+      // per account, and asking inside it is refused more often than answered.
+      const alreadyFresh = forceNetwork ? getCachedSnap(key, FORCE_FRESH_ENOUGH_MS) : null;
+      if (alreadyFresh) {
+        this.lastFailure = null;
+        this.lastServedFromCacheAgeMs = cachedSnapAgeMs(key) ?? 0;
+        const snap = { ...alreadyFresh, configDir: fetchDir };
+        this.cache.set(key, snap);
+        this.emitPressure(snap);
+        this.emit();
+        return snap;
+      }
       if (fetchDir !== d && email && hasCredentials(d)) {
         // Store-lag guard: never poll a store the CLI's rotation left behind.
         try {
@@ -1391,7 +1645,7 @@ export class UsageMonitor {
           if (!this.polling || gen !== this.pollGen) return;
           // Reschedule AFTER the run (never overlap two polls) with jitter, so windows
           // that started together — e.g. a batch of windows reloaded at once — don't all
-          // poll at the 60s cache boundary and stampede /api/oauth/usage into a 429.
+          // poll at the cache boundary and stampede /api/oauth/usage into a 429.
           const delay = this.intervalMs + Math.floor(Math.random() * this.intervalMs * 0.5);
           this.timer = setTimeout(runAndReschedule, delay);
           this.timer.unref?.();

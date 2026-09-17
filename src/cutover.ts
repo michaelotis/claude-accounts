@@ -17,7 +17,7 @@ import { SetupWizard } from './setupWizard';
 import { log } from './log';
 import { TurnWatcher } from './turnWatcher';
 import {
-  BACKGROUND_TTL_MS,
+  USAGE_CACHE_TTL_MS,
   fetchUsageCoordinated,
   getUsageFromCache,
   usageCacheKey,
@@ -45,12 +45,36 @@ const PENDING_KEY = 'claudeAccounts.pendingIdleCutover';
 const AUTO_COOLDOWN_KEY = 'claudeAccounts.lastAutoCutoverAt';
 const AUTO_COOLDOWN_MS = 5 * 60_000;
 /**
- * How stale a cached snapshot may be for a cutover decision — tied to the
- * central poll's background tier: that is the freshness the poll actually
- * guarantees for every saved account. Anything older is "unknown", which
- * excludes the account rather than treating it as cool or hot.
+ * How stale the ACTIVE account's snapshot may be when deciding whether a failover
+ * is needed at all. Nothing re-validates this read and a false positive costs a
+ * window reload, so it stays as tight as the active account's own worst case
+ * allows — but no tighter, because a horizon under that worst case silently
+ * switches cutover evaluation OFF for the account most likely to need it.
+ *
+ * The worst case is a sum, not a single tier: the poll reschedules from the END
+ * of the previous run with 0-50% jitter (60-90s), the entry only becomes
+ * refetchable past USAGE_CACHE_TTL_MS (150s), and a 429 at that moment holds the
+ * next attempt for up to MAX_BACKOFF_MS (300s). 90 + 150 + 300 = 540s, so 600s is
+ * that worst case rounded up once, and it is pinned by a test.
  */
-const CUTOVER_SNAP_MAX_AGE_MS = BACKGROUND_TTL_MS;
+export const CUTOVER_CURRENT_MAX_AGE_MS = 600_000;
+/**
+ * How stale a candidate's snapshot may be during discovery. This read IS followed
+ * by a mandatory live re-validation, so it can be loose — and it must be: a
+ * background account is refreshed only past 600s, on a 60-90s poll that the
+ * refreshingAll guard can skip, so real ages reach 700-800s. A tighter horizon
+ * would quietly leave auto-cutover with no candidates at all.
+ */
+export const CUTOVER_PICK_MAX_AGE_MS = 900_000;
+/**
+ * Live re-validation of the picked target: how fresh the snapshot must be, and
+ * how fresh it must still look when it authorizes the switch. INVARIANT: the
+ * authorization horizon is >= the fetch's freshForMs. Raise freshForMs alone and
+ * every cache-served snapshot between the two fails authorization — auto-cutover
+ * stops working silently, logging a line that reads like a legitimate "not cool".
+ */
+export const CUTOVER_REVALIDATE_FRESH_MS = USAGE_CACHE_TTL_MS;
+export const CUTOVER_AUTHORIZE_MAX_AGE_MS = 180_000;
 /** Repeat the idle "usage high" log line at most this often while pressure persists. */
 const HIGH_LOG_THROTTLE_MS = 10 * 60_000;
 
@@ -171,7 +195,7 @@ export class IdleCutoverController {
       // Cache-only: a threshold decision tolerates minutes-old figures, and this
       // path fires on every turn-transition while hot — it must never hit the
       // network or the backoff log. The central poll owns freshness.
-      const currentSnap = getUsageFromCache(usageCacheKey(currentDir), CUTOVER_SNAP_MAX_AGE_MS);
+      const currentSnap = getUsageFromCache(usageCacheKey(currentDir), CUTOVER_CURRENT_MAX_AGE_MS);
       if (!currentSnap) {
         // No cached data yet (fresh activation / long 429) — keep pending and wait
         // for the poll to land; the next pressure or idle edge re-evaluates.
@@ -233,10 +257,10 @@ export class IdleCutoverController {
       // The pick came from the shared cache, which may be minutes old for an idle
       // account — an auto-switch (a window RELOAD) must not land on an account
       // that heated up since. Re-validate the target with ONE coordinated fetch
-      // (cache-fresh within a minute, else a single locked network call).
+      // (served from cache inside the freshness clock, else a locked network call).
       const fresh = await fetchUsageCoordinated(
         { dir: next.dir, email: nextEmail },
-        { freshForMs: 60_000 }
+        { freshForMs: CUTOVER_REVALIDATE_FRESH_MS }
       );
       if (this.disposed) return; // keep pending persisted so a reload can resume it
       if (!this.watching || this.panelMode !== 'idleReload') {
@@ -248,8 +272,11 @@ export class IdleCutoverController {
       const freshSnap = fresh.result.ok ? fresh.result.snap : null;
       // FAIL CLOSED on recency: a lock-skip or backoff serves best-effort, which
       // can be an old snap or literal zeros — and zeros read as maximally cool.
-      // Only a snapshot demonstrably from the last ~90s may authorize a switch.
-      const isRecent = Boolean(freshSnap && Date.now() - freshSnap.fetchedAt <= 90_000);
+      // The horizon covers everything the fetch above is allowed to serve from
+      // cache; anything older than that did not come from this check.
+      const isRecent = Boolean(
+        freshSnap && Date.now() - freshSnap.fetchedAt <= CUTOVER_AUTHORIZE_MAX_AGE_MS
+      );
       const stillCool =
         isRecent &&
         freshSnap &&
@@ -331,10 +358,10 @@ export class IdleCutoverController {
     for (const a of accounts) {
       const email = this.registry.emailOf(a);
       if (!email || !a.dir || !fs.existsSync(a.dir)) continue;
-      // Cache-only (the central poll keeps every saved account ≤5 min fresh):
-      // no data / too stale = unknown, not 100% — exclude from auto selection,
+      // Cache-only (the central poll refreshes idle accounts past the background
+      // tier): no data / too stale = unknown, not 100% — exclude from selection,
       // exactly like the old fetch-failed rule. Never fan out network calls here.
-      const snap = getUsageFromCache(usageCacheKey(a.dir, email), CUTOVER_SNAP_MAX_AGE_MS);
+      const snap = getUsageFromCache(usageCacheKey(a.dir, email), CUTOVER_PICK_MAX_AGE_MS);
       if (!snap) {
         log(`cutover: skip ${email} (no fresh cached usage)`);
         continue;
