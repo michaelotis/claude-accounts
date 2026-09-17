@@ -204,28 +204,6 @@ export function buildSnapshot(
   };
 }
 
-/**
- * The limit that will actually cut this account off: the highest of 5h, 7d and
- * every model-scoped bucket. A just-reset 5h reading says nothing about an
- * account sitting at 100% for the week, so the meter leads with this instead of
- * always with 5h. Ties fall to 5h, then 7d, then the snapshot's model order.
- * Null for a never-fetched snapshot (fetchedAt 0) — 0% there is the absence of a
- * reading, not a reading of zero.
- */
-export function bindingConstraint(u: UsageSnapshot): { label: string; percent: number } | null {
-  if (u.fetchedAt === 0) return null;
-  const candidates = [
-    { label: '5h', percent: u.sessionPercent },
-    { label: '7d', percent: u.weeklyPercent },
-    ...u.modelLimits.map((m) => ({ label: m.name, percent: m.percent })),
-  ];
-  let binding = candidates[0];
-  for (const c of candidates) {
-    if (c.percent > binding.percent) binding = c;
-  }
-  return binding;
-}
-
 export function fablePercent(u: UsageSnapshot): number | null {
   const m = u.modelLimits.find((x) => /fable/i.test(x.name));
   return m ? m.percent : null;
