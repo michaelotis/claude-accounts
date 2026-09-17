@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.9.13
+
+### Fixed
+- **A third of all usage calls were being refused, and a refusal froze the meter
+  right when it mattered — 95% one moment, out of usage the next.** Measured over
+  34 h of 16 windows on 5 accounts: 6,837 calls, 2,295 of them HTTP 429 (33.6%).
+  Sorted by the gap since that account's last *successful* call, 60–90 s was
+  refused 54.7% of the time, 90–120 s 19.7%, 120–150 s 1.3% and 150–180 s 1.2% —
+  the allowance is roughly one successful call per two minutes per account, and
+  the extension was asking every ~72 s. The shared cache entry is written only
+  after a 200, so its TTL already schedules from the last success: that TTL is
+  now 150 s (600 s for accounts not open in any window), which lands in the flat
+  part of the measured curve. A 429 no longer retries into the same wall either:
+  the account waits one flat 150 s, never more than 5 minutes whatever the server
+  or the shared files say, and a `retry-after` header can only lengthen that wait
+  within the 5-minute cap — never shorten it below the measured allowance. A
+  success by *any* window ends the wait, because the shared cache entry is written
+  only after a 200. With five accounts in use that is about 105 calls an hour
+  machine-wide, but the number that governs is the per-account gap, not any
+  machine-wide total: each account is asked at most once per 150 s no matter how
+  many windows are open. Clicking Refresh Usage on figures under 150 s old now
+  serves them and says so in the tooltip instead of spending a call to be told the
+  same numbers, and the tooltip states how old the figures really are and when the
+  next attempt is due. The poll timer is unchanged at 60–90 s; most of its ticks
+  now simply repaint from the shared cache. A 429 is still never treated as a
+  sign-out, and the meter still shows the last known figures while one is in
+  force.
+- **The status bar led with 5h even when the 7-day limit was the one about to cut
+  you off.** A just-reset 5h reading of 0% sat next to a 7d of 100% and read as
+  "plenty left". The account item now appends whichever limit is highest — 5h, 7d
+  or a model-scoped bucket — as `$(account) name · 7d 96%`, and takes its
+  warning/error colour from that number; a long account name is truncated before
+  the percent is. The three metric pills are unchanged, so each still shows and
+  colours its own figure. An account whose usage has never been fetched shows no
+  constraint rather than a binding 0%.
+
 ## 0.9.12
 
 ### Fixed

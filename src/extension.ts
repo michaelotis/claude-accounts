@@ -16,7 +16,12 @@ import {
   sweepStaleWorkingLocks,
 } from './workdir';
 import { log, showLog } from './log';
-import { UsageMonitor, writePolicyCache, type WorkspaceRoutePolicy } from './usage';
+import {
+  UsageMonitor,
+  USAGE_CACHE_TTL_MS,
+  writePolicyCache,
+  type WorkspaceRoutePolicy,
+} from './usage';
 import { isSidecarConfigDir } from './sidecars';
 import {
   emailsEqual,
@@ -473,8 +478,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // fresh fetch, BUT if we're already in the post-429 backoff don't hammer the API
       // (that just re-stamps the window and keeps the meter stale); a non-force refresh
       // still adopts a newer cross-window cache and the tooltip shows the rate-limit note.
-      const force = !usage.isRateLimited(dir);
+      // refresh() also declines to call on figures under 2 min old (the measured
+      // per-account allowance), so the tooltip reports what really happened rather
+      // than implying a call the click did not make.
+      const waitMs = usage.rateLimitWaitMs(dir);
+      const force = waitMs == null;
       let hardMsg: string | undefined;
+      let note = '';
+      let noteClaimsCurrent = false;
       statusBar.setRefreshing(true);
       try {
         const snap = await usage.refresh(dir, force);
@@ -482,10 +493,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           hardMsg =
             usage.lastFailure.message ??
             'Could not fetch usage for this window. Sign in with Claude Code first (/login).';
+        } else if (waitMs != null) {
+          // Say how long the wait is instead of leaving the click looking ignored.
+          note = `Usage API is rate-limiting this account — next attempt in ${Math.ceil(
+            waitMs / 1000
+          )}s; showing the last known figures.`;
+        } else if (usage.lastServedFromCacheAgeMs != null) {
+          // Served from the shared cache: report that, never imply a call we
+          // skipped. The AGE is deliberately not baked into this string — it
+          // would freeze at click time and keep asserting currency while the
+          // figures aged out from under it. The tooltip's own "Refreshed N ago"
+          // line is recomputed on every repaint and is the one that carries age.
+          note = 'Usage is already current — no call was needed.';
+          noteClaimsCurrent = true;
+        } else if (snap && (!snap.fetchedAt || Date.now() - snap.fetchedAt > USAGE_CACHE_TTL_MS)) {
+          // We really went to the network and came back with the old figures: a
+          // soft failure (timeout, DNS, a non-429 HTTP error) returns ok:true with
+          // best-effort data. Without a line here the click looks ignored.
+          note = 'Couldn’t reach the usage API — showing the last known figures.';
         }
       } finally {
         statusBar.setRefreshing(false); // clear the spinner BEFORE any modal
       }
+      statusBar.setRefreshNote(note, noteClaimsCurrent);
       // Only a hard failure that isn't a rate-limit (e.g. signed out) surfaces — it needs action.
       if (hardMsg) {
         const pick = await vscode.window.showWarningMessage(hardMsg, 'Show log');
