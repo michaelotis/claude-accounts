@@ -17,7 +17,11 @@ import { log } from './log';
  *
  * Returns the paths written. Throws if the source has no credentials.
  */
-export function snapshotAccount(sourceDir: string, targetDir: string, status: AuthStatus): void {
+export function snapshotAccount(
+  sourceDir: string,
+  targetDir: string,
+  status: IdentityFields
+): void {
   const srcCreds = path.join(sourceDir, '.credentials.json');
   if (!fs.existsSync(srcCreds)) {
     throw new Error(`No credentials found in ${sourceDir} — sign in first.`);
@@ -89,21 +93,99 @@ export function stampIdentity(dir: string, identity: AccountIdentity): boolean {
   return true;
 }
 
-/** Makes sure oauthAccount in the target reflects `status` (best effort). */
-export function ensureIdentity(dir: string, status: AuthStatus): boolean {
+/** `AuthStatus` plus the display name only the identity files carry. */
+export type IdentityFields = AuthStatus & { displayName?: string };
+
+/**
+ * The display name an identity file genuinely carries. readIdentity falls back to
+ * the email when the file has none, so a name equal to the email is that
+ * fallback, not an observation — passing it on would overwrite a store's real
+ * display name with the address.
+ */
+export function observedDisplayName(
+  identity: { email?: string; displayName?: string } | null | undefined
+): string | undefined {
+  if (!identity?.displayName) return undefined;
+  return emailsEqual(identity.displayName, identity.email) ? undefined : identity.displayName;
+}
+
+/**
+ * Makes sure oauthAccount in the target reflects `status` (best effort).
+ *
+ * A matching email is NOT enough to skip the write: a store's copy is stamped at
+ * save time and the account's organization can be renamed afterwards, so an
+ * email-only check left a stale organizationName in place forever (and every
+ * snapshot synthesised from that dir named an organization the account had moved
+ * on from). Only a NON-EMPTY incoming value counts as a correction — an absent
+ * organization or display name means the caller does not know one, not that the
+ * file's is wrong. Nothing but the drifted fields is touched, and a file we
+ * cannot read or that is not a JSON object is still never rewritten.
+ */
+export function ensureIdentity(dir: string, status: IdentityFields): boolean {
   if (!status.email) return false;
   const file = path.join(dir, '.claude.json');
   const obj = readDirIdentityJson(file);
   if (obj === null) return false;
-  const existing = (obj.oauthAccount as Record<string, unknown>) ?? {};
-  if (existing.emailAddress === status.email) return true; // already consistent
-  obj.oauthAccount = {
-    ...existing,
-    emailAddress: status.email,
-    organizationName: status.orgName ?? existing.organizationName,
-  };
+  const existing = identityObject(obj.oauthAccount);
+  // Case-insensitively, like every other email comparison here: a casing-only
+  // difference is the SAME account, and reading it as a different one would
+  // throw away that account's own organization and ids for nothing.
+  const sameAccount = emailsEqual(existing.emailAddress as string | undefined, status.email);
+  const orgDrift = drifted(existing.organizationName, status.orgName);
+  const nameDrift = drifted(existing.displayName, status.displayName);
+  if (sameAccount && !orgDrift && !nameDrift) {
+    return true; // already consistent
+  }
+  // Same account: correct only what drifted. Different account: the file's
+  // account-scoped keys describe the account being replaced and are dropped.
+  const next: Record<string, unknown> = sameAccount
+    ? { ...existing }
+    : { ...withoutAccountScoped(existing), emailAddress: status.email };
+  if (orgDrift || (!sameAccount && status.orgName)) next.organizationName = status.orgName;
+  if (nameDrift || (!sameAccount && status.displayName)) next.displayName = status.displayName;
+  obj.oauthAccount = next;
   writeFileAtomic(file, JSON.stringify(obj, null, 2), { mode: 0o600 });
   return true;
+}
+
+/**
+ * oauthAccount keys scoped to the ACCOUNT behind the email rather than to the
+ * config: the organization it belongs to, the display name it signs in under,
+ * and the ids/roles the API issued for it. Every one of them describes the
+ * PREVIOUS account once the email changes, so they are dropped instead of
+ * merged forward — a carried organizationName is exactly the stale name the
+ * hover card would then show for the account that replaced it. Keys outside
+ * this list belong to the config (project trust, tool state) and stay.
+ */
+const ACCOUNT_SCOPED_KEYS = [
+  'organizationName',
+  'organizationUuid',
+  'organizationRole',
+  'workspaceRole',
+  'displayName',
+  'accountUuid',
+];
+
+function withoutAccountScoped(existing: Record<string, unknown>): Record<string, unknown> {
+  const next = { ...existing };
+  for (const key of ACCOUNT_SCOPED_KEYS) delete next[key];
+  return next;
+}
+
+/**
+ * A config's oauthAccount as a plain object. A truthy NON-object (a string, an
+ * array) is treated as absent rather than spread — the same refusal
+ * readDirIdentityJson applies to the file itself, since spreading one would
+ * splatter its characters or indices across the identity we write back.
+ */
+function identityObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return value as Record<string, unknown>;
+}
+
+/** True when a non-empty incoming value disagrees with what the file carries. */
+function drifted(current: unknown, incoming: string | undefined): boolean {
+  return !!incoming && current !== incoming;
 }
 
 /**
@@ -439,7 +521,7 @@ function stampHomeIdentity(
     }
   }
 
-  const existing = (obj.oauthAccount as Record<string, unknown>) ?? {};
+  const existing = identityObject(obj.oauthAccount);
   if (emailsEqual(existing.emailAddress as string | undefined, identity.email)) {
     return true;
   }
@@ -447,8 +529,14 @@ function stampHomeIdentity(
     typeof existing.emailAddress === 'string' && existing.emailAddress
       ? existing.emailAddress
       : 'unnamed';
+  // Only ever reached on an email change, so the account-scoped keys the file
+  // carries belong to the account being replaced and are dropped rather than
+  // merged forward — the same rule ensureIdentity applies, shared by both
+  // writers of an oauthAccount. Merging them kept the PREVIOUS organization
+  // (and ids) under the new email, which is exactly the stale name the hover
+  // card then showed.
   obj.oauthAccount = {
-    ...existing,
+    ...withoutAccountScoped(existing),
     emailAddress: identity.email,
     displayName: identity.displayName,
     organizationName: identity.organizationName,

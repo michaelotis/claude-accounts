@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.9.15
+
+### Fixed
+- **The hover card could name an organization the account had moved on from, and
+  it never corrected itself.** Each saved account has a durable store directory,
+  and the usage poll runs against it: the organization in the tooltip is read
+  from the store's `.claude.json`, not from the window's. The store's copy was
+  written when the account was saved and rewritten only if the email changed — so
+  an organization renamed after that stayed wrong for good, and the shared usage
+  cache entry inherited the stale name too. Saving that account — or the
+  extension spotting a sign-in to it — now also corrects the organization and
+  display name on its store, from the identity it has just read. That is the one
+  moment the extension genuinely observes those names, so it is the only place
+  they are written: a usage poll has no way to tell which of two copies is
+  fresher (Claude Code rewrites a window's `.claude.json` every few seconds, so
+  its timestamp says nothing about the identity inside it), and windows guessing
+  would take turns rewriting the shared file. Plainly: a store can go on naming
+  the old organization until the next time that account is signed in to afresh
+  — a window's own copy is stocked from the store, so re-saving from a window
+  that was never signed in anew observes the same old name and changes nothing —
+  and the hover card follows on the next successful usage fetch after the
+  correction, not instantly. A store is only ever corrected from an
+  identity carrying the same email — a different email is a different account,
+  not a drift — an empty organization or display name is not a correction,
+  everything else in the store's config is left exactly as it was, and a config
+  that cannot be read or that is not a JSON object is still never rewritten.
+- **Switching a directory to another account could leave the previous account's
+  organization and display name on it.** The identity written on an email change
+  now carries only the incoming account's own fields; the organization, display
+  name, ids and roles that belonged to the account being replaced are dropped
+  instead of merged forward. Both writers of an identity follow that rule — an
+  account's own store and the `~/.claude.json` Claude Code reads when no
+  extension is involved. Emails compare case-insensitively throughout, so a
+  difference in capitalisation alone is the same account, not a switch.
+
 ## 0.9.14
 
 ### Added
