@@ -32,6 +32,13 @@ import {
 } from './workspaceRoutes';
 import { IdleCutoverController, type PanelCutoverMode } from './cutover';
 import { looksLikeLogout } from './reclaim';
+import {
+  PRESENCE_HEARTBEAT_MS,
+  moveRecord,
+  presenceIdFor,
+  removePresence,
+  sweepPresence,
+} from './windowPresence';
 
 /**
  * Everything this extension does rests on Linux semantics that we verified:
@@ -57,6 +64,12 @@ function storeTokenIsForeign(storeDir: string, email: string | undefined): boole
     return false;
   }
 }
+
+/**
+ * This window's presence-record id, kept at module scope so deactivate() removes
+ * exactly the record activate() wrote — it runs outside that closure.
+ */
+let activePresenceId: string | undefined;
 
 function activateUnsupported(context: vscode.ExtensionContext): void {
   const label =
@@ -256,6 +269,82 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     log(`usage hot on ${snap.email ?? 'this account'}: ${reasons.join(', ')} (shown on the meter)`);
   };
 
+  // Say that this window exists, and which dir its Claude Code runs — the one
+  // part of "which windows are on which account" that is not already on disk.
+  // The account is deliberately NOT recorded: readers derive it from the config
+  // dir, so a switch shows up at once and a record left behind by a crash can
+  // never name the wrong account (windowPresence.ts).
+  //
+  // Recorded HERE, before the bind and before anything that can return early:
+  // activation can end at a workspace-route correction, which asks for a reload
+  // the user is free to decline, and a window that came up without a record
+  // would then be missing from the map until it was next restarted. The record
+  // starts on whatever dir this window runs now and follows the bind — see the
+  // notePresence() calls after each applyStored below.
+  const presenceWorkspace = (): string => {
+    // The same identity a working dir is keyed on: the .code-workspace file when
+    // there is one, the first folder otherwise. Basename only — a card shows a
+    // name, and a full path would be both unreadable and more than was asked.
+    const file = vscode.workspace.workspaceFile?.fsPath;
+    if (file) return path.basename(file);
+    const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    return folder ? path.basename(folder) : '';
+  };
+  let presenceFailureLogged = false;
+  let presenceRemoveFailureLogged = false;
+  const notePresence = (): void => {
+    try {
+      const envDir = binding.getEnvDir();
+      const id = presenceIdFor(envDir, process.pid);
+      // A bind or unbind moves this window to another dir, so its record moves
+      // with it: the new one is written before the old is dropped, so this
+      // window is never briefly absent from the map, and the id it will remove
+      // on shutdown follows the write rather than the removal.
+      moveRecord(
+        activePresenceId,
+        {
+          id,
+          workspace: presenceWorkspace(),
+          configDir: envDir ?? defaultSourceDir(),
+          pid: process.pid,
+          lastSeen: Date.now(),
+        },
+        undefined,
+        (err) => {
+          if (presenceRemoveFailureLogged) return;
+          presenceRemoveFailureLogged = true;
+          log(`could not remove this window's previous presence record: ${err.message}`);
+        }
+      );
+      activePresenceId = id;
+    } catch (err) {
+      // Presence is a convenience on top of everything else this extension does;
+      // it never blocks activation and never reaches the user. Logged once, so a
+      // read-only $HOME does not write a line a minute for the rest of the day.
+      if (!presenceFailureLogged) {
+        presenceFailureLogged = true;
+        log(`could not record this window's presence: ${(err as Error).message}`);
+      }
+    }
+  };
+  notePresence();
+  try {
+    sweepPresence(Date.now());
+  } catch (err) {
+    log(`could not sweep stale window presence records: ${(err as Error).message}`);
+  }
+  // Unref'd: a heartbeat must never be the reason the extension host stays up.
+  const presenceHeartbeat = setInterval(notePresence, PRESENCE_HEARTBEAT_MS);
+  if (typeof presenceHeartbeat.unref === 'function') presenceHeartbeat.unref();
+  context.subscriptions.push(
+    { dispose: () => clearInterval(presenceHeartbeat) },
+    // A switch, a forget or a release changes which dir this window runs; rewrite
+    // the record so no reader attributes it to the account it just left. Before
+    // the status bar exists, so the repaint that same event triggers reads the
+    // record this window has just moved, not the one it left.
+    binding.onDidChange.event(() => notePresence())
+  );
+
   const statusBar = new StatusBarManager(registry, binding, usage);
   // Reconcile quietly restocked this window's rotated-away token (file only, no
   // reload) — surface it inline in the tooltip so an auth error, if Claude Code's
@@ -310,6 +399,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     log(`workspace route ${preferredAtStart.email} has no saved account yet — sign in as it once`);
   }
   const appliedStart = binding.applyStored(resolveAccount, preferredName);
+  // applyStored moves this window's config dir without raising onDidChange, so
+  // the record has to be told: without this the map would name the dir the
+  // window came up on until the next heartbeat, and a card painted in between
+  // would put it on the wrong account.
+  notePresence();
   // Healthy bind only when the working dir is stocked. Preferred + unstocked is
   // escalated after override clear (force bind + metered reload).
   let bound = appliedStart?.stocked
@@ -400,6 +494,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   } else if (!bound) {
     const again = binding.applyStored(resolveAccount);
     bound = again?.stocked ? again.account : again?.account;
+    notePresence();
   }
   applyUsageSettings();
 
@@ -602,6 +697,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   if (!bound) {
     const after = binding.applyStored(resolveAccount);
     bound = after?.stocked ? after.account : after?.account;
+    notePresence();
   }
 
   // An account handoff finishes with a reload, which kills any toast raised
@@ -642,4 +738,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
 export function deactivate(): void {
   disposeMirrorTimers();
+  // Closing a window should stop listing it immediately, not five minutes later
+  // when its record ages out. A failure here is harmless for that reason.
+  if (activePresenceId) {
+    try {
+      removePresence(activePresenceId);
+    } catch {
+      /* the liveness bound retires it anyway */
+    }
+    activePresenceId = undefined;
+  }
 }

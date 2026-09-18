@@ -78,6 +78,35 @@ function writeCache(home, entries) {
   return writeCacheText(home, JSON.stringify({ entries }, null, 2));
 }
 
+function presenceDir(home) {
+  return path.join(home, '.config', 'claude-accounts', 'windows');
+}
+
+/**
+ * A config dir under `home` whose `.claude.json` names `email` — what the CLI
+ * derives a window's account from, rather than from the record itself.
+ */
+function writeConfigDir(home, id, email) {
+  const dir = path.join(home, '.claude-windows', id);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, '.claude.json'),
+    JSON.stringify({ oauthAccount: { emailAddress: email } })
+  );
+  return dir;
+}
+
+/** A live presence record: this test process's own pid, beating right now. */
+function writeWindow(home, { id, workspace, configDir, pid = process.pid, lastSeen = Date.now() }) {
+  const dir = presenceDir(home);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, `${id}.json`),
+    JSON.stringify({ v: 1, id, workspace, configDir, pid, lastSeen })
+  );
+  return { workspace, configDir, pid, lastSeen };
+}
+
 function snap() {
   return {
     sessionPercent: 12,
@@ -148,6 +177,7 @@ describe('usage CLI — contract', () => {
         'stale',
         'weeklyPercent',
         'weeklyResetsAt',
+        'windows',
       ]);
       assert.equal(a.email, 'a@example.com');
       assert.equal(a.planLabel, 'Max');
@@ -766,8 +796,8 @@ describe('usage CLI — filtering and flags', () => {
       const res = run(home, ['--text']);
       assert.equal(res.status, 1);
       const lines = res.stdout.trimEnd().split('\n');
-      assert.match(lines[0], /^ACCOUNT\s+PLAN\s+5H\s+7D\s+MODELS\s+AGE\s+STATE$/);
-      assert.match(lines[1], /^a@example\.com\s+Max\s+12%\s+34%\s+Fable 40%\s+30m\s+stale$/);
+      assert.match(lines[0], /^ACCOUNT\s+PLAN\s+5H\s+7D\s+MODELS\s+WIN\s+AGE\s+STATE$/);
+      assert.match(lines[1], /^a@example\.com\s+Max\s+12%\s+34%\s+Fable 40%\s+0\s+30m\s+stale$/);
     });
   });
 
@@ -999,6 +1029,274 @@ describe('claude-usage wrapper', () => {
   });
 });
 
+describe('usage CLI — which windows are on which account', () => {
+  it('lists windows as an empty array, never absent, when none has ever recorded one', () => {
+    withHome((home) => {
+      writeCache(home, { 'email:a@example.com': entry('email:a@example.com', Date.now()) });
+      const res = runJson(home);
+      assert.equal(res.status, 0);
+      assert.deepEqual(res.json.accounts[0].windows, []);
+      assert.deepEqual(res.json.otherWindows, []);
+      // No warning either: every window closed is when this command matters most.
+      assert.deepEqual(res.json.warnings, []);
+    });
+  });
+
+  it('puts a live window under the account its config dir runs', () => {
+    withHome((home) => {
+      const now = Date.now();
+      writeCache(home, {
+        'email:a@example.com': entry('email:a@example.com', now, { email: 'a@example.com' }),
+        'email:b@example.com': entry('email:b@example.com', now, { email: 'b@example.com' }),
+      });
+      const cfg = writeConfigDir(home, 'aaaa1111', 'a@example.com');
+      const written = writeWindow(home, {
+        id: 'aaaa1111',
+        workspace: 'my-project',
+        configDir: cfg,
+      });
+      const res = runJson(home);
+      assert.equal(res.status, 0);
+      const byEmail = new Map(res.json.accounts.map((a) => [a.email, a.windows]));
+      assert.deepEqual(byEmail.get('a@example.com'), [
+        {
+          workspace: 'my-project',
+          configDir: cfg,
+          pid: written.pid,
+          lastSeen: written.lastSeen,
+        },
+      ]);
+      assert.deepEqual(byEmail.get('b@example.com'), []);
+      assert.deepEqual(res.json.otherWindows, []);
+      // The count reaches the table as its own column.
+      const text = run(home, ['--text']);
+      assert.match(
+        text.stdout.split('\n')[1],
+        /^a@example\.com\s+Max\s+12%\s+34%\s+Fable 40%\s+1\s/
+      );
+      assert.match(
+        text.stdout.split('\n')[2],
+        /^b@example\.com\s+Max\s+12%\s+34%\s+Fable 40%\s+0\s/
+      );
+    });
+  });
+
+  it('puts a window whose account the cache does not know into otherWindows', () => {
+    withHome((home) => {
+      const now = Date.now();
+      writeCache(home, {
+        'email:a@example.com': entry('email:a@example.com', now, { email: 'a@example.com' }),
+      });
+      const known = writeConfigDir(home, 'aaaa1111', 'a@example.com');
+      writeWindow(home, { id: 'aaaa1111', workspace: 'my-project', configDir: known });
+      const uncached = writeConfigDir(home, 'bbbb2222', 'b@example.com');
+      const other = writeWindow(home, {
+        id: 'bbbb2222',
+        workspace: 'other-repo',
+        configDir: uncached,
+      });
+      // A dir with no identity at all: live, but nothing says whose it is.
+      const blank = path.join(home, '.claude-windows', 'cccc3333');
+      fs.mkdirSync(blank, { recursive: true });
+      const nameless = writeWindow(home, { id: 'cccc3333', workspace: '', configDir: blank });
+
+      const res = runJson(home);
+      assert.equal(res.status, 0);
+      assert.deepEqual(
+        res.json.accounts[0].windows.map((w) => w.workspace),
+        ['my-project']
+      );
+      assert.deepEqual(res.json.otherWindows, [
+        {
+          workspace: '',
+          configDir: blank,
+          pid: nameless.pid,
+          lastSeen: nameless.lastSeen,
+          email: null,
+        },
+        {
+          workspace: 'other-repo',
+          configDir: uncached,
+          pid: other.pid,
+          lastSeen: other.lastSeen,
+          email: 'b@example.com',
+        },
+      ]);
+    });
+  });
+
+  it('never lists a window that is not live', () => {
+    withHome((home) => {
+      const now = Date.now();
+      writeCache(home, {
+        'email:a@example.com': entry('email:a@example.com', now, { email: 'a@example.com' }),
+      });
+      const cfg = writeConfigDir(home, 'aaaa1111', 'a@example.com');
+      // Pid 1 is alive but this record has not beaten in half an hour; the other
+      // beats now but its pid is long gone.
+      writeWindow(home, {
+        id: 'aaaa1111',
+        workspace: 'stale-window',
+        configDir: cfg,
+        pid: 1,
+        lastSeen: now - 30 * 60_000,
+      });
+      writeWindow(home, {
+        id: 'bbbb2222',
+        workspace: 'dead-window',
+        configDir: cfg,
+        pid: 0x7ffffff0,
+        lastSeen: now,
+      });
+      const res = runJson(home);
+      assert.deepEqual(res.json.accounts[0].windows, []);
+      assert.deepEqual(res.json.otherWindows, []);
+    });
+  });
+
+  it('narrows windows with --account, and does not resurface the filtered ones', () => {
+    withHome((home) => {
+      const now = Date.now();
+      writeCache(home, {
+        'email:a@example.com': entry('email:a@example.com', now, { email: 'a@example.com' }),
+        'email:b@example.com': entry('email:b@example.com', now, { email: 'b@example.com' }),
+      });
+      writeWindow(home, {
+        id: 'aaaa1111',
+        workspace: 'my-project',
+        configDir: writeConfigDir(home, 'aaaa1111', 'a@example.com'),
+      });
+      writeWindow(home, {
+        id: 'bbbb2222',
+        workspace: 'other-repo',
+        configDir: writeConfigDir(home, 'bbbb2222', 'b@example.com'),
+      });
+      const res = runJson(home, ['--account', 'a@example.com']);
+      assert.equal(res.status, 0);
+      assert.equal(res.json.accounts.length, 1);
+      assert.deepEqual(
+        res.json.accounts[0].windows.map((w) => w.workspace),
+        ['my-project']
+      );
+      // b's window is accounted for by an account the filter dropped — it is not
+      // an unattributed window.
+      assert.deepEqual(res.json.otherWindows, []);
+    });
+  });
+
+  it('never lends a dir-keyed entry the windows it cannot claim', () => {
+    withHome((home) => {
+      // An entry keyed by directory has no email, and a window whose config dir
+      // names nobody has none either — matching them would be a guess, and the
+      // window would then be counted twice.
+      const configDir = path.join(home, 'profiles', '.claude-work');
+      writeCache(home, {
+        [`dir:${configDir}`]: entry(`dir:${configDir}`, Date.now(), { email: null }),
+      });
+      const blank = path.join(home, '.claude-windows', 'cccc3333');
+      fs.mkdirSync(blank, { recursive: true });
+      const nameless = writeWindow(home, {
+        id: 'cccc3333',
+        workspace: 'mystery',
+        configDir: blank,
+      });
+      const res = runJson(home);
+      assert.equal(res.status, 0);
+      assert.equal(res.json.accounts.length, 1);
+      assert.equal(res.json.accounts[0].email, null);
+      assert.deepEqual(res.json.accounts[0].windows, []);
+      assert.deepEqual(res.json.otherWindows, [
+        {
+          workspace: 'mystery',
+          configDir: blank,
+          pid: nameless.pid,
+          lastSeen: nameless.lastSeen,
+          email: null,
+        },
+      ]);
+    });
+  });
+
+  it('says in --text how many windows no row accounts for', () => {
+    withHome((home) => {
+      writeCache(home, {
+        'email:a@example.com': entry('email:a@example.com', Date.now(), {
+          email: 'a@example.com',
+        }),
+      });
+      writeWindow(home, {
+        id: 'aaaa1111',
+        workspace: 'my-project',
+        configDir: writeConfigDir(home, 'aaaa1111', 'a@example.com'),
+      });
+      writeWindow(home, {
+        id: 'bbbb2222',
+        workspace: 'other-repo',
+        configDir: writeConfigDir(home, 'bbbb2222', 'b@example.com'),
+      });
+      const res = run(home, ['--text']);
+      assert.equal(res.status, 0);
+      // The table has no row to hang them on, so without this line they would
+      // simply vanish from the format most people read.
+      assert.match(res.stdout, /^other windows: 1 \(no cached usage for their account\)$/m);
+    });
+    withHome((home) => {
+      writeCache(home, {
+        'email:a@example.com': entry('email:a@example.com', Date.now(), {
+          email: 'a@example.com',
+        }),
+      });
+      writeWindow(home, {
+        id: 'aaaa1111',
+        workspace: 'my-project',
+        configDir: writeConfigDir(home, 'aaaa1111', 'a@example.com'),
+      });
+      // Every window has a row of its own, so there is nothing to say.
+      assert.doesNotMatch(run(home, ['--text']).stdout, /other windows:/);
+    });
+  });
+
+  it('leaves the presence directory bytes and mtimes untouched', () => {
+    withHome((home) => {
+      const now = Date.now();
+      writeCache(home, {
+        'email:a@example.com': entry('email:a@example.com', now, { email: 'a@example.com' }),
+      });
+      writeWindow(home, {
+        id: 'aaaa1111',
+        workspace: 'my-project',
+        configDir: writeConfigDir(home, 'aaaa1111', 'a@example.com'),
+      });
+      // A dead, day-old record the extension's sweep would remove: this command
+      // must not sweep it, or it would be writing to a dir it only reads.
+      writeWindow(home, {
+        id: 'dddd4444',
+        workspace: 'long-gone',
+        configDir: path.join(home, '.claude-windows', 'dddd4444'),
+        pid: 0x7ffffff0,
+        lastSeen: now - 25 * 60 * 60_000,
+      });
+      const dir = presenceDir(home);
+      const snapshot = () => ({
+        files: fs.readdirSync(dir).sort(),
+        dirMtimeMs: fs.statSync(dir).mtimeMs,
+        entries: fs
+          .readdirSync(dir)
+          .sort()
+          .map((f) => ({
+            name: f,
+            bytes: fs.readFileSync(path.join(dir, f)).toString('base64'),
+            mtimeMs: fs.statSync(path.join(dir, f)).mtimeMs,
+          })),
+      });
+      const before = snapshot();
+      run(home, ['--json']);
+      run(home, ['--text']);
+      run(home, ['--account', 'a@example.com']);
+      assert.deepEqual(snapshot(), before);
+    });
+  });
+});
 describe('usage CLI — cache path pin', () => {
   /** usage.ts reaches vscode through the logger, so it needs the usual stub. */
   function bundleUsage() {

@@ -18,6 +18,7 @@ import {
   HEADROOM_MIN_DROP,
   type HeadroomEvent,
 } from './usageParse';
+import { describeWindows, readWindows, type WindowInfo } from './windowPresence';
 
 /** Marketplace / local id — hover links to the extension page when published. */
 const EXTENSION_ID = 'michaelotis.claude-accounts';
@@ -38,6 +39,15 @@ const REFRESH_NOTE_TTL_MS = 30_000;
  * again — the 5h bucket can be spent inside an hour.
  */
 const HEADROOM_NOTE_TTL_MS = 30 * 60_000;
+/**
+ * How long a reading of the window records is reused for. Reading the directory
+ * is synchronous, and render() is not the rare event it looks like — every poll
+ * tick, every focus edge, every usage change and every state change repaints the
+ * bar, so a burst of repaints would otherwise be a burst of directory scans. A
+ * few seconds behind is invisible on a per-minute heartbeat; this window's own
+ * bind is the one change that must show at once, and it clears the memo.
+ */
+const WINDOWS_MEMO_MS = 5_000;
 
 /** What a headroom event's bucket reads now, or null when the snapshot lost it. */
 function bucketPercent(usage: UsageSnapshot, label: string): number | null {
@@ -92,6 +102,10 @@ export class StatusBarManager implements vscode.Disposable {
   private refreshing = false;
   /** Set when this window's stale token was quietly restocked; cleared by reload. */
   private staleTokenNote = false;
+  /** Latch so an unreadable presence dir is reported once, not once per repaint. */
+  private presenceReadLogged = false;
+  /** Last window listing and when it was read — see WINDOWS_MEMO_MS. */
+  private windowsMemo: { at: number; dir: string | undefined; value: WindowInfo[] } | null = null;
   /** Outcome line for the last Refresh Usage click, with the time it was set. */
   private refreshNote: { text: string; at: number; claimsCurrent: boolean } | null = null;
   /**
@@ -147,6 +161,9 @@ export class StatusBarManager implements vscode.Disposable {
 
     this.disposables.push(
       this.binding.onDidChange.event(() => {
+        // This window has just moved to another dir and rewritten its own
+        // record; a cached listing would show it on the account it left.
+        this.windowsMemo = null;
         this.usage.setActiveDir(this.effectiveDir());
         void this.usage.refresh(this.effectiveDir());
         this.refresh();
@@ -447,6 +464,37 @@ export class StatusBarManager implements vscode.Disposable {
     return rows;
   }
 
+  /**
+   * Which windows are on which account, under the accounts table. Read at render
+   * time — the records are already on disk, so this needs no timer and no event
+   * of its own, and it can never be a reason the card fails to open. render()
+   * runs often (see WINDOWS_MEMO_MS), so the reading itself is memoized rather
+   * than the directory being scanned once per repaint.
+   */
+  private windowsSection(): string {
+    try {
+      const now = Date.now();
+      // Keyed on this window's dir as well as the clock: activation can move the
+      // dir without a binding event, and a memo filled a moment earlier would list
+      // this window under the account it has just left.
+      const envDir = this.binding.getEnvDir();
+      let memo = this.windowsMemo;
+      if (!memo || memo.dir !== envDir || now - memo.at >= WINDOWS_MEMO_MS) {
+        memo = { at: now, dir: envDir, value: readWindows(now) };
+        this.windowsMemo = memo;
+      }
+      return describeWindows(memo.value, (email) => this.labelForEmail(email));
+    } catch (err) {
+      // Once: the card is rebuilt on every focus edge and poll tick, and a
+      // persistent failure would otherwise write a line for each of them.
+      if (!this.presenceReadLogged) {
+        this.presenceReadLogged = true;
+        log(`could not read window presence: ${(err as Error).message}`);
+      }
+      return '';
+    }
+  }
+
   private render(): void {
     this.detectHeadroom();
     const dir = this.effectiveDir();
@@ -530,6 +578,7 @@ export class StatusBarManager implements vscode.Disposable {
         headroomNote,
         staleNote,
         formatAccountsTable(this.accountRows(email)),
+        this.windowsSection(),
         refreshedLine,
         this.binding.rememberedForFolder() ? '_auto-selected: this folder used it last time_' : '',
         !isSaved
