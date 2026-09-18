@@ -187,6 +187,90 @@ Thresholds: `sessionThreshold` / `weeklyThreshold` / `fableThreshold` (default 9
 
 Legacy `primaryEmail` / `secondaryEmail` still seed `accountOrder` if that list is empty.
 
+## Reading usage from a script (`scripts/claude-usage`)
+
+The extension writes what it collects to a shared cache file. `scripts/claude-usage`
+reads that file — nothing else. It **never writes, locks or fetches**, so it works
+with every VS Code window closed and can never spend an account's rate limit.
+
+```bash
+scripts/claude-usage                      # JSON on stdout
+scripts/claude-usage --text               # compact table
+scripts/claude-usage --account a@example.com
+scripts/claude-usage --max-age 2m         # how fresh a reading must be
+```
+
+```json
+{
+  "schema": "claude-accounts/usage@1",
+  "generatedAt": 1767225600000,
+  "stale": false,
+  "accounts": [
+    {
+      "email": "a@example.com",
+      "planLabel": "Max",
+      "orgName": "Example",
+      "present": true,
+      "sessionPercent": 12,
+      "sessionResetsAt": "2026-01-01T00:00:00Z",
+      "weeklyPercent": 34,
+      "weeklyResetsAt": null,
+      "models": [{ "name": "Fable", "percent": 40, "resetsAt": null }],
+      "fetchedAt": 1767225595000,
+      "ageMs": 5000,
+      "stale": false
+    }
+  ],
+  "warnings": []
+}
+```
+
+- `ageMs` is `now - fetchedAt`; an account is `stale` once that passes `--max-age`
+  (default `10m`). Top-level `stale` is true if **any** listed account that is still
+  `present` is stale, or if none was listed.
+- An account that has **never** been fetched has `fetchedAt`, `ageMs` and every
+  percentage as `null` with `stale: true` — its zeros in the cache are placeholders,
+  not a reading, and are never reported as 0%. A fetch that recovered no percentage
+  at all is `stale` the same way, with a line in `warnings`: unknown is not fresh.
+- A reading stamped in the future is clock jitter within a minute and reads as
+  `ageMs: 0`; beyond that its age cannot be known, so it is `ageMs: null` and
+  `stale: true` with a warning (`--text` shows `?`, never `0s`).
+- A reading whose fetch came back carrying no bucket at all is `stale` with every
+  percentage `null` and `<account>: the last fetch carried no usage buckets` in
+  `warnings`. The extension stores a bucket the response left out as 0, so without
+  that line the account would read as fresh with its whole allowance intact.
+- `present` has three outcomes. **`true`, no warning**: the credentials file is there.
+  **`false`**: it is genuinely gone. Nothing prunes the cache, so a removed account
+  would otherwise sit in it forever and hold the exit code at `1`; absent accounts
+  stay in the list (`gone` in the `--text` STATE column) but count towards neither the
+  top-level `stale` nor the exit code. Since that quietly narrows what exit `0` means,
+  each one also adds a line to `warnings`:
+  `<account>: no credentials in its config directory — left out of the exit code`.
+  **`true`, with a warning**: the check could not be made —
+  the config directory is not an absolute path (`CLAUDE_CONFIG_DIR` is stored exactly
+  as it was set, so `~/…` and relative values occur), or looking at it failed for some
+  other reason such as `EACCES`. Not being able to look is not the same as being
+  signed out, so the account keeps its place in the exit code and the warning says the
+  check did not happen. The credentials file is only checked for, never opened, and
+  its directory never appears in the output.
+- A percentage outside 0–100 becomes `null` and adds a line to `warnings`.
+- Warnings about an account are printed only for accounts the output lists, so
+  `--account` never names a different one. Warnings about the cache file itself —
+  missing, unreadable, corrupt, an entry that is not an object — are always printed.
+- An entry keyed by directory rather than email has `email: null`. Accounts sort by
+  email. Warnings name such an entry by its directory's basename, with the parent's
+  basename added when two of them share one (`projA/.claude`), never by its path.
+
+Exit codes: `0` everything listed is fresh · `1` some of it is stale · `2` no data
+(no cache yet, unreadable, nothing matched `--account`, or every account listed is
+gone) · `3` a flag was wrong, `dist/usage-cli.js` is not built, or something failed
+unexpectedly (message on stderr, stdout empty). In the default `--json` mode stdout
+is valid JSON on `0`, `1` and `2`; `--text` is a table for people to read, and its
+layout is not a contract to parse.
+
+Run `npm run compile` (or install the extension) first — the wrapper runs
+`dist/usage-cli.js` next to it.
+
 ## Safety
 
 - Never discovers reserved sidecars; does not migrate **forgotten** dirs into `~/.claude-shared`
@@ -211,6 +295,6 @@ npm run package
 
 ```text
 src/          extension (TypeScript)
-scripts/      install-latest.sh + ship.sh
+scripts/      install-latest.sh + ship.sh + claude-usage
 test/         node:test suites
 ```

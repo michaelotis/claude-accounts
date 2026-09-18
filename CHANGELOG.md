@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.9.19
+
+### Added
+- **Usage was unreadable with every VS Code window closed.** The extension
+  collects usage into a shared cache file — plain JSON, one entry per account —
+  but the only readers of it lived inside the extension bundle, and nearly every
+  module there imports the logger, which imports `vscode`. So a script or an
+  agent outside VS Code could see the file and had nothing to read it with.
+  `scripts/claude-usage` is that reader: `--json` (the default) prints every
+  cached account with its plan, its 5h and 7d percentages, its model buckets and
+  how old the reading is, `--text` prints the same as a compact table,
+  `--account` narrows to one email, and `--max-age` (default 10m) says how old a
+  reading may be and still count as fresh. The exit code answers the question a
+  script actually has: `0` everything listed is fresh, `1` some of it is older
+  than `--max-age`, `2` there is no data at all, `3` a flag was wrong. It only
+  reads. It never writes, never takes the cache lock and never fetches, so it
+  cannot spend an account's rate limit or race the windows that do — usage stays
+  one call per account machine-wide. And it will not round a gap up into a
+  reading: an account that has never been fetched has zeros in the cache as
+  placeholders, and those are reported as `null` with `stale: true` rather than
+  as an account sitting idle at 0%. A percentage outside 0–100, or one JSON
+  carried in as `Infinity`, goes the same way — `null`, with a line in
+  `warnings`. A missing, unreadable, corrupt or wrongly-shaped cache is "no
+  data" with a reason, never a crash, and stdout stays valid JSON in every case
+  the command prints a payload. Each account also carries `present`: nothing
+  prunes the usage cache, so an account signed out of long ago would sit in it
+  forever and its staleness would hold the exit code at `1` for good — an entry
+  whose config directory no longer holds credentials is reported with
+  `present: false`, stays in the list, and counts towards neither the top-level
+  `stale` nor the exit code — and because that narrows what exit `0` means, each
+  such account is named in `warnings` too. Only credentials that are genuinely
+  gone count as gone: a config directory this command cannot look into, or one
+  stored as a relative or `~`-prefixed path, says nothing about the account, so
+  it stays `present` with a warning that the check did not happen rather than
+  being reported as signed out. A cached reading whose fetch came back carrying
+  no bucket at all is `stale` with `null` percentages and a warning of its own,
+  because a missing bucket is stored as 0 and would otherwise read as an account
+  with its whole allowance intact. Warnings about an account are printed only
+  for the accounts the output lists, so `--account` never names another one.
+  Nothing can make the command exit `1` without printing a reading: a caller
+  that closes stderr gets the exit code the command had already decided, and the
+  wrapper reports and exits `3` if it cannot work out where it is installed.
+
 ## 0.9.18
 
 ### Fixed

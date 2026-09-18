@@ -26,6 +26,14 @@ export interface UsageSnapshot {
   planLabel: string | null;
   fetchedAt: number;
   configDir: string;
+  /**
+   * How many buckets the response behind this snapshot actually carried a
+   * utilization for — the 5h one, the 7d one and the model-scoped ones. A
+   * bucket the response left out is stored as 0 above, so the figures alone
+   * cannot tell a fetch that recovered nothing from an account that has used
+   * nothing. Optional: snapshots written before this field existed have none.
+   */
+  bucketsSeen?: number;
 }
 
 export interface FailoverThresholds {
@@ -182,6 +190,12 @@ export function buildSnapshot(
     }
   }
 
+  // Counted after the loop above so the model buckets it appends are included.
+  const bucketsSeen =
+    (pct(five.utilization) == null ? 0 : 1) +
+    (pct(week.utilization) == null ? 0 : 1) +
+    modelLimits.length;
+
   return {
     sessionPercent: pct(five.utilization) ?? 0,
     sessionResetsAt: five.resets_at,
@@ -201,6 +215,7 @@ export function buildSnapshot(
     planLabel: plan.planLabel,
     fetchedAt,
     configDir,
+    bucketsSeen,
   };
 }
 
