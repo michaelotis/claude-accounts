@@ -29,6 +29,7 @@ import {
   isStaleAgainstStore,
 } from './workdir';
 import { log } from './log';
+import { probeTurnForWindow, type TurnProbe } from './turnWatcher';
 import { emailsEqual, matchWorkspaceRoute, type WorkspaceRoute } from './workspaceRoutes';
 
 /**
@@ -52,6 +53,51 @@ export const NOTICE_KEY = 'claudeProfiles.pendingNotice';
 /** workspaceState: when this window last reloaded itself automatically. */
 const RELOAD_STAMP_KEY = 'claudeProfiles.lastAutoReload';
 
+/**
+ * workspaceState: why that reload happened. The stamp alone says a reload
+ * occurred, which is no help to whoever is staring at a window that just
+ * restarted under them — the reason survives the reload next to it so the
+ * reload can be attributed afterwards, in the log and in the one message that
+ * already reports a previous reload.
+ */
+const RELOAD_REASON_KEY = 'claudeProfiles.lastAutoReloadReason';
+
+/** The confirm button on the mid-turn switch warning. */
+export const SWITCH_ANYWAY = 'Switch anyway';
+
+/** What the mid-turn warning says. Exported so the test asserts the real text. */
+export function midTurnSwitchWarning(target: string): string {
+  return (
+    `A Claude turn is still running in this window.\n\n` +
+    `Switching to ${target} reloads the window now. The turn keeps running, but its output is ` +
+    `not replayed into the reloaded panel — whatever it was about to say is lost.\n\n` +
+    `Wait for the turn to finish and switch then, or switch anyway.`
+  );
+}
+
+/**
+ * The mid-turn switch decision, kept free of any window so it can be tested
+ * directly. Returns true when the switch may proceed.
+ *
+ * Only an EXPLICIT switch asks. Automatic paths — workspace-route correction,
+ * panel cutover — must never put a modal in front of the user, so they do not
+ * even probe: cutover already waits for idle, and a route correction is not the
+ * user's click to reconsider.
+ */
+export async function confirmSwitchDuringTurn(io: {
+  userInitiated: boolean;
+  target: string;
+  probe: () => TurnProbe;
+  warn: (message: string, ...actions: string[]) => Thenable<string | undefined>;
+}): Promise<boolean> {
+  if (!io.userInitiated) return true;
+  // 'idle' and 'unknown' both proceed: a probe that cannot see is not evidence
+  // of a turn, and warning on it would nag every window we are blind in.
+  if (io.probe() !== 'in_turn') return true;
+  const pick = await io.warn(midTurnSwitchWarning(io.target), SWITCH_ANYWAY);
+  return pick === SWITCH_ANYWAY;
+}
+
 export class SetupWizard {
   constructor(
     private readonly registry: AccountRegistry,
@@ -66,6 +112,16 @@ export class SetupWizard {
    * grant in memory until its next restart, and we never reload for it.
    */
   onStaleRestock?: (email?: string) => void;
+
+  /**
+   * Is a turn running in this window? One look at this window's own transcripts,
+   * scoped the way the cutover watcher scopes its own. Replaceable so the switch
+   * flow can be exercised without a real window.
+   */
+  probeTurn: () => TurnProbe = () =>
+    probeTurnForWindow(this.binding.getEnvDir(), {
+      getFallbackCwds: () => (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
+    });
 
   /**
    * The ONLY way any flow in this extension reloads the window.
@@ -94,18 +150,23 @@ export class SetupWizard {
 
   private async requestWindowReload(
     notice: string | undefined,
-    opts: { userInitiated?: boolean } = {}
+    opts: { userInitiated?: boolean; reason?: string } = {}
   ): Promise<void> {
     const now = Date.now();
     const last = this.context.workspaceState.get<number>(RELOAD_STAMP_KEY, 0);
+    // The notice is the user-facing half of the same news, so it stands in when
+    // a site names no reason of its own.
+    const reason = opts.reason ?? notice ?? 'no reason recorded';
     if (!opts.userInitiated && now - last < 60_000) {
-      log(`auto-reload SUPPRESSED (${now - last}ms after the previous one): ${notice ?? ''}`);
+      log(`auto-reload SUPPRESSED (${now - last}ms after the previous one): ${reason}`);
       // Do not claim "was reloaded" when we are skipping — that is the confusing
       // toast after Switch Account (first reload already applied the account).
+      const previous = this.context.workspaceState.get<string>(RELOAD_REASON_KEY, '');
       void vscode.window
         .showWarningMessage(
-          `Claude Accounts: already reloaded this window a moment ago, so a second automatic ` +
-            `reload was skipped. If the account or usage still looks wrong, reload once more.`,
+          `Claude Accounts: already reloaded this window a moment ago` +
+            `${previous ? ` (${previous})` : ''}, so a second automatic reload was skipped. ` +
+            `If the account or usage still looks wrong, reload once more.`,
           'Reload window'
         )
         .then((pick) => {
@@ -115,7 +176,11 @@ export class SetupWizard {
         });
       return;
     }
+    log(`reload (${opts.userInitiated ? 'user-initiated' : 'automatic'}): ${reason}`);
     await this.context.workspaceState.update(RELOAD_STAMP_KEY, now);
+    await this.context.workspaceState.update(RELOAD_REASON_KEY, reason);
+    // Only a site that already had news to deliver shows anything after the
+    // reload: a reason of its own must not turn a quiet reload into a toast.
     if (notice) await this.context.globalState.update(NOTICE_KEY, notice);
     await vscode.commands.executeCommand('workbench.action.reloadWindow');
   }
@@ -302,7 +367,8 @@ export class SetupWizard {
           // session and a panel naming an account that no longer exists —
           // nothing here worth keeping, so reload rather than ask.
           await this.requestWindowReload(
-            `The account this window was running was forgotten and signed out.`
+            `The account this window was running was forgotten and signed out.`,
+            { reason: `${active} was forgotten elsewhere` }
           );
         } else {
           // The window merely REMEMBERED the forgotten account (it was closed
@@ -365,7 +431,8 @@ export class SetupWizard {
         });
         if (captured && !this.recentlyReloaded()) {
           await this.requestWindowReload(
-            `Signed in as ${email} — reloading so Claude Code switches to it.`
+            `Signed in as ${email} — reloading so Claude Code switches to it.`,
+            { reason: `in-window sign-in as ${email}` }
           );
         }
         return;
@@ -425,7 +492,8 @@ export class SetupWizard {
         // reload that left the trigger state unchanged would just re-fire this path.
         if (followed && !this.recentlyReloaded()) {
           await this.requestWindowReload(
-            `Signed in as ${email} — reloading so Claude Code switches to it.`
+            `Signed in as ${email} — reloading so Claude Code switches to it.`,
+            { reason: `in-window switch to saved ${email}` }
           );
         }
         return;
@@ -445,7 +513,12 @@ export class SetupWizard {
         if (emailsEqual(readIdentity(dir)?.email, boundEmail)) {
           mirrorToDefault(dir);
           if (!this.recentlyReloaded()) {
-            await this.requestWindowReload(`Restored ${boundEmail ?? bound.name} for this window.`);
+            await this.requestWindowReload(
+              `Restored ${boundEmail ?? bound.name} for this window.`,
+              {
+                reason: `re-asserted ${boundEmail ?? bound.name} over a foreign token`,
+              }
+            );
           }
         } else {
           log(
@@ -539,7 +612,8 @@ export class SetupWizard {
       }
       await this.requestWindowReload(
         `${email} is set up. This window now runs it in a directory of its own — signing in to ` +
-          `another account here will no longer disturb your other windows.`
+          `another account here will no longer disturb your other windows.`,
+        { reason: `first move off the default dir onto ${email}` }
       );
     } else if (changed && active) {
       // Name/account drift (Switch Account, capture, or Claude Code /login).
@@ -555,7 +629,8 @@ export class SetupWizard {
       // Mid-session sign-in without our switchTo: Claude Code still has the old
       // process; reload so the panel matches the dir.
       await this.requestWindowReload(
-        `Signed in as ${email} — reloading so Claude Code fully switches to it.`
+        `Signed in as ${email} — reloading so Claude Code fully switches to it.`,
+        { reason: `account changed to ${email} outside Switch Account` }
       );
     }
   }
@@ -628,7 +703,8 @@ export class SetupWizard {
       );
       materialize(account, dir, true);
       await this.requestWindowReload(
-        `Restored ${this.registry.emailOf(account) ?? account.name} for this window.`
+        `Restored ${this.registry.emailOf(account) ?? account.name} for this window.`,
+        { reason: `restocked ${account.name} after its working dir lost its token` }
       );
       return;
     }
@@ -749,6 +825,24 @@ export class SetupWizard {
     account: Account,
     opts: { userInitiated?: boolean; notice?: string } = {}
   ): Promise<void> {
+    const target = account.email ?? this.registry.emailOf(account) ?? account.name;
+    // Strictly `=== true`, unlike the reload breaker's `!== false`: only the
+    // account picker sets it, and panel cutover (which passes no opts at all)
+    // must go through without a modal — it has already waited for idle.
+    const proceed = await confirmSwitchDuringTurn({
+      userInitiated: opts.userInitiated === true,
+      target,
+      probe: () => this.probeTurn(),
+      warn: (message, ...actions) =>
+        vscode.window.showWarningMessage(message, { modal: true }, ...actions),
+    });
+    if (!proceed) {
+      // Nothing has been bound, stocked, mirrored or stamped yet, so there is
+      // no pending state to keep and nothing to undo: the user simply switches
+      // again once the turn is done.
+      log(`switch: ${target} declined at the mid-turn warning — nothing changed`);
+      return;
+    }
     await this.binding.bind(account);
     const wd = this.binding.workingDir();
     if (opts.userInitiated !== false) {
@@ -784,6 +878,8 @@ export class SetupWizard {
     }
     await this.requestWindowReload(opts.notice, {
       userInitiated: opts.userInitiated !== false,
+      reason:
+        opts.userInitiated === false ? `route correction to ${target}` : `switch to ${target}`,
     });
   }
 
@@ -869,7 +965,10 @@ export class SetupWizard {
     // activation, so otherwise the window sits on a dir we just emptied, with a
     // dead session and a panel still naming an account that no longer exists.
     if (usedHere) {
-      await this.requestWindowReload(parts.join(' '), { userInitiated: true });
+      await this.requestWindowReload(parts.join(' '), {
+        userInitiated: true,
+        reason: `forgot ${email}, which this window was running`,
+      });
       return;
     }
     vscode.window.showInformationMessage(parts.join(' '));

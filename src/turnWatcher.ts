@@ -9,15 +9,150 @@
  */
 
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { log } from './log';
 import { claudeCwdsForDir } from './reclaim';
 
 export type TurnPhase = 'idle' | 'in_turn';
 
+/**
+ * What a ONE-SHOT probe can conclude. The watcher only ever reports idle or
+ * in_turn because it keeps history; a single look can also come up blind (no
+ * config dir, no cwd for it, no transcript dir yet, an unreadable scan) and
+ * must say so rather than pass a guess off as idle.
+ */
+export type TurnProbe = TurnPhase | 'unknown';
+
+/**
+ * How far back a one-shot probe looks. The watcher separates a short activity
+ * window from a longer settle window because it sees every tick; a single look
+ * has no history, so it uses the settle length directly — a tool call silent
+ * for less than this is still the same turn.
+ */
+const PROBE_WINDOW_MS = 30_000;
+
 /** Claude Code keys transcripts as projects/<cwd with non-alnum → '-'>/. */
 export function projectSlug(cwd: string): string {
   return cwd.replace(/[^a-zA-Z0-9]/g, '-');
+}
+
+/** The cwds whose transcripts belong to this window: live processes ∪ fallback. */
+function ownCwds(
+  configDir: string,
+  getCwds: (configDir: string) => string[],
+  getFallbackCwds: () => string[]
+): string[] {
+  const found = getCwds(configDir);
+  const fallback = getFallbackCwds().map((cwd) => {
+    try {
+      return fs.realpathSync(cwd);
+    } catch {
+      return cwd;
+    }
+  });
+  return [...new Set([...found, ...fallback])];
+}
+
+/**
+ * True if anything under `dir` (to `maxDepth`) was written inside `windowMs`.
+ *
+ * `strict` decides what an unreadable entry means. The watcher polls, so a
+ * transient read failure is best ignored — the next tick sees it. A one-shot
+ * probe gets no next tick, so for it an unreadable scan is not "no activity"
+ * but "cannot tell", and the error is raised for the caller to turn into
+ * `unknown`.
+ */
+function scanRecent(
+  dir: string,
+  now: number,
+  windowMs: number,
+  depth: number,
+  maxDepth: number,
+  strict: boolean
+): boolean {
+  if (depth > maxDepth) return false;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    if (strict) throw err;
+    return false;
+  }
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    try {
+      if (e.isDirectory()) {
+        if (scanRecent(p, now, windowMs, depth + 1, maxDepth, strict)) return true;
+      } else if (e.isFile()) {
+        if (!/\.(jsonl|json)$/i.test(e.name)) continue;
+        const st = fs.statSync(p);
+        if (now - st.mtimeMs < windowMs) return true;
+      }
+    } catch (err) {
+      if (strict) throw err;
+    }
+  }
+  return false;
+}
+
+/**
+ * The probe for a WINDOW rather than a dir. A bound window has its own working
+ * dir, so activity under it is this window's. An unbound window runs on the
+ * shared default dir, where every other unbound window and every plain terminal
+ * writes too — their turns are indistinguishable from ours there, so the honest
+ * answer is `unknown` (which never prompts), not someone else's `in_turn`.
+ */
+export function probeTurnForWindow(
+  envDir: string | undefined,
+  opts: Parameters<typeof probeTurnPhase>[1] = {}
+): TurnProbe {
+  // The env value is not only ours to set: a CLAUDE_CONFIG_DIR inherited from the
+  // user's shell can name the shared dir outright, and that window is no more
+  // bound than one with no value at all.
+  if (!envDir || path.resolve(envDir) === path.resolve(os.homedir(), '.claude')) return 'unknown';
+  return probeTurnPhase(envDir, opts);
+}
+
+/**
+ * Is a Claude turn running in this window RIGHT NOW? A single look, with no
+ * watcher behind it — the watcher only runs in idleReload mode, and the
+ * switch-account path has to be able to ask whatever the user's settings say.
+ *
+ * Scoped exactly as the watcher is: only transcripts under this window's own
+ * project slugs count. Total by construction — every failure reads as
+ * `unknown`, so a caller can never be blocked by a probe that threw.
+ */
+export function probeTurnPhase(
+  dir: string | undefined,
+  opts: {
+    activityWindowMs?: number;
+    getCwds?: (configDir: string) => string[];
+    getFallbackCwds?: () => string[];
+    now?: number;
+  } = {}
+): TurnProbe {
+  if (!dir) return 'unknown';
+  const windowMs = opts.activityWindowMs ?? PROBE_WINDOW_MS;
+  const now = opts.now ?? Date.now();
+  try {
+    const cwds = ownCwds(dir, opts.getCwds ?? claudeCwdsForDir, opts.getFallbackCwds ?? (() => []));
+    if (!cwds.length) return 'unknown';
+    let anySlug = false;
+    for (const cwd of cwds) {
+      const slugRoot = path.join(dir, 'projects', projectSlug(cwd));
+      if (!fs.existsSync(slugRoot)) continue;
+      anySlug = true;
+      // maxDepth 2: slug files, <sid>/ files, <sid>/subagents/ files.
+      if (scanRecent(slugRoot, now, windowMs, 0, 2, true)) return 'in_turn';
+    }
+    // No transcript dir at all means we are looking at the wrong place, not
+    // that the window is quiet.
+    return anySlug ? 'idle' : 'unknown';
+  } catch (err) {
+    log(`turn probe: ${(err as Error).message} — phase unknown`);
+    return 'unknown';
+  }
 }
 
 export class TurnWatcher {
@@ -131,15 +266,7 @@ export class TurnWatcher {
 
   private refreshCwds(configDir: string, now: number): void {
     if (this.cachedForDir === configDir && now - this.lastCwdScanAt < this.cwdRescanMs) return;
-    const found = this.getCwds(configDir);
-    const fallback = this.getFallbackCwds().map((cwd) => {
-      try {
-        return fs.realpathSync(cwd);
-      } catch {
-        return cwd;
-      }
-    });
-    this.cachedCwds = [...new Set([...found, ...fallback])];
+    this.cachedCwds = ownCwds(configDir, this.getCwds, this.getFallbackCwds);
     this.cachedForDir = configDir;
     this.lastCwdScanAt = now;
   }
@@ -173,44 +300,13 @@ export class TurnWatcher {
       if (!fs.existsSync(slugRoot)) continue;
       anySlug = true;
       // maxDepth 2: slug files, <sid>/ files, <sid>/subagents/ files.
-      if (this.walkRecent(slugRoot, now, windowMs, 0, 2)) {
+      if (scanRecent(slugRoot, now, windowMs, 0, 2, false)) {
         this.noteBlindRecovered(this.cachedCwds.length);
         return true;
       }
     }
     if (!anySlug) this.noteBlind(this.cachedCwds.length);
     else this.noteBlindRecovered(this.cachedCwds.length);
-    return false;
-  }
-
-  private walkRecent(
-    dir: string,
-    now: number,
-    windowMs: number,
-    depth: number,
-    maxDepth: number
-  ): boolean {
-    if (depth > maxDepth) return false;
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return false;
-    }
-    for (const e of entries) {
-      const p = path.join(dir, e.name);
-      try {
-        if (e.isDirectory()) {
-          if (this.walkRecent(p, now, windowMs, depth + 1, maxDepth)) return true;
-        } else if (e.isFile()) {
-          if (!/\.(jsonl|json)$/i.test(e.name)) continue;
-          const st = fs.statSync(p);
-          if (now - st.mtimeMs < windowMs) return true;
-        }
-      } catch {
-        /* ignore */
-      }
-    }
     return false;
   }
 }

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.9.17
+
+### Fixed
+- **Switching account while Claude was mid-turn threw that turn's output away
+  without saying so.** The switch has to reload the window — Claude Code reads
+  its config directory once, when it starts — but the session process outlives
+  the reload and the new panel never replays what it missed, so whatever the
+  running turn was about to say was simply gone. Switch Account now looks at
+  this window's own transcripts first, and if a turn is still running it says so
+  and waits for an answer. Cancel and nothing has changed at all: no bind, no
+  stocking, no mirror, no reload, nothing pending anywhere — switching again
+  once the turn finishes is the whole of the recovery. "Switch anyway" reloads
+  exactly as before and still costs that turn's output; the point of the warning
+  is that it is now a choice rather than a surprise. A window we cannot see into
+  is never warned about, so nothing new gets in the way when the answer is
+  unknown. The automatic paths are untouched — a workspace-route correction and
+  the opt-in idle cutover never ask, the latter because it already waits for
+  idle. Every reload also records a short reason next to the timestamp it
+  already kept, so a window that restarted can account for why.
+
 ## 0.9.16
 
 ### Added
