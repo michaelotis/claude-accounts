@@ -375,13 +375,27 @@ export function selectFailoverAccount(
   return null;
 }
 
-export function formatReset(iso: string | null | undefined): string {
+/**
+ * Countdown to a bucket's reset. `compact` collapses it to a single decimal
+ * figure ("8.8h", "45m", "2.1d") for places that append it to a percent — one
+ * formatter, two widths, so a duration never gets a second implementation.
+ */
+export function formatReset(iso: string | null | undefined, compact = false): string {
   if (!iso) return '';
   try {
-    const diff = new Date(iso).getTime() - Date.now();
+    const at = new Date(iso).getTime();
+    // An unparseable timestamp gives NaN, which compares false against every
+    // bound below and would print "NaNm". No time is better than a fake one.
+    if (!Number.isFinite(at)) return '';
+    const diff = at - Date.now();
     if (diff <= 0) return 'soon';
     const hours = Math.floor(diff / 3_600_000);
     const minutes = Math.floor((diff % 3_600_000) / 60_000);
+    if (compact) {
+      if (diff >= 86_400_000) return `${trimZero(diff / 86_400_000)}d`;
+      if (diff >= 3_600_000) return `${trimZero(diff / 3_600_000)}h`;
+      return `${Math.max(1, Math.round(diff / 60_000))}m`;
+    }
     if (hours >= 24) {
       const days = Math.floor(hours / 24);
       return `${days}d ${hours % 24}h`;
@@ -391,6 +405,126 @@ export function formatReset(iso: string | null | undefined): string {
   } catch {
     return '';
   }
+}
+
+/** One decimal, with a bare "9h" rather than "9.0h". */
+function trimZero(value: number): string {
+  return value.toFixed(1).replace(/\.0$/, '');
+}
+
+/**
+ * A bucket this full is what the user is waiting on, so its cell always carries
+ * the countdown rather than just the number.
+ */
+const EXHAUSTED_PERCENT = 80;
+
+/**
+ * Smallest percentage drop that means anything: a fall of this many points or
+ * more is headroom, anything smaller is noise. Usage only rises with use, so any
+ * fall is headroom returning, but both figures are rounded, so two readings of
+ * one unchanged bucket can differ by up to 2 points on rounding alone.
+ */
+export const HEADROOM_MIN_DROP = 3;
+
+/**
+ * A bucket landing this low came back because its window rolled over. Anything
+ * higher is a partial move — an allowance change or a credit — which no clock
+ * predicts: measured over 13 days of logs, 117 of 130 downward moves landed at
+ * ~0% at untidy times (18:30, 23:31, 04:13), and the clearest of the rest was
+ * two accounts going Fable 100% → ~70% six seconds apart, neither near its
+ * resetsAt.
+ */
+const HEADROOM_RESET_MAX = 5;
+
+/** One bucket whose usage percentage fell between two snapshots. */
+export interface HeadroomEvent {
+  /** `5h`, `7d`, or the model bucket's name (`Fable`). */
+  label: string;
+  from: number;
+  to: number;
+  kind: 'reset' | 'raise';
+}
+
+/**
+ * Buckets that gained headroom between two snapshots of one account.
+ *
+ * Silent by design when it cannot know: no previous snapshot (a window that has
+ * just started), a never-fetched snapshot on either side (`fetchedAt === 0`, so
+ * its zeros are placeholders, not readings), a reading no newer than the one it
+ * is compared against, or a model bucket that only appears in `next` (Anthropic
+ * adding a bucket is not a drop).
+ */
+export function headroomEvents(
+  prev: UsageSnapshot | null | undefined,
+  next: UsageSnapshot | null | undefined
+): HeadroomEvent[] {
+  if (!prev || !next) return [];
+  if (!prev.fetchedAt || !next.fetchedAt) return [];
+  // Only a genuinely newer reading can show a drop, and that single test is what
+  // keeps a degraded snapshot out: every path that serves one without a live
+  // fetch carries the ORIGINAL fetch time rather than stamping a new one. A 429
+  // or a failed call falls back to the last cached snapshot exactly as it was
+  // stored; the policy.json fallback carries the poll time of the row it reads;
+  // the never-fetched placeholder carries 0, which the line above already
+  // rejects. So a best-effort snapshot served during a backoff is never newer
+  // than what this window already holds, and its figures never reach the
+  // comparison below — while an all-zero reading that IS newer is a real reset.
+  if (next.fetchedAt <= prev.fetchedAt) return [];
+  const events: HeadroomEvent[] = [];
+  // One bucket speaks once: a name that differs only in case is the same bucket,
+  // and a second event for it would double-count in the fleet-wide collapse.
+  const spoken = new Set<string>();
+  const consider = (label: string, from: unknown, to: unknown) => {
+    if (typeof from !== 'number' || typeof to !== 'number') return;
+    if (!Number.isFinite(from) || !Number.isFinite(to)) return;
+    // A bucket cannot be less than empty or more than spent, so a figure outside
+    // 0–100 is not a reading at all — and one bad figure on either side would
+    // manufacture a drop of any size. Silence beats a cue built on a number the
+    // API's own contract does not allow.
+    if (from < 0 || from > 100 || to < 0 || to > 100) return;
+    if (from - to < HEADROOM_MIN_DROP) return;
+    if (spoken.has(label.toLowerCase())) return;
+    spoken.add(label.toLowerCase());
+    events.push({ label, from, to, kind: to <= HEADROOM_RESET_MAX ? 'reset' : 'raise' });
+  };
+  consider('5h', prev.sessionPercent, next.sessionPercent);
+  consider('7d', prev.weeklyPercent, next.weeklyPercent);
+  const before = new Map<string, number>();
+  for (const m of Array.isArray(prev.modelLimits) ? prev.modelLimits : []) {
+    if (m && typeof m.name === 'string') before.set(m.name.toLowerCase(), m.percent);
+  }
+  for (const m of Array.isArray(next.modelLimits) ? next.modelLimits : []) {
+    if (!m || typeof m.name !== 'string') continue;
+    const from = before.get(m.name.toLowerCase());
+    if (from == null) continue;
+    consider(m.name, from, m.percent);
+  }
+  return events;
+}
+
+/**
+ * One tooltip line for an account's headroom: which buckets came back, and
+ * whether the window rolled over or the allowance itself moved. Several buckets
+ * for one account collapse into the same line — this is a quiet cue, not a list.
+ */
+export function describeHeadroom(events: HeadroomEvent[], accountLabel: string): string {
+  if (!events.length) return '';
+  const who = escapeTableCell(accountLabel);
+  // The bucket name is an API display name and lands in the same trusted
+  // markdown as the account name, so it gets the same escaping.
+  const what = (e: HeadroomEvent) => escapeTableCell(e.label);
+  if (events.length === 1) {
+    const e = events[0];
+    return e.kind === 'reset'
+      ? `${what(e)} reset for ${who} — ${e.to}% used`
+      : `${what(e)} allowance went up for ${who} — ${e.from}% → ${e.to}%`;
+  }
+  const clauses = events.map((e) =>
+    e.kind === 'reset'
+      ? `${what(e)} reset — ${e.to}% used`
+      : `${what(e)} allowance went up — ${e.from}% → ${e.to}%`
+  );
+  return `${who}: ${clauses.join(' · ')}`;
 }
 
 export function formatUsageBar(u: UsageSnapshot | null | undefined): string {
@@ -422,7 +556,7 @@ export interface AccountUsageRow {
  * Markdown-table cells break on raw pipes, and stray emphasis characters in an
  * account name would mangle the row — escape everything markdown-active.
  */
-function escapeTableCell(s: string): string {
+export function escapeTableCell(s: string): string {
   return s.replace(/[\\|*_`[\]]/g, (c) => `\\${c}`);
 }
 
@@ -435,7 +569,20 @@ function escapeTableCell(s: string): string {
 export function formatAccountsTable(rows: AccountUsageRow[]): string {
   const cell = (percent: number | null | undefined, resetsAt: string | null | undefined) => {
     if (percent == null) return '—';
-    const reset = formatReset(resetsAt ?? null);
+    // A hint is only worth the space while it names a time still to come: a
+    // malformed or already-elapsed reset time gets the number on its own rather
+    // than a countdown that has run out.
+    const hint = (compact: boolean) => {
+      const due = formatReset(resetsAt ?? null, compact);
+      return due && due !== 'soon' ? due : '';
+    };
+    // A bucket at the top of its allowance is one the user is blocked on, so
+    // say when it is due back in the shortest form that still reads: "100% · 8.8h".
+    if (percent >= EXHAUSTED_PERCENT) {
+      const due = hint(true);
+      return `**${percent}%**${due ? ` · ${due}` : ''}`;
+    }
+    const reset = hint(false);
     return `**${percent}%**${reset ? ` ${reset}` : ''}`;
   };
   const lines = ['| Account | 5h | 7d | Fable |', '| --- | --- | --- | --- |'];
