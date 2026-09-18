@@ -281,7 +281,7 @@ export class SetupWizard {
       // holding different ones would take turns rewriting the shared file.
       ensureIdentity(known.dir, observed);
       await this.binding.bind(known);
-      mirrorToDefault(sourceDir, { takeover: true });
+      await mirrorToDefault(sourceDir, { takeover: true });
       if (!opts.quiet) {
         vscode.window.showInformationMessage(`${status.email} — this window is bound to it.`);
       }
@@ -311,7 +311,7 @@ export class SetupWizard {
     target.email = status.email;
     await this.registry.add(target);
     await this.binding.bind(target);
-    mirrorToDefault(sourceDir, { takeover: true });
+    await mirrorToDefault(sourceDir, { takeover: true });
     if (!opts.quiet) {
       vscode.window.showInformationMessage(`Saved ${status.email} — this window is bound to it.`);
     }
@@ -511,7 +511,7 @@ export class SetupWizard {
         );
         materialize(bound, dir, true);
         if (emailsEqual(readIdentity(dir)?.email, boundEmail)) {
-          mirrorToDefault(dir);
+          await mirrorToDefault(dir);
           if (!this.recentlyReloaded()) {
             await this.requestWindowReload(
               `Restored ${boundEmail ?? bound.name} for this window.`,
@@ -591,7 +591,7 @@ export class SetupWizard {
           log(`reconcile: dir grant is stale vs store and restock was not applied`);
         }
       } else {
-        mirrorToDefault(dir);
+        await mirrorToDefault(dir);
       }
     }
     // Propagate newly-added home MCP servers into already-stocked windows.
@@ -867,14 +867,14 @@ export class SetupWizard {
             half = `identity is ${identityDesc}`;
           }
           log(`switch: ${email} did not stock ${wd} (${half}) — default dir left as is`);
-        } else if (!mirrorToDefault(wd, { takeover: true })) {
+        } else if (!(await mirrorToDefault(wd, { takeover: true }))) {
           log(`switch: default dir did not follow ${email} (see mirror lines above)`);
         }
       }
     } else {
       // Workspace-route correction is automatic — stay passive so it cannot
       // flip ~/.claude to the pin without an explicit user choice.
-      mirrorToDefault(wd);
+      await mirrorToDefault(wd);
     }
     await this.requestWindowReload(opts.notice, {
       userInitiated: opts.userInitiated !== false,

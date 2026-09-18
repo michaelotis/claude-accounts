@@ -452,7 +452,7 @@ describe('stampHomeIdentity (~/.claude.json, via mirrorToDefault)', () => {
     }
   });
 
-  it('carries no organization, display name or account-scoped id across an email change', () => {
+  it('carries no organization, display name or account-scoped id across an email change', async () => {
     const sourceDir = path.join(home, '.claude-new');
     fs.mkdirSync(sourceDir, { recursive: true });
     writeCreds(sourceDir);
@@ -475,7 +475,7 @@ describe('stampHomeIdentity (~/.claude.json, via mirrorToDefault)', () => {
       })
     );
 
-    assert.equal(mirrorToDefault(sourceDir, { takeover: true }), true);
+    assert.equal(await mirrorToDefault(sourceDir, { takeover: true }), true);
 
     const cfg = JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf-8'));
     assert.equal(cfg.oauthAccount.emailAddress, 'new@ex.com');

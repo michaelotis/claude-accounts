@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { AuthStatus } from './cli';
 import { AccountIdentity, readIdentity } from './accounts';
-import { writeFileAtomic, copyFileAtomic, withLock } from './fsSafe';
+import { writeFileAtomic, copyFileAtomic, withLockAsync } from './fsSafe';
 import { foreignTokenConflict, tokenExpiry } from './workdir';
 import { emailsEqual } from './workspaceRoutes';
 import { log } from './log';
@@ -273,11 +273,44 @@ export function defaultSourceDir(): string {
  * keeps it inside the dir instead, and writing it there would leave the default
  * account signed in with no name).
  */
-export function mirrorToDefault(sourceDir: string, opts: { takeover?: boolean } = {}): boolean {
+export function mirrorToDefault(
+  sourceDir: string,
+  opts: { takeover?: boolean } = {}
+): Promise<boolean> {
   const defaultDir = defaultSourceDir();
-  if (isDefaultDir(sourceDir)) return false; // already is the default
+  if (isDefaultDir(sourceDir)) return Promise.resolve(false); // already is the default
 
-  const takeover = !!opts.takeover;
+  // In-process single flight per default dir. Waiting for the lock now yields the
+  // event loop, so a focus reconcile and an account-watcher event can both be
+  // mid-mirror at once — which they never could while the wait blocked. The
+  // second caller is QUEUED BEHIND the first rather than handed its result: it
+  // may carry a different source dir, or a takeover the first call knows nothing
+  // about, and answering it with someone else's outcome would silently drop that
+  // decision. Queuing makes every call classify against the default dir as the
+  // call before it left it.
+  const epoch = disposeEpoch;
+  const prior = mirrorQueue.get(defaultDir);
+  const run = (prior ? prior.catch(() => false) : Promise.resolve(false)).then(() =>
+    mirrorOnce(defaultDir, sourceDir, !!opts.takeover, epoch)
+  );
+  mirrorQueue.set(defaultDir, run);
+  void run
+    .catch(() => false)
+    .then(() => {
+      if (mirrorQueue.get(defaultDir) === run) mirrorQueue.delete(defaultDir);
+    });
+  return run;
+}
+
+/** Tail of the queued mirrors for a default dir, while any are outstanding. */
+const mirrorQueue = new Map<string, Promise<boolean>>();
+
+async function mirrorOnce(
+  defaultDir: string,
+  sourceDir: string,
+  takeover: boolean,
+  epoch: number
+): Promise<boolean> {
   try {
     // Token first, then identity, both from sourceDir: the pair stamped into
     // ~/.claude must come from one place. Reading identity at the call site is
@@ -309,17 +342,32 @@ export function mirrorToDefault(sourceDir: string, opts: { takeover?: boolean } 
     // Fill of an empty default used to have no single writer: after Forget/logout
     // every bound window could wake and write, and token/identity are two files,
     // so two windows could leave token(A)+name(B).
-    const outcome = withLock(
+    //
+    // The WAIT is async (it runs on the reconcile path, at activation, on focus
+    // and on every account-watcher event — a blocking wait froze the window), but
+    // mirrorUnderLock itself is synchronous end to end and must stay that way:
+    // the token write and the identity write are two files, and an await between
+    // them would let another continuation in this process observe — or add to —
+    // the half-written pair the lock exists to prevent.
+    beforeMirrorLock?.();
+    const { result, locked } = await withLockAsync(
       path.join(defaultDir, '.credentials.json.lock'),
-      () => mirrorUnderLock(defaultDir, incoming, identity, takeover, sourceDir),
-      { capMs: takeover ? 2_000 : 500, stepMs: 15, skipIfUnacquired: true }
+      () => mirrorUnderLock(defaultDir, incoming, identity, takeover, sourceDir, epoch),
+      {
+        // withLockAsync's own defaults are tuned for the long history merge;
+        // these are the caps this path has always used.
+        staleMs: 15_000,
+        capMs: takeover ? 2_000 : 500,
+        stepMs: 15,
+        skipIfUnacquired: true,
+      }
     );
-    if (outcome === undefined) {
+    if (!locked) {
       lastMirrorSkipReason = 'default dir busy';
       logDecision('mirror: default dir busy (another window is mirroring) — skipped', takeover);
       return false;
     }
-    return outcome;
+    return result ?? false;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     lastMirrorSkipReason = message;
@@ -335,7 +383,8 @@ function mirrorUnderLock(
   incoming: Buffer,
   identity: AccountIdentity,
   takeover: boolean,
-  sourceDir: string
+  sourceDir: string,
+  epoch: number
 ): boolean {
   const dstToken = path.join(defaultDir, '.credentials.json');
   let current: Buffer | undefined;
@@ -430,7 +479,7 @@ function mirrorUnderLock(
           false
         );
         if (!tokenlessTimerArmed.has(key)) {
-          scheduleReCheck(key, sourceDir, h.email, MID_OAUTH_ABANDON_MS - elapsed + 1000);
+          scheduleReCheck(key, sourceDir, h.email, MID_OAUTH_ABANDON_MS - elapsed + 1000, epoch);
         }
         return false;
       }
@@ -589,6 +638,7 @@ const tokenlessTimers: ReturnType<typeof setTimeout>[] = [];
 let lastMirrorSkipReason: string | undefined;
 let beforeIdentityWrite: (() => void) | undefined;
 let beforeTokenWrite: (() => void) | undefined;
+let beforeMirrorLock: (() => void) | undefined;
 
 /** Test seam: the abandon window is 5 min in production. */
 export function _setMidOauthAbandonMs(ms: number): void {
@@ -601,42 +651,86 @@ export function _setBeforeIdentityWrite(fn: (() => void) | undefined): void {
   beforeIdentityWrite = fn;
 }
 
+/** Test seam: run as a mirror starts waiting for the default dir's lock. */
+export function _setBeforeMirrorLock(fn: (() => void) | undefined): void {
+  beforeMirrorLock = fn;
+}
+
 /** Test seam: run immediately before the token write. */
 export function _setBeforeTokenWrite(fn: (() => void) | undefined): void {
   beforeTokenWrite = fn;
 }
 
-function scheduleReCheck(key: string, sourceDir: string, email: string, delay: number): void {
+/**
+ * Bumped by dispose ONLY, and consulted only where a re-check timer is armed or
+ * fires. A re-check awaits the mirror now, so a dispose can land while one is
+ * waiting for the lock or in its tail, and each of those would otherwise arm the
+ * next timer for a window that is going away. Every arm carries the epoch its
+ * mirror started under.
+ *
+ * It does NOT gate writes. What the default dir should hold is decided under the
+ * lock from what is on disk, and that decision is as right a moment after a
+ * dispose as it was a moment before — the blocking version of this code would
+ * simply have finished the same write first.
+ *
+ * Deliberately NOT bumped when an episode merely ends: writeToken ends the
+ * episode before the identity write is known to have landed, and a rolled-back
+ * write must still get its retry.
+ */
+let disposeEpoch = 0;
+
+function scheduleReCheck(
+  key: string,
+  sourceDir: string,
+  email: string,
+  delay: number,
+  epoch: number
+): void {
+  if (epoch !== disposeEpoch) return;
   tokenlessTimerArmed.add(key);
   const t = setTimeout(() => {
     const idx = tokenlessTimers.indexOf(t);
     if (idx !== -1) tokenlessTimers.splice(idx, 1);
     tokenlessTimerArmed.delete(key);
-    const ok = mirrorToDefault(sourceDir);
-    if (ok) return;
-    // The mid-OAuth path may have armed a fresh timer; don't stack another.
-    if (tokenlessTimerArmed.has(key)) return;
-    const n = (tokenlessAttempts.get(key) ?? 0) + 1;
-    tokenlessAttempts.set(key, n);
-    const reason = lastMirrorSkipReason ?? 'unknown';
-    if (n < RECHECK_ATTEMPTS_CAP) {
-      logDecision(
-        `mirror: re-check for ${email} could not run (${reason}) — will try once more`,
-        false
-      );
-      scheduleReCheck(key, sourceDir, email, RECHECK_RETRY_MS);
-    } else {
-      logDecision(
-        `mirror: re-check for ${email} could not run (${reason}) — giving up until the next reconcile`,
-        false
-      );
-    }
+    void runReCheck(key, sourceDir, email, epoch);
   }, delay);
   if (typeof t.unref === 'function') t.unref();
   tokenlessTimers.push(t);
 }
 
+async function runReCheck(
+  key: string,
+  sourceDir: string,
+  email: string,
+  epoch: number
+): Promise<void> {
+  if (epoch !== disposeEpoch) return;
+  const ok = await mirrorToDefault(sourceDir);
+  if (ok) return;
+  // Disposed while the mirror was awaited: retrying would re-arm a timer for a
+  // window that is going away.
+  if (epoch !== disposeEpoch) return;
+  // The mid-OAuth path may have armed a fresh timer; don't stack another.
+  if (tokenlessTimerArmed.has(key)) return;
+  const n = (tokenlessAttempts.get(key) ?? 0) + 1;
+  tokenlessAttempts.set(key, n);
+  const reason = lastMirrorSkipReason ?? 'unknown';
+  if (n < RECHECK_ATTEMPTS_CAP) {
+    logDecision(
+      `mirror: re-check for ${email} could not run (${reason}) — will try once more`,
+      false
+    );
+    scheduleReCheck(key, sourceDir, email, RECHECK_RETRY_MS, epoch);
+  } else {
+    logDecision(
+      `mirror: re-check for ${email} could not run (${reason}) — giving up until the next reconcile`,
+      false
+    );
+  }
+}
+
 export function disposeMirrorTimers(): void {
+  disposeEpoch++;
   clearAbsenceEpisode();
 }
 
