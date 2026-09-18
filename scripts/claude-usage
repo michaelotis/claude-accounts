@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Read-only view of the usage the extension has already collected.
+set -euo pipefail
+die() {
+  echo "claude-usage: $1" >&2
+  exit 3
+}
+# Nothing here is a reading, so nothing here may exit 1 — that code means "data
+# printed, some of it stale". Left to `set -e` a failed resolution exits with the
+# failing command's own status and says nothing at all.
+trap 'die "could not work out where it is installed"' ERR
+# Resolve the link first: on $PATH this is reached through a symlink, and the
+# directory the link sits in has no dist/ to run.
+self="$(readlink -f "${BASH_SOURCE[0]}")"
+repo="$(cd "$(dirname "$self")/.." && pwd)"
+trap - ERR
+cli="$repo/dist/usage-cli.js"
+# Not built is not "some of it is stale": exit 1 is a reading, and there is none.
+if [ ! -f "$cli" ]; then
+  die "no $cli — run 'npm run compile' in $repo first"
+fi
+exec node "$cli" "$@"

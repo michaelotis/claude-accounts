@@ -128,6 +128,57 @@ describe('buildSnapshot + triggers', () => {
       false
     );
   });
+
+  it('counts no buckets when the response carried none', () => {
+    const snap = buildSnapshot({}, profile, '/tmp/fake', 1_000);
+    assert.equal(snap.bucketsSeen, 0);
+    // The zeros are the snapshot's shape, not a reading — and on their own they
+    // are indistinguishable from an account that has used nothing.
+    assert.equal(snap.sessionPercent, 0);
+    assert.equal(snap.weeklyPercent, 0);
+  });
+
+  it('counts the five-hour and seven-day buckets', () => {
+    const snap = buildSnapshot(
+      { five_hour: { utilization: 4 }, seven_day: { utilization: 89 } },
+      profile,
+      '/tmp/fake',
+      1_000
+    );
+    assert.equal(snap.bucketsSeen, 2);
+  });
+
+  it('counts a model-scoped bucket as well', () => {
+    assert.equal(buildSnapshot(baseUsage, profile, '/tmp/fake', 1_000).bucketsSeen, 3);
+    assert.equal(
+      buildSnapshot({ ...baseUsage, limits: [] }, profile, '/tmp/fake', 1_000).bucketsSeen,
+      2
+    );
+  });
+
+  it('leaves every other field exactly as it was', () => {
+    const { bucketsSeen, ...rest } = buildSnapshot(baseUsage, profile, '/tmp/fake', 1_000);
+    assert.equal(bucketsSeen, 3);
+    // The extension's pills, failover and headroom cue read these, so the count
+    // is additive or it is wrong: this is the whole snapshot as it was before.
+    assert.deepEqual(rest, {
+      sessionPercent: 4,
+      sessionResetsAt: null,
+      weeklyPercent: 89,
+      weeklyResetsAt: '2026-07-17T06:00:00Z',
+      opusPercent: null,
+      opusResetsAt: null,
+      sonnetPercent: null,
+      sonnetResetsAt: null,
+      modelLimits: [{ name: 'Fable', percent: 96, resetsAt: null, kind: 'weekly_scoped' }],
+      overagePercent: null,
+      email: 'a@b.com',
+      orgName: 'Org',
+      planLabel: 'Max 20x',
+      fetchedAt: 1_000,
+      configDir: '/tmp/fake',
+    });
+  });
 });
 
 /**
