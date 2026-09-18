@@ -1,4 +1,4 @@
-const { describe, it, beforeEach, afterEach } = require('node:test');
+const { describe, it, before, after, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('path');
 const esbuild = require('esbuild');
@@ -70,6 +70,15 @@ function writeJson(file, obj, mode = 0o600) {
 describe('mirrorToDefault', () => {
   let tmpHome;
   let prevHome;
+
+  // The lock wait sleeps on an unref'd timer — right for an extension host, which
+  // never drains, but here it is often the only thing pending, and a drained loop
+  // cancels the awaiting test and every test after it.
+  let keepAlive;
+  before(() => {
+    keepAlive = setInterval(() => {}, 1_000);
+  });
+  after(() => clearInterval(keepAlive));
 
   beforeEach(() => {
     prevHome = process.env.HOME;
