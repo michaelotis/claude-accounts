@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.18
+
+### Fixed
+- **The window could freeze for a moment while another window held the
+  credentials lock.** Keeping Claude Code's own default account (`~/.claude`) in
+  step takes a short lock on it, and the wait for that lock stopped this window
+  dead — up to half a second on an ordinary check, two seconds when you switch
+  accounts. That check runs at startup, whenever the window is focused and on
+  every change to an account's files, so a window doing its own bookkeeping next
+  door was enough to make this one stutter. The wait now yields while it waits.
+  The lock, how long it waits before giving up, and every decision about what the
+  default account should hold are exactly as they were; two checks that overlap
+  in one window now queue behind each other instead of running together.
+
 ## 0.9.17
 
 ### Fixed
