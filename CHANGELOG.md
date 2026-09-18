@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.16
+
+### Added
+- **The hover card already told you which account had headroom; taking it still
+  meant a trip through a menu.** Clicking the meter opened a quick pick at the
+  top of the window, so the name you had just read in the table had to be found
+  again in a list. Every other account's name in that table is now a link:
+  clicking it switches this window to that account directly. Nothing after the
+  choice changes — the same already-current message when you pick the account
+  you are on, the same warning when settings pin the folder to someone else, the
+  same single reload. The quick pick is untouched and still answers the command
+  palette, the status-bar click and the signed-out card, and the table's columns,
+  figures and countdowns are exactly as they were.
+
 ## 0.9.15
 
 ### Fixed

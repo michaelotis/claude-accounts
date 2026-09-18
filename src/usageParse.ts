@@ -550,6 +550,8 @@ export interface AccountUsageRow {
   snap: UsageSnapshot | null;
   /** Render a staleness hint next to the label (data older than its tier). */
   stale?: boolean;
+  /** Identity to switch to when the row is clicked. Absent → plain text. */
+  email?: string;
 }
 
 /**
@@ -561,10 +563,24 @@ export function escapeTableCell(s: string): string {
 }
 
 /**
+ * Positional command arguments as a `command:` URI query — the JSON array VS
+ * Code expects, percent-encoded. The parentheses `encodeURIComponent` leaves
+ * alone are encoded too: a `)` inside a markdown link's destination ends the
+ * link, so an email carrying one would spill the rest of the URI into the cell.
+ */
+function encodeCommandArgs(args: unknown[]): string {
+  return encodeURIComponent(JSON.stringify(args)).replace(/\(/g, '%28').replace(/\)/g, '%29');
+}
+
+/**
  * The all-accounts usage table for the status-bar tooltip: one row per saved
  * account — `| Account | 5h | 7d | Fable |` — percents bold with each bucket's
  * reset countdown inline. Compact by design: this replaces the old multi-
  * paragraph per-account block.
+ *
+ * Another account's name is a link that switches this window straight to it, so
+ * the hover that says which account has headroom is also where you take it. The
+ * active row has nowhere to go, so it stays plain text.
  */
 export function formatAccountsTable(rows: AccountUsageRow[]): string {
   const cell = (percent: number | null | undefined, resetsAt: string | null | undefined) => {
@@ -588,7 +604,13 @@ export function formatAccountsTable(rows: AccountUsageRow[]): string {
   const lines = ['| Account | 5h | 7d | Fable |', '| --- | --- | --- | --- |'];
   for (const row of rows) {
     const name = escapeTableCell(row.label);
-    const label = `${row.active ? `**${name}** •` : name}${row.stale ? ' _(stale)_' : ''}`;
+    const target =
+      !row.active && row.email
+        ? `[${name}](command:claudeProfiles.switchAccount?${encodeCommandArgs([row.email])})`
+        : row.active
+          ? `**${name}** •`
+          : name;
+    const label = `${target}${row.stale ? ' _(stale)_' : ''}`;
     if (!row.snap) {
       lines.push(`| ${label} | — | — | — |`);
       continue;
