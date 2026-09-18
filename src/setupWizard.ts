@@ -5,7 +5,15 @@ import * as os from 'os';
 import { Account, AccountRegistry, readIdentity, hasCredentials } from './accounts';
 import { WindowBinding } from './binding';
 import { getAuthStatus, AuthStatus } from './cli';
-import { snapshotAccount, defaultSourceDir, mirrorToDefault, stampIdentity } from './capture';
+import {
+  snapshotAccount,
+  defaultSourceDir,
+  mirrorToDefault,
+  stampIdentity,
+  ensureIdentity,
+  observedDisplayName,
+  type IdentityFields,
+} from './capture';
 import { ensureSharedHistory } from './sharedHistory';
 import { signOut, interruptSessions, dirsHoldingToken, looksLikeLogout } from './reclaim';
 import {
@@ -179,6 +187,20 @@ export class SetupWizard {
       return undefined;
     }
 
+    // A capture is the one moment the extension genuinely OBSERVES an account's
+    // identity: the dir it is signed into was just read (or the CLI just
+    // answered for it). The display name only the identity file carries is
+    // taken from the same read, and only when that file still names this
+    // account — a dir whose identity has drifted to another email must not lend
+    // its name to this one.
+    const observed: IdentityFields = emailsEqual(identity?.email, status.email)
+      ? {
+          ...status,
+          orgName: status.orgName || identity?.organizationName,
+          displayName: observedDisplayName(identity),
+        }
+      : status;
+
     // Known account? Reuse its store — never a second copy of the same email.
     // Take the opportunity to freshen the store with the token now in use.
     const known = this.registry.savedForEmail(status.email);
@@ -186,6 +208,13 @@ export class SetupWizard {
       known.email = status.email;
       await this.registry.add(known);
       await refreshStore(known, sourceDir);
+      // The store's identity is stamped when the account is saved and rewritten
+      // only when the email changes, so an organization renamed after that stays
+      // wrong for good — and every snapshot synthesised from the store names it.
+      // Correct it HERE, where the value was just observed, and nowhere else: a
+      // poll comparing two copies cannot tell which is fresher, so two windows
+      // holding different ones would take turns rewriting the shared file.
+      ensureIdentity(known.dir, observed);
       await this.binding.bind(known);
       mirrorToDefault(sourceDir, { takeover: true });
       if (!opts.quiet) {
@@ -208,7 +237,7 @@ export class SetupWizard {
       })();
 
     try {
-      snapshotAccount(sourceDir, target.dir, status);
+      snapshotAccount(sourceDir, target.dir, observed);
     } catch (err) {
       vscode.window.showErrorMessage(`Could not save account: ${(err as Error).message}`);
       return undefined;
