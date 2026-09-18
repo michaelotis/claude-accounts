@@ -711,18 +711,78 @@ export type UsageFetchKind =
   | 'api_error'
   | 'unknown';
 
+/**
+ * Consecutive background refusals before a row says "sign in again". Two, not
+ * one: the background poll has no `preSyncStore` retry (see refresh()), so a
+ * single `token_rejected` can be the store-lag race rather than a revoked
+ * account — and a false marker costs the user a pointless re-login.
+ */
+export const AUTH_REJECT_CONFIRM = 2;
+
+/**
+ * How long a refusal stays available to be the first of a consecutive pair.
+ * Without a bound, two unrelated one-off refusals hours apart — the store-lag
+ * race the pair exists to filter out, twice — would mark a healthy account.
+ */
+export const AUTH_REJECT_WINDOW_MS = 15 * 60_000;
+
 export interface UsageFetchFailure {
   kind: UsageFetchKind;
   /** Short user-facing sentence (no secrets). */
   message: string;
   status?: number;
+  /**
+   * The GRANT itself was refused — the refresh POST came back `invalid_grant`
+   * or 401, or the usage endpoint answered 401 with a token minted seconds
+   * earlier. Only this is evidence that signing in again would change anything.
+   * A 403 is deliberately excluded: org policy, plan or a disabled endpoint all
+   * answer 403 with a perfectly good grant, and `/login` could never clear it.
+   */
+  grantRejected?: boolean;
 }
 
 export type UsageFetchResult =
-  { ok: true; snap: UsageSnapshot } | { ok: false; failure: UsageFetchFailure };
+  | {
+      ok: true;
+      snap: UsageSnapshot;
+      /**
+       * This snap really is a reading of the account: our own HTTP 200, or a
+       * shared-cache entry inside the freshness the caller asked for. Absent on
+       * every best-effort return — see isLiveReading.
+       */
+      live?: boolean;
+    }
+  | { ok: false; failure: UsageFetchFailure };
 
-function failure(kind: UsageFetchKind, message: string, status?: number): UsageFetchResult {
-  return { ok: false, failure: { kind, message, status } };
+function failure(
+  kind: UsageFetchKind,
+  message: string,
+  status?: number,
+  grantRejected?: boolean
+): UsageFetchResult {
+  return { ok: false, failure: { kind, message, status, grantRejected } };
+}
+
+/**
+ * True when a result really carries a reading of this account's usage — our own
+ * 200, or one another window wrote inside the background tier. Deliberately not
+ * every `ok: true`: a 429, a busy fetch lock or an unrecognised error all serve
+ * the LAST KNOWN figures (`bestEffortSnap`), which say nothing about whether the
+ * account's grant still works.
+ *
+ * The PRODUCER decides, via `live`: a timestamp cannot, because `bestEffortSnap`
+ * can fall through to `policy.json`, whose rows carry a `fetchedAt` copied from
+ * whichever window last polled — recent enough to pass any age test while being
+ * no reading of ours at all. `live` is absent on every best-effort return, so an
+ * unclassified path reads as "not a reading". The age bound stays as a second,
+ * independent floor: it bounds how old a cached reading may be whatever
+ * freshness a caller asked for, and a negative age is a clock the shared cache
+ * was written by rather than ours, which is no evidence either way.
+ */
+function isLiveReading(result: UsageFetchResult): boolean {
+  if (!result.ok || result.live !== true) return false;
+  const age = Date.now() - result.snap.fetchedAt;
+  return result.snap.fetchedAt > 0 && age >= 0 && age <= BACKGROUND_TTL_MS;
 }
 
 /**
@@ -802,7 +862,7 @@ export async function fetchUsageDetailed(
     if (fresh) {
       // Served silently: this is the overwhelmingly common path, and a log line per
       // cache read buries the real events. Network fetches still log below.
-      return { ok: true, snap: { ...fresh, configDir: dir } };
+      return { ok: true, snap: { ...fresh, configDir: dir }, live: true };
     }
   }
 
@@ -877,9 +937,13 @@ async function fetchUsageNetwork(dir: string, key: string): Promise<UsageFetchRe
       );
     }
     if (kind === 'token_rejected') {
+      // The token endpoint itself refused the refresh token (invalid_grant/401):
+      // evidence about the grant, so it counts toward the background marker.
       return failure(
         'token_rejected',
-        'Claude rejected this window’s refresh token. Sign in again with Claude Code (/login).'
+        'Claude rejected this window’s refresh token. Sign in again with Claude Code (/login).',
+        undefined,
+        true
       );
     }
     log(`usage: ensureFreshToken failed — ${err instanceof Error ? err.message : String(err)}`);
@@ -906,26 +970,29 @@ async function fetchUsageNetwork(dir: string, key: string): Promise<UsageFetchRe
         log(
           `usage: forced refresh failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`
         );
-        return {
-          ok: false,
-          failure: {
-            kind: 'token_rejected',
-            message:
-              'Claude rejected this window’s token after refresh. Sign in again with Claude Code (/login).',
-            status,
-          },
-        };
+        // This catch also covers a timeout or socket error on the retry poll, so
+        // the grant is only implicated when the refresh POST itself was refused.
+        const retryKind =
+          typeof retryErr === 'object' && retryErr && 'kind' in retryErr
+            ? (retryErr as { kind: UsageFetchKind }).kind
+            : 'unknown';
+        return failure(
+          'token_rejected',
+          'Claude rejected this window’s token after refresh. Sign in again with Claude Code (/login).',
+          status,
+          retryKind === 'token_rejected'
+        );
       }
       if (status === 401 || status === 403) {
-        return {
-          ok: false,
-          failure: {
-            kind: 'token_rejected',
-            message:
-              'Claude rejected this window’s token after refresh. Sign in again with Claude Code (/login).',
-            status,
-          },
-        };
+        // 401 on a token minted a moment ago is the grant. 403 is not: org
+        // policy, plan or a disabled endpoint refuse a working grant the same
+        // way, and no amount of signing in again would move them.
+        return failure(
+          'token_rejected',
+          'Claude rejected this window’s token after refresh. Sign in again with Claude Code (/login).',
+          status,
+          status === 401
+        );
       }
     }
 
@@ -974,7 +1041,7 @@ async function fetchUsageNetwork(dir: string, key: string): Promise<UsageFetchRe
         snap.modelLimits.map((m) => `${m.name}:${m.percent}%`).join(',') || 'none'
       }`
     );
-    return { ok: true, snap };
+    return { ok: true, snap, live: true };
   } catch (err) {
     // Network / timeout — keep last good cache
     log(`usage: network error — ${err instanceof Error ? err.message : String(err)}`);
@@ -1031,8 +1098,10 @@ export async function fetchUsageCoordinated(
 
   const fromCache = (maxAgeMs: number): CoordinatedResult | null => {
     const fresh = getCachedSnap(key, maxAgeMs);
+    // A shared-cache hit inside the freshness the caller asked for IS a reading:
+    // some window really polled the account that recently and got a 200.
     return fresh
-      ? { result: { ok: true, snap: { ...fresh, configDir: dir } }, fromNetwork: false }
+      ? { result: { ok: true, snap: { ...fresh, configDir: dir }, live: true }, fromNetwork: false }
       : null;
   };
   const bestEffort = (): CoordinatedResult => {
@@ -1290,6 +1359,14 @@ export class UsageMonitor {
   private cacheWatchTimer: NodeJS.Timeout | null = null;
   private watchingCache = false;
   private lastSeenFetchedAt = new Map<string, number>();
+  /**
+   * Consecutive background `token_rejected` results per email (lowercased), for
+   * the hover card's "sign in again" marker. In-process only and never written
+   * to disk: every window polls every account through the coordinator, so each
+   * one sees the refusal for itself, and a shared file would only add a way for
+   * a marker to outlive the sign-in it describes.
+   */
+  private authRejections = new Map<string, { count: number; at: number }>();
 
   /**
    * Carries this window's workdir grant into the account store when the workdir
@@ -1358,6 +1435,19 @@ export class UsageMonitor {
 
   getCached(dir?: string): UsageSnapshot | null | undefined {
     return this.cache.get(usageCacheKey(resolveConfigDir(dir)));
+  }
+
+  /**
+   * Emails Claude has refused AUTH_REJECT_CONFIRM background polls running — the
+   * rows the tooltip marks "sign in again". A background account never raises
+   * the sign-in UI, so this marker is the whole of what it gets.
+   */
+  getRejectedEmails(): Set<string> {
+    const out = new Set<string>();
+    for (const [email, rec] of this.authRejections) {
+      if (rec.count >= AUTH_REJECT_CONFIRM) out.add(email);
+    }
+    return out;
   }
 
   /** Last-known snapshot per email (watcher-fed) — the tooltip table's rows. */
@@ -1453,6 +1543,13 @@ export class UsageMonitor {
         this.lastFailure = null;
         this.lastServedFromCacheAgeMs = cachedSnapAgeMs(key) ?? 0;
         const snap = { ...alreadyFresh, configDir: fetchDir };
+        // Same evidence bar as the network path below. This is the branch taken
+        // right after switch → /login → Refresh Usage when another window polled
+        // the account seconds ago: a cache entry that fresh is a real reading,
+        // and it is the only thing that will answer the marker for a while.
+        if (email && isLiveReading({ ok: true, snap, live: true })) {
+          this.authRejections.delete(email.trim().toLowerCase());
+        }
         this.cache.set(key, snap);
         this.emitPressure(snap);
         this.emit();
@@ -1499,6 +1596,16 @@ export class UsageMonitor {
         return null;
       }
       this.lastFailure = null;
+      // A marker earned while this account was in the background is answered by
+      // this success — typically the /login the marker asked for. The background
+      // loop skips the active account, so nothing else would clear it, and the
+      // row would read "sign in again" the moment the window switched away.
+      // Only a live reading counts: a 429, a busy fetch lock, this process's own
+      // call gap and a network error all return ok with last-known figures, and
+      // taking those as proof would unmark an account that is still refused.
+      if (email && isLiveReading(result)) {
+        this.authRejections.delete(email.trim().toLowerCase());
+      }
       const snap = result.snap;
       // The disk-cache watcher owns lastSeenFetchedAt — deliberately NOT stamped
       // here: a wall-clock stamp taken after a racing window's write could mark
@@ -1556,7 +1663,8 @@ export class UsageMonitor {
     }
     const netSnaps: UsageSnapshot[] = [];
     let changed = false;
-    for (const a of byEmail.values()) {
+    const markedBefore = this.getRejectedEmails();
+    for (const [em, a] of byEmail) {
       const { result, fromNetwork } = await fetchUsageCoordinated(
         { dir: a.dir, email: a.email },
         { freshForMs: BACKGROUND_TTL_MS }
@@ -1565,9 +1673,39 @@ export class UsageMonitor {
         // Soft-fail: a background account must never raise the sign-in UI — its
         // store heals via reconcile and the next cycle retries. Only the active
         // account (refresh() above) escalates failures to lastFailure.
-        log(`usage: background poll ${a.email}: ${result.failure.kind} — skipped`);
+        if (result.failure.grantRejected) {
+          // Consecutive means consecutive in TIME as well as in sequence: past
+          // AUTH_REJECT_WINDOW_MS the earlier refusal is its own isolated
+          // incident, so this one starts a fresh pair rather than completing it.
+          // A backwards clock proves nothing, so it restarts the count too.
+          const rec = this.authRejections.get(em);
+          const now = Date.now();
+          const since = rec ? now - rec.at : Infinity;
+          // The window only decides whether a pair FORMS. Once confirmed, a long
+          // gap before the next refusal (the machine slept) is not news about the
+          // grant: only a live reading takes a marker off.
+          const confirmed = (rec?.count ?? 0) >= AUTH_REJECT_CONFIRM;
+          const consecutive = confirmed || (since >= 0 && since <= AUTH_REJECT_WINDOW_MS);
+          this.authRejections.set(em, {
+            count: consecutive ? (rec?.count ?? 0) + 1 : 1,
+            at: now,
+          });
+        }
+        // Say what the refusal was evidence of: a 403 that does not count and a
+        // refused grant that does are both `token_rejected`, and the log is the only
+        // place that can answer why a row is or is not marked.
+        const strikes = this.authRejections.get(em)?.count ?? 0;
+        log(
+          `usage: background poll ${a.email}: ${result.failure.kind}` +
+            `${result.failure.status ? ` ${result.failure.status}` : ''}` +
+            ` grant-refused=${result.failure.grantRejected === true} strikes=${strikes} — skipped`
+        );
         continue;
       }
+      // Only a real reading clears the count: figures served best-effort behind a
+      // 429 or a busy lock are the ones already on screen, and re-showing them is
+      // no evidence the account can still be polled.
+      if (isLiveReading(result)) this.authRejections.delete(em);
       const snap = { ...result.snap, email: result.snap.email || a.email };
       const key = usageCacheKey(a.dir, a.email);
       this.cache.set(key, snap); // watcher owns lastSeenFetchedAt (see refresh())
@@ -1575,7 +1713,12 @@ export class UsageMonitor {
       if (fromNetwork) netSnaps.push(snap);
     }
     if (netSnaps.length) await this.policyWrite(netSnaps);
-    if (changed) this.emit();
+    const markedAfter = this.getRejectedEmails();
+    // Repaint when the marked SET moved either way — not on every refusal, or a
+    // permanently signed-out account would rebuild every card on every tick.
+    const markingChanged =
+      markedBefore.size !== markedAfter.size || [...markedAfter].some((e) => !markedBefore.has(e));
+    if (changed || markingChanged) this.emit();
   }
 
   /**

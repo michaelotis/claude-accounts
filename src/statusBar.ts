@@ -441,6 +441,7 @@ export class StatusBarManager implements vscode.Disposable {
    */
   private accountRows(activeEmail: string): AccountUsageRow[] {
     const byEmail = this.usage.getAllCachedByEmail();
+    const rejected = this.usage.getRejectedEmails();
     const activeLower = activeEmail.toLowerCase();
     const rows: AccountUsageRow[] = [];
     const seen = new Set<string>();
@@ -451,7 +452,10 @@ export class StatusBarManager implements vscode.Disposable {
       // fetchedAt 0 is emptySnap / never-fetched — the table's null path renders "—".
       const snap = cached && cached.fetchedAt !== 0 ? cached : null;
       const stale = Boolean(snap && snap.fetchedAt && Date.now() - snap.fetchedAt > STALE_ROW_MS);
-      rows.push({ label, active, snap, stale, email: emailLower });
+      // Background accounts only: the window's own account is told about a
+      // rejected sign-in by its own failure path, which says more than a marker.
+      const needsLogin = !active && rejected.has(emailLower);
+      rows.push({ label, active, snap, stale, needsLogin, email: emailLower });
     };
     const activeAccount = this.registry.savedForEmail(activeEmail);
     push(activeLower, activeAccount?.name ?? activeEmail.split('@')[0], true);
@@ -570,6 +574,12 @@ export class StatusBarManager implements vscode.Disposable {
       // answer to "which account can I use right now".
       const headroom = this.liveHeadroom(email.toLowerCase());
       const headroomNote = headroom.lines.map((l) => `$(sparkle) _${l}_`).join('\n\n');
+      // One line under the table, only while a row carries the marker — the
+      // table says which account, this says what to do about it.
+      const accountTableRows = this.accountRows(email);
+      const signInNote = accountTableRows.some((r) => r.needsLogin)
+        ? '_An account marked "sign in again" was refused by Claude. Switch to it and run /login._'
+        : '';
       this.item.tooltip = this.card([
         `**${email}**${usage?.planLabel ? ` · ${usage.planLabel}` : ''}${
           usage?.orgName ? ` · ${usage.orgName}` : ''
@@ -577,7 +587,8 @@ export class StatusBarManager implements vscode.Disposable {
         freshness,
         headroomNote,
         staleNote,
-        formatAccountsTable(this.accountRows(email)),
+        formatAccountsTable(accountTableRows),
+        signInNote,
         this.windowsSection(),
         refreshedLine,
         this.binding.rememberedForFolder() ? '_auto-selected: this folder used it last time_' : '',

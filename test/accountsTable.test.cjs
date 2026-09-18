@@ -83,6 +83,44 @@ describe('formatAccountsTable', () => {
     assert.match(md, /old _\(stale\)_/);
   });
 
+  it('a refused account says so instead of saying its figures are stale', () => {
+    const md = formatAccountsTable([
+      { label: 'refused', active: false, snap: snap(), stale: true, needsLogin: true },
+    ]);
+    assert.match(md, /refused _\(sign in again\)_/);
+    assert.ok(!md.includes('(stale)'), 'the reason replaces the symptom');
+  });
+
+  it('a refused row keeps its last-known figures and its switch link', () => {
+    const md = formatAccountsTable([
+      { label: 'motis', active: true, snap: snap() },
+      {
+        label: 'refused',
+        active: false,
+        snap: snap({ sessionPercent: 10 }),
+        email: 'mike@x.com',
+        needsLogin: true,
+      },
+    ]);
+    const row = md.split('\n')[3];
+    assert.match(
+      row,
+      /^\| \[refused\]\(command:claudeProfiles\.switchAccount\?[^)]*\) _\(sign in again\)_ \|/,
+      'link first, marker outside it'
+    );
+    assert.match(row, /\*\*10%\*\*/, 'the last-known 5h figure stays');
+    assert.match(row, /\*\*41%\*\*/, 'and the 7d one');
+    assert.match(row, /\*\*55%\*\*/, 'and the Fable bucket');
+  });
+
+  it('an active row is never marked — that account has its own path', () => {
+    const rows = [{ label: 'motis', active: true, snap: snap(), stale: true }];
+    const plain = formatAccountsTable(rows);
+    const marked = formatAccountsTable([{ ...rows[0], needsLogin: true }]);
+    assert.equal(marked, plain, 'needsLogin changes nothing on the active row');
+    assert.match(marked, /\*\*motis\*\* • _\(stale\)_/, 'its stale hint is untouched');
+  });
+
   /** The link destination of the first switch link in the table, if any. */
   function linkArgs(md) {
     const m = md.match(/\(command:claudeProfiles\.switchAccount\?([^)\s]*)\)/);
