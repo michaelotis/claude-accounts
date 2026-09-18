@@ -10,9 +10,13 @@ const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), `auth-marker-${process.pid
 const vscodeStub = path.join(tmpRoot, 'vscode-stub.js');
 fs.writeFileSync(
   vscodeStub,
-  `module.exports = {
+  `global.__caLog = global.__caLog || [];
+   module.exports = {
      window: {
-       createOutputChannel: () => ({ appendLine() {}, show() {} }),
+       createOutputChannel: () => ({
+         appendLine(s) { global.__caLog.push(s); },
+         show() {},
+       }),
        showWarningMessage: () => Promise.resolve(undefined),
        showInformationMessage: () => Promise.resolve(undefined),
        showErrorMessage: () => Promise.resolve(undefined),
@@ -89,15 +93,17 @@ function makeAccount(home, name, email, opts = {}) {
 /**
  * An expired grant, so every poll goes through the OAuth refresh POST.
  * `noToken` writes the other kind of broken store: a credentials file that is
- * there (so the account is still polled) with nothing in it to authenticate with.
+ * there (so the account is still polled) with nothing in it to authenticate
+ * with. `token` names the grant — a different one is what a `/login` leaves
+ * behind, and the only thing that gets a marked account polled again.
  */
-function writeCreds(dir, { noToken = false } = {}) {
+function writeCreds(dir, { noToken = false, token = 'rt-test' } = {}) {
   fs.writeFileSync(
     path.join(dir, '.credentials.json'),
     JSON.stringify({
       claudeAiOauth: noToken
         ? {}
-        : { accessToken: 'at-test', refreshToken: 'rt-test', expiresAt: Date.now() - 60_000 },
+        : { accessToken: 'at-test', refreshToken: token, expiresAt: Date.now() - 60_000 },
     })
   );
 }
@@ -128,14 +134,28 @@ function res(status, body) {
 function stubFetch(handler) {
   const calls = [];
   const real = globalThis.fetch;
-  globalThis.fetch = async (url) => {
+  // The request, not just the URL: the refresh POST carries the account's
+  // refresh token and the usage GET the bearer minted from it, which is the
+  // only way to say WHOSE call a call on a shared endpoint was.
+  calls.requests = [];
+  globalThis.fetch = async (url, init) => {
     calls.push(String(url));
-    return handler(String(url));
+    calls.requests.push({
+      url: String(url),
+      body: String(init?.body ?? ''),
+      auth: String(init?.headers?.Authorization ?? ''),
+    });
+    return handler(String(url), init);
   };
   calls.restore = () => {
     globalThis.fetch = real;
   };
   return calls;
+}
+
+/** Every call made on behalf of the account whose grant is `token`. */
+function callsFor(calls, token) {
+  return calls.requests.filter((r) => r.body.includes(token) || r.auth.includes(token));
 }
 
 /**
@@ -163,6 +183,27 @@ function scriptedNetwork(state) {
   });
 }
 
+/**
+ * Like scriptedNetwork, but it tells the accounts apart: an account is refused
+ * when `state.reject` holds its refresh token, and the access token minted for
+ * it is `at-<its refresh token>`, so the usage GET's bearer names the account
+ * too. That makes "zero network calls for THIS account" a countable thing while
+ * another account is being polled on the very same cycles.
+ */
+function perAccountNetwork(state) {
+  return stubFetch((url, init) => {
+    if (url === TOKEN_URL) {
+      const rt = JSON.parse(String(init.body)).refresh_token;
+      if (state.reject.has(rt)) return res(401, JSON.stringify({ error: 'invalid_grant' }));
+      return res(
+        200,
+        JSON.stringify({ access_token: `at-${rt}`, refresh_token: rt, expires_in: 3600 })
+      );
+    }
+    return res(200, usageBody());
+  });
+}
+
 function monitorFor(accounts) {
   const monitor = new UsageMonitor(60_000);
   monitor.listAccountsToPoll = () => accounts.map((x) => ({ email: x.email, dir: x.dir }));
@@ -177,6 +218,21 @@ function monitorFor(accounts) {
 async function poll(monitor, account) {
   await monitor.refreshAllAccounts();
   if (account) writeCreds(account.dir, account.opts); // the refresh POST may have restocked it
+  __ageInProcessStateForTests(130_000);
+}
+
+/**
+ * The same cycle for several accounts at once, each restocked and each pushed
+ * past the background tier — so an account that IS being polled really reaches
+ * the network on every cycle, and an account that is not can be told apart from
+ * one merely served out of the shared cache.
+ */
+async function pollAll(monitor, accounts) {
+  await monitor.refreshAllAccounts();
+  for (const acc of accounts) {
+    writeCreds(acc.dir, acc.opts);
+    stalePolledEntry(acc, false);
+  }
   __ageInProcessStateForTests(130_000);
 }
 
@@ -200,10 +256,21 @@ function cachePath() {
   return path.join(policyDir(), 'usage-cache.json');
 }
 
-/** Push this account's shared cache entry past the background tier. */
-function stalePolledEntry(account) {
-  const cache = JSON.parse(fs.readFileSync(cachePath(), 'utf-8'));
+/**
+ * Push this account's shared cache entry past the background tier. `required`
+ * off is for the accounts a test expects to have no entry at all (nothing was
+ * ever read from them) alongside ones that do.
+ */
+function stalePolledEntry(account, required = true) {
+  let cache;
+  try {
+    cache = JSON.parse(fs.readFileSync(cachePath(), 'utf-8'));
+  } catch {
+    assert.ok(!required, 'the poll should have cached a reading');
+    return;
+  }
   const entry = cache.entries[usageCacheKey(account.dir, account.email)];
+  if (!entry && !required) return;
   assert.ok(entry, 'the poll should have cached a reading');
   entry.fetchedAt -= BACKGROUND_TTL_MS + 100_000;
   entry.snap.fetchedAt -= BACKGROUND_TTL_MS + 100_000;
@@ -483,7 +550,13 @@ describe('background sign-in rejection marker', () => {
         await poll(monitor, b);
         assert.deepEqual([...monitor.getRejectedEmails()], ['b@y.com']);
 
+        // What a recovery actually looks like: the user signs in, so a different
+        // grant is on disk and the background loop asks again. (On the refused
+        // grant it no longer asks at all — a refused refresh token never starts
+        // answering, and the row already says to sign in.)
         state.mode = 'ok';
+        b.opts = { token: 'rt-after-login' };
+        writeCreds(b.dir, b.opts);
         await poll(monitor, b);
         assert.deepEqual([...monitor.getRejectedEmails()], [], 'one success is enough to clear');
       } finally {
@@ -748,11 +821,318 @@ describe('background sign-in rejection marker', () => {
         await poll(monitor, b);
         assert.equal(emits, 1, 'a third refusal says nothing new');
 
+        // Signed in again: a different grant, so the account is polled once more.
         state.mode = 'ok';
+        b.opts = { token: 'rt-after-login' };
+        writeCreds(b.dir, b.opts);
         await poll(monitor, b);
         assert.equal(emits, 2, 'the marker came off');
       } finally {
         sub.dispose();
+        monitor.dispose();
+        calls.restore();
+      }
+    });
+  });
+});
+
+describe('holding off a refused account', () => {
+  it('a confirmed refusal costs nothing per cycle, and only that account stops', async () => {
+    await withHome(async ({ account }) => {
+      const dead = account('dead', 'dead@x.com', { token: 'rt-dead' });
+      const live = account('live', 'live@x.com', { token: 'rt-live' });
+      const state = { reject: new Set(['rt-dead']) };
+      const calls = perAccountNetwork(state);
+      const monitor = monitorFor([dead, live]);
+      try {
+        for (let i = 0; i < 2; i++) await pollAll(monitor, [dead, live]);
+        assert.deepEqual([...monitor.getRejectedEmails()], ['dead@x.com']);
+        const asked = callsFor(calls, 'rt-dead').length;
+        assert.ok(asked >= 2, 'it really was asked on the way to being marked');
+
+        for (let i = 0; i < 3; i++) {
+          const liveBefore = callsFor(calls, 'rt-live').length;
+          await pollAll(monitor, [dead, live]);
+          assert.ok(
+            callsFor(calls, 'rt-live').length > liveBefore,
+            'the healthy account was polled on this same cycle'
+          );
+        }
+        assert.equal(
+          callsFor(calls, 'rt-dead').length,
+          asked,
+          'and the refused one cost no call at all — not the token POST either'
+        );
+        assert.deepEqual(
+          [...monitor.getRejectedEmails()],
+          ['dead@x.com'],
+          'it stays marked the whole time it is left alone'
+        );
+      } finally {
+        monitor.dispose();
+        calls.restore();
+      }
+    });
+  });
+
+  it('new credentials on disk are what start the calls again', async () => {
+    await withHome(async ({ b }) => {
+      const state = { mode: 'reject' };
+      const calls = scriptedNetwork(state);
+      const monitor = monitorFor([b]);
+      try {
+        await poll(monitor, b);
+        await poll(monitor, b);
+        assert.deepEqual([...monitor.getRejectedEmails()], ['b@y.com']);
+
+        const held = calls.length;
+        await poll(monitor, b);
+        assert.equal(calls.length, held, 'the same grant is not worth asking about again');
+
+        // The user signs in: a different refresh token is sitting in the store,
+        // and that is the one thing that can change the answer.
+        state.mode = 'ok';
+        b.opts = { token: 'rt-after-login' };
+        writeCreds(b.dir, b.opts);
+        await poll(monitor, b);
+        assert.ok(calls.length > held, 'a different grant is');
+        assert.deepEqual(
+          [...monitor.getRejectedEmails()],
+          [],
+          'and it answered, so the marker came off'
+        );
+      } finally {
+        monitor.dispose();
+        calls.restore();
+      }
+    });
+  });
+
+  it('a new grant that is refused too keeps the marker on and re-forms the hold', async () => {
+    await withHome(async ({ b }) => {
+      const state = { mode: 'reject' };
+      const calls = scriptedNetwork(state);
+      const monitor = monitorFor([b]);
+      try {
+        await poll(monitor, b);
+        await poll(monitor, b);
+        assert.deepEqual([...monitor.getRejectedEmails()], ['b@y.com']);
+
+        b.opts = { token: 'rt-second-try' };
+        writeCreds(b.dir, b.opts);
+        const before = calls.length;
+        await poll(monitor, b);
+        assert.ok(calls.length > before, 'the new grant was tried');
+        assert.deepEqual(
+          [...monitor.getRejectedEmails()],
+          ['b@y.com'],
+          'refused again — the marker never flickered off to find that out'
+        );
+
+        const after = calls.length;
+        await poll(monitor, b);
+        await poll(monitor, b);
+        assert.equal(calls.length, after, 'and the hold re-formed, on the new grant');
+        assert.deepEqual([...monitor.getRejectedEmails()], ['b@y.com']);
+      } finally {
+        monitor.dispose();
+        calls.restore();
+      }
+    });
+  });
+
+  it('Refresh Usage buys exactly one more attempt and changes no marker', async () => {
+    await withHome(async ({ b }) => {
+      const state = { mode: 'reject' };
+      const calls = scriptedNetwork(state);
+      const monitor = monitorFor([b]);
+      try {
+        await poll(monitor, b);
+        await poll(monitor, b);
+        await poll(monitor, b);
+        assert.deepEqual([...monitor.getRejectedEmails()], ['b@y.com']);
+        const held = calls.length;
+
+        monitor.retryRejected();
+        assert.deepEqual(
+          [...monitor.getRejectedEmails()],
+          ['b@y.com'],
+          'asking us to look again is not evidence that anything changed'
+        );
+
+        await poll(monitor, b);
+        const asked = calls.length;
+        assert.ok(asked > held, 'the click bought an attempt');
+        assert.deepEqual([...monitor.getRejectedEmails()], ['b@y.com'], 'refused again');
+
+        await poll(monitor, b);
+        await poll(monitor, b);
+        assert.equal(calls.length, asked, 'exactly one attempt, then the hold again');
+
+        // A reading is still the only thing that takes the marker off.
+        state.mode = 'ok';
+        monitor.retryRejected();
+        await poll(monitor, b);
+        assert.deepEqual([...monitor.getRejectedEmails()], []);
+      } finally {
+        monitor.dispose();
+        calls.restore();
+      }
+    });
+  });
+
+  it('a sign-in that lands while the refusal is in flight is never the grant that gets held', async () => {
+    await withHome(async ({ b }) => {
+      // The /login the marker asked for reaches the store while the doomed refresh
+      // is still out. Holding whatever is on disk once the refusal returns would
+      // hold the NEW grant, and a signed-in account would never be polled again.
+      let loggedIn = false;
+      const calls = stubFetch((url, init) => {
+        if (url === TOKEN_URL) {
+          const sent = String(init?.body ?? '');
+          if (sent.includes('rt-after-login')) {
+            return res(
+              200,
+              JSON.stringify({
+                access_token: 'at-good',
+                refresh_token: 'rt-rotated',
+                expires_in: 3600,
+              })
+            );
+          }
+          if (loggedIn === 'next') {
+            writeCreds(b.dir, { token: 'rt-after-login' });
+            loggedIn = true;
+          }
+          return res(401, JSON.stringify({ error: 'invalid_grant' }));
+        }
+        return res(200, usageBody());
+      });
+      const monitor = monitorFor([b]);
+      try {
+        await poll(monitor);
+        writeCreds(b.dir);
+        __ageInProcessStateForTests(130_000);
+        loggedIn = 'next';
+        await poll(monitor); // second refusal; the new grant lands mid-flight
+        assert.equal(loggedIn, true, 'the sign-in did land during the refusal');
+        assert.deepEqual([...monitor.getRejectedEmails()], ['b@y.com']);
+
+        __ageInProcessStateForTests(130_000);
+        await poll(monitor);
+        assert.deepEqual(
+          [...monitor.getRejectedEmails()],
+          [],
+          'the new grant was tried, and worked'
+        );
+      } finally {
+        monitor.dispose();
+        calls.restore();
+      }
+    });
+  });
+
+  it("another window's real reading releases a hold without a call", async () => {
+    await withHome(async ({ b }) => {
+      const state = { mode: 'ok' };
+      const calls = scriptedNetwork(state);
+      const monitor = monitorFor([b]);
+      try {
+        await poll(monitor, b); // a real reading exists in the shared cache
+        stalePolledEntry(b);
+        state.mode = 'reject';
+        for (let i = 0; i < 2; i++) {
+          await poll(monitor, b);
+          writeCreds(b.dir);
+        }
+        assert.deepEqual([...monitor.getRejectedEmails()], ['b@y.com']);
+        const held = calls.length;
+        await poll(monitor);
+        assert.equal(calls.length, held, 'held: nothing asked');
+
+        // Some other window polls the same account successfully and writes the
+        // shared cache. Same credentials on disk here, so nothing else would ever
+        // tell this window its marker was wrong.
+        const file = cachePath();
+        const cache = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        const entry = cache.entries[usageCacheKey(b.dir, b.email)];
+        entry.fetchedAt = Date.now();
+        entry.snap.fetchedAt = Date.now();
+        fs.writeFileSync(file, JSON.stringify(cache));
+        __ageInProcessStateForTests(130_000);
+
+        await poll(monitor);
+        assert.equal(calls.length, held, 'released from the cache, not from the network');
+        assert.deepEqual([...monitor.getRejectedEmails()], []);
+      } finally {
+        monitor.dispose();
+        calls.restore();
+      }
+    });
+  });
+
+  it('switching to a held account polls it regardless', async () => {
+    await withHome(async ({ b }) => {
+      const state = { mode: 'reject' };
+      const calls = scriptedNetwork(state);
+      const monitor = monitorFor([b]);
+      try {
+        await poll(monitor, b);
+        await poll(monitor, b);
+        await poll(monitor, b);
+        assert.deepEqual([...monitor.getRejectedEmails()], ['b@y.com']);
+        const held = calls.length;
+
+        // The hold belongs to the background loop. Switching to the account and
+        // signing in is exactly the case it must not get in the way of.
+        state.mode = 'ok';
+        monitor.setActiveDir(b.dir);
+        assert.ok(await monitor.refresh(b.dir, true), 'the active poll ran');
+        assert.ok(calls.length > held, 'and really went to the network');
+        assert.deepEqual([...monitor.getRejectedEmails()], []);
+      } finally {
+        monitor.dispose();
+        calls.restore();
+      }
+    });
+  });
+
+  it('says so once and then goes quiet, and never logs a token', async () => {
+    await withHome(async ({ b }) => {
+      const state = { mode: 'reject' };
+      const calls = scriptedNetwork(state);
+      const monitor = monitorFor([b]);
+      global.__caLog.length = 0;
+      try {
+        await poll(monitor, b);
+        await poll(monitor, b);
+        assert.deepEqual([...monitor.getRejectedEmails()], ['b@y.com']);
+
+        await poll(monitor, b);
+        assert.equal(
+          global.__caLog.filter((l) => l.includes('not retrying until its credentials change'))
+            .length,
+          1,
+          'the hold announces itself once'
+        );
+
+        const quiet = global.__caLog.length;
+        for (let i = 0; i < 3; i++) await poll(monitor, b);
+        assert.equal(global.__caLog.length, quiet, 'and then says nothing per tick');
+
+        monitor.retryRejected();
+        assert.equal(
+          global.__caLog.filter((l) => l.includes('polling it again')).length,
+          1,
+          'ending it is the other single line'
+        );
+        assert.ok(
+          !global.__caLog.some((l) =>
+            ['rt-test', 'rt-after-login', 'rt-second-try'].some((t) => l.includes(t))
+          ),
+          'no refresh token is ever written to the log'
+        );
+      } finally {
         monitor.dispose();
         calls.restore();
       }

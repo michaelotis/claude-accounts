@@ -726,6 +726,22 @@ export const AUTH_REJECT_CONFIRM = 2;
  */
 export const AUTH_REJECT_WINDOW_MS = 15 * 60_000;
 
+/**
+ * Identity of the grant a store holds, as a SHA-256 hex — never the token
+ * itself. A refused refresh token does not start working again, so the only
+ * thing that can change the answer for a marked account is DIFFERENT
+ * credentials on disk; comparing fingerprints is how the background loop
+ * notices that without keeping a secret in memory beside an email, or ever
+ * having one it could log. `'none'` covers both the store with no file and the
+ * store with nothing left to refresh with — a stable "no grant here" that
+ * compares like any other.
+ */
+function grantFingerprint(configDir: string): string {
+  const token = readCreds(configDir)?.claudeAiOauth?.refreshToken;
+  if (!token) return 'none';
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
 export interface UsageFetchFailure {
   kind: UsageFetchKind;
   /** Short user-facing sentence (no secrets). */
@@ -1365,8 +1381,17 @@ export class UsageMonitor {
    * to disk: every window polls every account through the coordinator, so each
    * one sees the refusal for itself, and a shared file would only add a way for
    * a marker to outlive the sign-in it describes.
+   *
+   * `heldGrant` is set once the count confirms the marker: the fingerprint of
+   * the grant that was refused. While the store still holds that same grant the
+   * background loop stops polling the account entirely (refreshAllAccountsOnce).
+   * `holdLogged` keeps that decision to one log line per hold instead of one
+   * per tick.
    */
-  private authRejections = new Map<string, { count: number; at: number }>();
+  private authRejections = new Map<
+    string,
+    { count: number; at: number; heldGrant?: string; holdLogged?: boolean }
+  >();
 
   /**
    * Carries this window's workdir grant into the account store when the workdir
@@ -1448,6 +1473,33 @@ export class UsageMonitor {
       if (rec.count >= AUTH_REJECT_CONFIRM) out.add(email);
     }
     return out;
+  }
+
+  /**
+   * Ask every held account once more on the next background cycle. The counts —
+   * and so the markers — are deliberately left alone: a Refresh Usage click is
+   * the user asking us to look again, not evidence that anything on disk
+   * changed. If the grant is still refused the hold simply re-forms.
+   *
+   * Nothing else calls this. There is no timer that quietly resumes polling an
+   * account Claude has already refused twice.
+   */
+  retryRejected(): void {
+    for (const [email, rec] of this.authRejections) {
+      if (rec.heldGrant) this.endHold(rec, email, 'retry requested');
+    }
+  }
+
+  /** Drop a hold, closing the one log line that opened it. */
+  private endHold(
+    rec: { heldGrant?: string; holdLogged?: boolean },
+    email: string,
+    why: string
+  ): void {
+    rec.heldGrant = undefined;
+    if (!rec.holdLogged) return;
+    rec.holdLogged = false;
+    log(`usage: background poll ${email}: ${why} — polling it again`);
   }
 
   /** Last-known snapshot per email (watcher-fed) — the tooltip table's rows. */
@@ -1665,6 +1717,47 @@ export class UsageMonitor {
     let changed = false;
     const markedBefore = this.getRejectedEmails();
     for (const [em, a] of byEmail) {
+      const rec = this.authRejections.get(em);
+      if (rec && rec.count >= AUTH_REJECT_CONFIRM && rec.heldGrant) {
+        // A refused refresh token never recovers, and the row already says so:
+        // polling on would be one more token POST answered `invalid_grant`
+        // every tick, for as long as the account stays signed out. Only
+        // different credentials on disk can change the answer, so wait for them.
+        //
+        // The hold is in-process like the marker itself — a window that has not
+        // yet seen its own two refusals keeps polling until it has. That is
+        // accepted: each window converges within a cycle or two, and a hold
+        // shared on disk would be a way for one to outlive the sign-in it
+        // describes.
+        // One thing outranks the hold: another window's REAL reading for this
+        // account, sitting in the shared cache. It costs a memoized file read and
+        // no call, and it is the only way a marker earned wrongly — two 401s from
+        // something in the path rather than from a dead grant, on credentials that
+        // then never change — is ever corrected. The coordinator below serves that
+        // same entry as a live reading, which takes the marker off as usual.
+        const seenElsewhere = getCachedSnap(usageCacheKey(a.dir, a.email), BACKGROUND_TTL_MS);
+        if (seenElsewhere) {
+          this.endHold(rec, a.email, 'another window read it successfully');
+        } else if (grantFingerprint(a.dir) === rec.heldGrant) {
+          if (!rec.holdLogged) {
+            rec.holdLogged = true;
+            log(
+              `usage: background poll ${a.email}: sign-in refused` +
+                ' — not retrying until its credentials change'
+            );
+          }
+          continue;
+        } else {
+          // A different grant is on disk: a /login, or a newer one carried into
+          // the store. That is worth a call. The marker stays on until a reading
+          // takes it off, so nothing flickers while we find out.
+          this.endHold(rec, a.email, 'credentials changed');
+        }
+      }
+      // The grant this attempt is about to send. A /login can land in the store
+      // while the refusal is still in flight; holding whatever is on disk
+      // afterwards would hold the NEW, good grant and never poll it again.
+      const grantSent = grantFingerprint(a.dir);
       const { result, fromNetwork } = await fetchUsageCoordinated(
         { dir: a.dir, email: a.email },
         { freshForMs: BACKGROUND_TTL_MS }
@@ -1678,18 +1771,31 @@ export class UsageMonitor {
           // AUTH_REJECT_WINDOW_MS the earlier refusal is its own isolated
           // incident, so this one starts a fresh pair rather than completing it.
           // A backwards clock proves nothing, so it restarts the count too.
-          const rec = this.authRejections.get(em);
+          // Re-read rather than reuse the entry from the top of the loop: the
+          // active path can have cleared this email on a live reading while the
+          // fetch above was in flight, and that clearing must stand.
+          const prev = this.authRejections.get(em);
           const now = Date.now();
-          const since = rec ? now - rec.at : Infinity;
+          const since = prev ? now - prev.at : Infinity;
           // The window only decides whether a pair FORMS. Once confirmed, a long
           // gap before the next refusal (the machine slept) is not news about the
           // grant: only a live reading takes a marker off.
-          const confirmed = (rec?.count ?? 0) >= AUTH_REJECT_CONFIRM;
+          const confirmed = (prev?.count ?? 0) >= AUTH_REJECT_CONFIRM;
           const consecutive = confirmed || (since >= 0 && since <= AUTH_REJECT_WINDOW_MS);
-          this.authRejections.set(em, {
-            count: consecutive ? (rec?.count ?? 0) + 1 : 1,
+          const next = {
+            count: consecutive ? (prev?.count ?? 0) + 1 : 1,
             at: now,
-          });
+            heldGrant: prev?.heldGrant,
+            holdLogged: prev?.holdLogged,
+          };
+          if (next.count >= AUTH_REJECT_CONFIRM) {
+            // Hold against the grant that was just refused, read now rather than
+            // next tick. A refusal after a credential change re-records here, so
+            // the hold resumes on the new grant without the marker ever coming
+            // off in between.
+            next.heldGrant = grantFingerprint(a.dir) === grantSent ? grantSent : undefined;
+          }
+          this.authRejections.set(em, next);
         }
         // Say what the refusal was evidence of: a 403 that does not count and a
         // refused grant that does are both `token_rejected`, and the log is the only

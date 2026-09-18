@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.9.22
+
+### Changed
+- **An account marked `(sign in again)` went on being asked, on every poll, for as
+  long as it stayed signed out.** The marker went in last release; the
+  polling behind it did not change, so each tick still POSTed that account's
+  refresh token to the OAuth endpoint and was told `invalid_grant` again, from
+  every window, indefinitely. There was nothing to learn from those calls: a
+  refresh token Claude has refused does not start working again, and only new
+  credentials on disk can fix the account — which is exactly what the row already
+  asks for. Once an account is marked, the background poll now leaves it alone. It
+  keeps a fingerprint of the refused grant — a hash of the refresh token, never
+  the token itself, which is neither kept nor logged — and skips the account for
+  as long as the store still holds that same grant: no fetch, no token POST, no
+  log line per tick, one line when it stops asking and one when it starts again.
+  The moment a different grant appears in the store, from a `/login` or from a
+  newer one carried in, the account is polled normally, and the first real reading
+  takes the marker off as before. If that new grant is refused too, the hold
+  re-forms on it and the marker never comes off in between. Nothing else about the
+  marker moved: it is still two grant refusals inside fifteen minutes that earn
+  it, still only a live reading that clears it, and the hold lives in the running
+  window like the marker does, written nowhere. The account you are switched to is
+  never held — switching to it always polls it, which is how signing in again
+  clears the row. And clicking **Refresh Usage** releases every hold, because a
+  click is you asking us to look again; each held account gets one more attempt on
+  the next cycle. One thing releases a hold without any call at all: another
+  window's successful reading for the same account turning up in the shared cache,
+  which is how a marker earned by something in the network path rather than by a
+  dead grant gets corrected. The caveat is the plain one: a marked account stays marked, and
+  stays unasked, until you sign in to it again, click Refresh Usage, or another
+  window reads it successfully.
+
 ## 0.9.21
 
 ### Added
