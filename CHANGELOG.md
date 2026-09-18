@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.9.14
+
+### Added
+- **Usage coming back was invisible: an account could sit at Fable 100% while the
+  allowance change that would free it landed as a silent 100% → 70%.** Usage
+  percentages only rise with use, so any downward move is headroom returning, and
+  the drop itself is now the trigger — not the clock. Over 13 days of logs there
+  were 130 downward moves: 117 landed at ~0% when a window rolled over, at untidy
+  times (18:30, 23:31, 04:13, 05:20), and the rest were partial drops no reset
+  time predicts — the clearest being two accounts going Fable 100% → ~70% six
+  seconds apart, neither near its reset. A bucket that falls by 3 points or more
+  (both figures are rounded, so smaller moves are rounding) now marks its
+  status-bar pill with a sparkle and adds
+  one line to the hover card: a window that rolled over reads as a reset, a
+  partial drop as the allowance going up. Another account's headroom is card-only
+  and names the account, so the card answers "which account can I use right now",
+  and the same bucket returning on several accounts at once says so once instead
+  of once per account. The cue goes as soon as that bucket fills back up — it
+  never sits over a figure that has moved on — and fades after 30 minutes if the
+  bucket simply stays where it landed. Status bar only, by design:
+  no toast, no popup, no reload — and the polling cadence and rate-limit handling
+  are untouched. The hover table also puts a compact countdown on any bucket at
+  80% or more (`100% · 8.8h`), so an exhausted bucket always says when it is due
+  back.
+
 ## 0.9.13
 
 ### Fixed

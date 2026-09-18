@@ -11,6 +11,13 @@ import {
   type AccountUsageRow,
   type UsageSnapshot,
 } from './usage';
+import {
+  headroomEvents,
+  describeHeadroom,
+  escapeTableCell,
+  HEADROOM_MIN_DROP,
+  type HeadroomEvent,
+} from './usageParse';
 
 /** Marketplace / local id — hover links to the extension page when published. */
 const EXTENSION_ID = 'michaelotis.claude-accounts';
@@ -25,6 +32,35 @@ const STALE_ROW_MS = 20 * 60_000;
  * must never be the reason a live degradation warning isn't shown.
  */
 const REFRESH_NOTE_TTL_MS = 30_000;
+/**
+ * How long a "headroom came back" cue stays up. Long enough to be seen after a
+ * break, short enough that it never describes a window that has since filled
+ * again — the 5h bucket can be spent inside an hour.
+ */
+const HEADROOM_NOTE_TTL_MS = 30 * 60_000;
+
+/** What a headroom event's bucket reads now, or null when the snapshot lost it. */
+function bucketPercent(usage: UsageSnapshot, label: string): number | null {
+  if (label === '5h') return usage.sessionPercent;
+  if (label === '7d') return usage.weeklyPercent;
+  const lower = label.toLowerCase();
+  const m = (usage.modelLimits ?? []).find(
+    (x) => x && typeof x.name === 'string' && x.name.toLowerCase() === lower
+  );
+  return m ? m.percent : null;
+}
+
+/**
+ * Has the bucket this cue describes filled back up? A cue that outlives its own
+ * figure is worse than no cue: a 5h reset noted at 0% would still read "$(sparkle)
+ * 5h 0%" while the pill beside it says 94%. The same margin that made the drop
+ * worth reporting makes the refill worth believing.
+ */
+function refilled(event: HeadroomEvent, usage: UsageSnapshot): boolean {
+  if (!usage.fetchedAt) return false;
+  const now = bucketPercent(usage, event.label);
+  return now != null && now - event.to >= HEADROOM_MIN_DROP;
+}
 
 /** Compact "12s" / "3m" / "1h 05m" age for the tooltip's Refreshed line. */
 function formatAgo(ms: number): string {
@@ -58,6 +94,19 @@ export class StatusBarManager implements vscode.Disposable {
   private staleTokenNote = false;
   /** Outcome line for the last Refresh Usage click, with the time it was set. */
   private refreshNote: { text: string; at: number; claimsCurrent: boolean } | null = null;
+  /**
+   * Last snapshot this window saw per account (lowercased email, the key
+   * getAllCachedByEmail uses) — the baseline a drop is measured against. Kept in
+   * process on purpose: the cue is a live per-window nudge, two windows both
+   * showing it is correct, and no new shared file means no mixed-version hazard
+   * between windows on different releases.
+   */
+  private readonly lastSeenUsage = new Map<string, UsageSnapshot>();
+  /** Accounts that recently gained headroom, with when this window noticed. */
+  private readonly headroomNotes = new Map<
+    string,
+    { label: string; events: HeadroomEvent[]; at: number }
+  >();
 
   constructor(
     private readonly registry: AccountRegistry,
@@ -219,7 +268,110 @@ export class StatusBarManager implements vscode.Disposable {
     this.fableItem.hide();
   }
 
-  private renderMetricItems(usage: UsageSnapshot | null | undefined): void {
+  /** Registry name for an account, falling back to the email's local part. */
+  private labelForEmail(emailLower: string): string {
+    for (const a of this.registry.listUniqueByEmail()) {
+      if ((this.registry.emailOf(a) || '').toLowerCase() === emailLower) return a.name;
+    }
+    return emailLower.split('@')[0];
+  }
+
+  /**
+   * Compare every account's newest snapshot with the last one this window saw
+   * and record the buckets whose percentage fell. Usage only rises with use, so
+   * a fall is headroom returning — whether a window rolled over or Anthropic
+   * moved the allowance, which no clock predicts. The first pass only seeds the
+   * baseline: with nothing to compare against there is nothing to say.
+   *
+   * The same pass retires cues: a bucket that has filled again is no longer
+   * headroom, so its event goes and the note goes with the last of them. The TTL
+   * is only the backstop for a bucket that simply sits where it landed.
+   */
+  private detectHeadroom(): void {
+    for (const [emailLower, snap] of this.usage.getAllCachedByEmail()) {
+      const prev = this.lastSeenUsage.get(emailLower);
+      this.lastSeenUsage.set(emailLower, snap);
+      const fresh = headroomEvents(prev, snap);
+      const note = this.headroomNotes.get(emailLower);
+      if (!note && !fresh.length) continue;
+      // Buckets come back one at a time — a 5h rollover then a Fable raise are
+      // two pieces of the same answer to "what can I use now", so they are kept
+      // together, the older reading giving the span the newer one continues.
+      const live = new Map<string, HeadroomEvent>();
+      for (const e of note?.events ?? []) {
+        if (!refilled(e, snap)) live.set(e.label.toLowerCase(), e);
+      }
+      for (const e of fresh) {
+        const held = live.get(e.label.toLowerCase());
+        live.set(e.label.toLowerCase(), held ? { ...e, from: Math.max(held.from, e.from) } : e);
+      }
+      if (!live.size) {
+        this.headroomNotes.delete(emailLower);
+        continue;
+      }
+      this.headroomNotes.set(emailLower, {
+        label: this.labelForEmail(emailLower),
+        events: [...live.values()],
+        at: fresh.length ? Date.now() : (note?.at ?? Date.now()),
+      });
+    }
+  }
+
+  /**
+   * Live headroom cues: the card lines, and the bucket labels that should
+   * sparkle on the active account's pills. Notes decay at their TTL, and the
+   * same bucket returning on several accounts collapses to one line — an
+   * allowance change hits the whole fleet at once (two accounts went Fable 100%
+   * → ~70% six seconds apart), and N copies of that is noise, not news.
+   */
+  private liveHeadroom(activeEmailLower: string): { lines: string[]; sparkle: Set<string> } {
+    const now = Date.now();
+    for (const [emailLower, note] of [...this.headroomNotes]) {
+      if (now - note.at >= HEADROOM_NOTE_TTL_MS) this.headroomNotes.delete(emailLower);
+    }
+
+    // Keyed lowercase — the bucket identity `bucketPercent` and the fleet
+    // collapse already use. A name that comes back in another case is the same
+    // bucket the cue was raised on, and a pill that quietly stopped matching
+    // would leave a card line with nothing on screen to explain it.
+    const sparkle = new Set<string>();
+    for (const e of this.headroomNotes.get(activeEmailLower)?.events ?? [])
+      sparkle.add(e.label.toLowerCase());
+
+    // Keyed case-insensitively: one account calling the bucket `Fable` and
+    // another `fable` is still one bucket moving across the fleet.
+    const perLabel = new Map<string, HeadroomEvent[]>();
+    for (const note of this.headroomNotes.values()) {
+      for (const e of note.events) {
+        const list = perLabel.get(e.label.toLowerCase());
+        if (list) list.push(e);
+        else perLabel.set(e.label.toLowerCase(), [e]);
+      }
+    }
+    const lines: string[] = [];
+    const fleetLabels = new Set<string>();
+    for (const [key, events] of perLabel) {
+      if (events.length < 2) continue;
+      fleetLabels.add(key);
+      const verb = events.every((e) => e.kind === 'reset') ? 'reset' : 'allowance went up';
+      lines.push(`${escapeTableCell(events[0].label)} ${verb} across ${events.length} accounts`);
+    }
+
+    // The window's own account first: its line is the one that explains a pill.
+    const notes = [...this.headroomNotes].sort(([a], [b]) =>
+      a === activeEmailLower ? -1 : b === activeEmailLower ? 1 : a.localeCompare(b)
+    );
+    for (const [, note] of notes) {
+      const line = describeHeadroom(
+        note.events.filter((e) => !fleetLabels.has(e.label.toLowerCase())),
+        note.label
+      );
+      if (line) lines.push(line);
+    }
+    return { lines, sparkle };
+  }
+
+  private renderMetricItems(usage: UsageSnapshot | null | undefined, sparkle: Set<string>): void {
     if (!usage) {
       this.hideMetricItems();
       return;
@@ -242,17 +394,21 @@ export class StatusBarManager implements vscode.Disposable {
       return;
     }
 
-    this.sessionItem.text = `5h ${usage.sessionPercent}%`;
+    // A bucket that just gained headroom is marked on its own pill — no toast,
+    // no reload; the number is already on screen, this only says it moved down.
+    const mark = (label: string) => (sparkle.has(label.toLowerCase()) ? '$(sparkle) ' : '');
+
+    this.sessionItem.text = `${mark('5h')}5h ${usage.sessionPercent}%`;
     this.sessionItem.backgroundColor = this.metricBackground(usage.sessionPercent, 65);
     this.sessionItem.show();
 
-    this.weeklyItem.text = `7d ${usage.weeklyPercent}%`;
+    this.weeklyItem.text = `${mark('7d')}7d ${usage.weeklyPercent}%`;
     this.weeklyItem.backgroundColor = this.metricBackground(usage.weeklyPercent, 70);
     this.weeklyItem.show();
 
     const fable = usage.modelLimits.find((m) => /fable/i.test(m.name));
     if (fable) {
-      this.fableItem.text = `Fable ${fable.percent}%`;
+      this.fableItem.text = `${mark(fable.name)}Fable ${fable.percent}%`;
       this.fableItem.backgroundColor = this.metricBackground(fable.percent, 70);
       this.fableItem.show();
     } else {
@@ -291,6 +447,7 @@ export class StatusBarManager implements vscode.Disposable {
   }
 
   private render(): void {
+    this.detectHeadroom();
     const dir = this.effectiveDir();
     const active = this.binding.getActiveName();
     const savedName = this.registry.getByDir(dir)?.name;
@@ -359,11 +516,17 @@ export class StatusBarManager implements vscode.Disposable {
           : usage && usage.fetchedAt
             ? `_Refreshed ${formatAgo(Date.now() - usage.fetchedAt)} ago_`
             : '';
+      // Headroom on any account is card-only; only the active account's own
+      // buckets also mark a pill. The line names the account because it is the
+      // answer to "which account can I use right now".
+      const headroom = this.liveHeadroom(email.toLowerCase());
+      const headroomNote = headroom.lines.map((l) => `$(sparkle) _${l}_`).join('\n\n');
       this.item.tooltip = this.card([
         `**${email}**${usage?.planLabel ? ` · ${usage.planLabel}` : ''}${
           usage?.orgName ? ` · ${usage.orgName}` : ''
         }`,
         freshness,
+        headroomNote,
         staleNote,
         formatAccountsTable(this.accountRows(email)),
         refreshedLine,
@@ -376,7 +539,7 @@ export class StatusBarManager implements vscode.Disposable {
       // Account item never carries usage hot/warn background — each metric pill
       // colors itself from its own percent.
       this.item.backgroundColor = undefined;
-      this.renderMetricItems(usage);
+      this.renderMetricItems(usage, headroom.sparkle);
     } else if (notLoggedIn) {
       // A logout ends the "your token was restocked earlier" storyline — without
       // this, a later re-login would resurrect a note about a grant that no longer
