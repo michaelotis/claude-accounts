@@ -132,10 +132,14 @@ function makeBar() {
     rememberedForFolder: () => false,
   };
   const cache = new Map();
+  // Mutable, so a test can refuse an account's poll the way the monitor would
+  // and read back what the card says about it.
+  const rejected = new Set();
   const usage = {
     onChange: () => ({ dispose() {} }),
     getCached: () => cache.get(ACTIVE) ?? null,
     getAllCachedByEmail: () => cache,
+    getRejectedEmails: () => rejected,
     isRateLimited: () => false,
     rateLimitWaitMs: () => null,
     setActiveDir() {},
@@ -151,6 +155,7 @@ function makeBar() {
     bar,
     reconfirm: () => bar.reconfirm(),
     cache,
+    rejected,
     account: items['claudeAccounts.status'],
     session: items['claudeAccounts.usage.session'],
     weekly: items['claudeAccounts.usage.weekly'],
@@ -380,6 +385,45 @@ describe('status bar headroom cue', () => {
     bar.reconfirm();
     assert.equal(bar.session.text, '5h 0%');
     assert.doesNotMatch(bar.card(), /5h reset/);
+    bar.bar.dispose();
+  });
+
+  it('marks a refused background account on its own row, and says once what to do', () => {
+    const bar = makeBar();
+    bar.cache.set(ACTIVE, snap({ email: ACTIVE }));
+    bar.cache.set(OTHER, snap({ email: OTHER }));
+    bar.rejected.add(OTHER);
+    bar.reconfirm();
+    const card = bar.card();
+    const rows = card.split('\n').filter((l) => l.startsWith('| ') && !l.startsWith('| ---'));
+    const refused = rows.filter((l) => l.includes('michaelotis'));
+    assert.equal(refused.length, 1, 'one table row for the refused account');
+    assert.match(refused[0], /_\(sign in again\)_/, 'the row says which account it is');
+    // The hint replaces the staleness one rather than joining it: figures go
+    // stale because the poll is being refused, and the reason is the useful half.
+    assert.doesNotMatch(refused[0], /_\(stale\)_/);
+    assert.equal(
+      rows.filter((l) => l.includes('sign in again')).length,
+      1,
+      'and no other row carries it'
+    );
+    assert.equal(
+      (card.match(/An account marked "sign in again" was refused by Claude/g) || []).length,
+      1,
+      'the line under the table is said once, not once per marked row'
+    );
+    bar.bar.dispose();
+  });
+
+  it('never marks the active account, which has its own louder path', () => {
+    const bar = makeBar();
+    bar.cache.set(ACTIVE, snap({ email: ACTIVE }));
+    bar.cache.set(OTHER, snap({ email: OTHER }));
+    bar.rejected.add(ACTIVE);
+    bar.reconfirm();
+    const card = bar.card();
+    assert.doesNotMatch(card, /\(sign in again\)/, 'no marker on the window’s own row');
+    assert.doesNotMatch(card, /was refused by Claude/, 'and no line under the table either');
     bar.bar.dispose();
   });
 });

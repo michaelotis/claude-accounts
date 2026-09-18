@@ -565,6 +565,8 @@ export interface AccountUsageRow {
   snap: UsageSnapshot | null;
   /** Render a staleness hint next to the label (data older than its tier). */
   stale?: boolean;
+  /** Claude has refused this account's poll often enough to mean a real sign-out. */
+  needsLogin?: boolean;
   /** Identity to switch to when the row is clicked. Absent → plain text. */
   email?: string;
 }
@@ -625,7 +627,12 @@ export function formatAccountsTable(rows: AccountUsageRow[]): string {
         : row.active
           ? `**${name}** •`
           : name;
-    const label = `${target}${row.stale ? ' _(stale)_' : ''}`;
+    // The refusal replaces the staleness hint rather than joining it: figures go
+    // stale BECAUSE the poll is being refused, and the reason is the more useful
+    // of the two. Never on the active row — that account has its own, louder path.
+    const hint =
+      row.needsLogin && !row.active ? ' _(sign in again)_' : row.stale ? ' _(stale)_' : '';
+    const label = `${target}${hint}`;
     if (!row.snap) {
       lines.push(`| ${label} | — | — | — |`);
       continue;

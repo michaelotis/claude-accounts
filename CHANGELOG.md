@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.9.21
+
+### Added
+- **An account Claude had signed out stayed on the hover card as if nothing had
+  happened.** The extension refreshes OAuth tokens silently, which is the point —
+  but a background account whose refresh token is genuinely rejected is soft-failed
+  by design (a background account must never raise the sign-in UI), so its row kept
+  showing its last figures with nothing to say why they had stopped moving. Twenty
+  minutes later it said `(stale)`, which is the symptom, not the reason. A
+  background account Claude has refused twice running now reads `(sign in again)`
+  next to its name, in place of the staleness hint, and one line under the table
+  says what to do about it: switch to that account and run `/login`. The row keeps
+  its last-known percentages and its switch link, because they are still the best
+  figures there are and the link is how you get there. Nothing pops up, nothing
+  reloads, no pill changes colour — the marker is hover text and nothing else. The
+  active account is never marked: it has its own, louder failure path, and this is
+  for the accounts nothing else speaks for. Only a refusal of the GRANT counts —
+  the refresh POST coming back `invalid_grant` or 401, or the usage call answering
+  401 with a token minted seconds earlier. A 403 deliberately does not: org policy,
+  the plan, or the endpoint being switched off all refuse a perfectly good sign-in
+  that way, and telling the user to sign in again would send them nowhere. Two such
+  refusals in a row are required rather than one, and within fifteen minutes of each
+  other: the background poll has no store-lag retry, so a single refusal can be the
+  token the CLI rotated out from under us a moment earlier, and two unrelated ones
+  hours apart are two of those, not a signed-out account — a false "sign in again"
+  costs a pointless re-login. That is also the cost — the marker can lag a real
+  sign-out by one background cycle. It comes off on the first real reading of that
+  account: this window's own HTTP 200, or an entry another window wrote inside the
+  freshness this one asked for, from the background poll or from the account being
+  switched to and refreshed. Figures handed back behind a 429, an unreachable API,
+  a busy fetch lock or the poll's own minimum call gap are the ones already on
+  screen and clear nothing. The state is held in the running window and written
+  nowhere: every window polls every account through the coordinator, so each one
+  sees the refusal for itself, and `scripts/claude-usage` reads only the shared
+  cache and so cannot see the marker at all.
+
 ## 0.9.20
 
 ### Added
