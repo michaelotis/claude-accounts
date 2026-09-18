@@ -575,6 +575,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     cmd('claudeProfiles.showLog', () => showLog()),
     cmd('claudeProfiles.refreshUsage', async () => {
       const dir = binding.getEnvDir() ?? defaultSourceDir();
+      // An explicit click is the user asking us to look again, so release the
+      // background holds on accounts whose sign-in was refused: each gets one
+      // more attempt on the next cycle. Their markers stay until a reading
+      // takes one off — the click is a request, not evidence.
+      usage.retryRejected();
       // User-initiated: show it updating INLINE (status-bar spinner + tooltip note) and
       // repaint the meter in place via onChange — no "here's your usage" toast. Force a
       // fresh fetch, BUT if we're already in the post-429 backoff don't hammer the API
