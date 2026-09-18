@@ -659,7 +659,14 @@ export class SetupWizard {
 
   // ─── Switching this window's account ────────────────────────────────────────
 
-  async switchAccountInteractive(): Promise<void> {
+  /**
+   * Switch this window's account. With no argument — the palette, the status-bar
+   * click, the signed-out card — the user picks from the quick pick. A target
+   * email names the account directly (the hover card's row links), skipping only
+   * the pick: everything after it, including the already-current no-op and the
+   * workspace-pin warning, is the same path a picked account takes.
+   */
+  async switchAccountInteractive(targetEmail?: string): Promise<void> {
     const accounts = this.registry.listUniqueByEmail();
     if (accounts.length === 0) {
       vscode.window.showInformationMessage(
@@ -669,13 +676,6 @@ export class SetupWizard {
     }
 
     const activeName = this.binding.getActiveName();
-    type Item = vscode.QuickPickItem & { account: Account };
-    const items: Item[] = accounts.map((a) => ({
-      label: `${a.name === activeName ? '$(check) ' : '$(account) '}${this.registry.emailOf(a) ?? a.name}`,
-      description: a.name === activeName ? 'current' : '',
-      account: a,
-    }));
-
     const folderPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const settingsRoutes = (
       vscode.workspace
@@ -685,22 +685,38 @@ export class SetupWizard {
     const settingsPin =
       folderPath && settingsRoutes.length ? matchWorkspaceRoute(folderPath, settingsRoutes) : null;
 
-    const picked = await vscode.window.showQuickPick(items, {
-      title: 'Switch Claude account for this window (reloads the window)',
-      placeHolder: settingsPin
-        ? `Settings pin this folder to ${settingsPin.email} (re-applies on reload)`
-        : 'Pick the account this window should use',
-    });
-    if (!picked) return;
-    if (picked.account.name === activeName) {
+    // A named target that matches nothing saved falls back to the pick rather
+    // than failing: a command URI is user-reachable input, and the worst it can
+    // do is cost the user one more click.
+    let chosen = resolveSwitchTarget(
+      targetEmail,
+      accounts.map((a) => ({ account: a, email: this.registry.emailOf(a) }))
+    );
+    if (!chosen) {
+      type Item = vscode.QuickPickItem & { account: Account };
+      const items: Item[] = accounts.map((a) => ({
+        label: `${a.name === activeName ? '$(check) ' : '$(account) '}${this.registry.emailOf(a) ?? a.name}`,
+        description: a.name === activeName ? 'current' : '',
+        account: a,
+      }));
+      const picked = await vscode.window.showQuickPick(items, {
+        title: 'Switch Claude account for this window (reloads the window)',
+        placeHolder: settingsPin
+          ? `Settings pin this folder to ${settingsPin.email} (re-applies on reload)`
+          : 'Pick the account this window should use',
+      });
+      if (!picked) return;
+      chosen = picked.account;
+    }
+    if (chosen.name === activeName) {
       // Never a silent no-op: to the user a click that does nothing is a bug.
       vscode.window.showInformationMessage(
-        `${this.registry.emailOf(picked.account) ?? picked.account.name} is already this window's account.`
+        `${this.registry.emailOf(chosen) ?? chosen.name} is already this window's account.`
       );
       return;
     }
     if (settingsPin) {
-      const pickEmail = this.registry.emailOf(picked.account);
+      const pickEmail = this.registry.emailOf(chosen);
       if (pickEmail && pickEmail.toLowerCase() !== settingsPin.email.toLowerCase()) {
         const go = await vscode.window.showWarningMessage(
           `This folder is pinned in settings to ${settingsPin.email}. ` +
@@ -712,7 +728,7 @@ export class SetupWizard {
         if (go !== 'Switch anyway') return;
       }
     }
-    await this.switchTo(picked.account, { userInitiated: true });
+    await this.switchTo(chosen, { userInitiated: true });
   }
 
   /**
@@ -858,6 +874,26 @@ export class SetupWizard {
     }
     vscode.window.showInformationMessage(parts.join(' '));
   }
+}
+
+/**
+ * The saved account a switch target names, or null when nothing matches.
+ *
+ * The target arrives from a command URI in the hover card, so it is arbitrary
+ * input: anything that is not a string naming a saved identity resolves to null
+ * and the caller falls back to the picker. Matching is the same case-insensitive
+ * email comparison the rest of the extension uses, so the account a row names is
+ * the account that gets bound — never a near neighbour.
+ */
+export function resolveSwitchTarget<T>(
+  target: unknown,
+  candidates: { account: T; email: string | undefined }[]
+): T | null {
+  if (typeof target !== 'string') return null;
+  for (const c of candidates) {
+    if (emailsEqual(c.email, target)) return c.account;
+  }
+  return null;
 }
 
 /**

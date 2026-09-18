@@ -419,7 +419,8 @@ export class StatusBarManager implements vscode.Disposable {
   /**
    * Rows for the all-accounts tooltip table: the window's own account first,
    * then every other saved account, each with its last-known snapshot from the
-   * shared cache (fed machine-wide by whichever window fetched it).
+   * shared cache (fed machine-wide by whichever window fetched it). The email
+   * rides along as the switch target for the row's link.
    */
   private accountRows(activeEmail: string): AccountUsageRow[] {
     const byEmail = this.usage.getAllCachedByEmail();
@@ -433,7 +434,7 @@ export class StatusBarManager implements vscode.Disposable {
       // fetchedAt 0 is emptySnap / never-fetched — the table's null path renders "—".
       const snap = cached && cached.fetchedAt !== 0 ? cached : null;
       const stale = Boolean(snap && snap.fetchedAt && Date.now() - snap.fetchedAt > STALE_ROW_MS);
-      rows.push({ label, active, snap, stale });
+      rows.push({ label, active, snap, stale, email: emailLower });
     };
     const activeAccount = this.registry.savedForEmail(activeEmail);
     push(activeLower, activeAccount?.name ?? activeEmail.split('@')[0], true);

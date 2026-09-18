@@ -443,12 +443,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // under another publisher) registering the same command IDs used to crash
   // activation halfway and leave a dead status bar button.
   const conflicts: string[] = [];
-  const cmd = (id: string, fn: () => Promise<unknown> | unknown): vscode.Disposable => {
+  const cmd = (
+    id: string,
+    fn: (...args: unknown[]) => Promise<unknown> | unknown
+  ): vscode.Disposable => {
     try {
-      return vscode.commands.registerCommand(id, async () => {
+      // Arguments are forwarded: a command link in the hover card passes the
+      // account it names, and a handler that dropped it would switch blind.
+      return vscode.commands.registerCommand(id, async (...args: unknown[]) => {
         log(`command: ${id}`);
         try {
-          await fn();
+          await fn(...args);
         } catch (err) {
           log(`ERROR in ${id}: ${(err as Error).stack ?? String(err)}`);
           const pick = await vscode.window.showErrorMessage(
@@ -466,7 +471,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
 
   context.subscriptions.push(
-    cmd('claudeProfiles.switchAccount', () => wizard.switchAccountInteractive()),
+    cmd('claudeProfiles.switchAccount', (target) =>
+      wizard.switchAccountInteractive(typeof target === 'string' ? target : undefined)
+    ),
     cmd('claudeProfiles.captureAccount', () => wizard.captureCurrentAccount()),
     cmd('claudeProfiles.removeProfile', () => wizard.removeAccountInteractive()),
     cmd('claudeProfiles.showStatus', () => statusBar.onClick()),

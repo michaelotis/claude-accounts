@@ -82,4 +82,52 @@ describe('formatAccountsTable', () => {
     const md = formatAccountsTable([{ label: 'old', active: false, snap: snap(), stale: true }]);
     assert.match(md, /old _\(stale\)_/);
   });
+
+  /** The link destination of the first switch link in the table, if any. */
+  function linkArgs(md) {
+    const m = md.match(/\(command:claudeProfiles\.switchAccount\?([^)\s]*)\)/);
+    return m ? m[1] : null;
+  }
+
+  it('links a non-active row to the switch command with its email as a JSON array', () => {
+    const md = formatAccountsTable([
+      { label: 'motis', active: true, snap: snap(), email: 'motis@x.com' },
+      { label: 'michaelotis', active: false, snap: snap(), email: 'mike@x.com' },
+    ]);
+    const lines = md.split('\n');
+    assert.match(
+      lines[3],
+      /^\| \[michaelotis\]\(command:claudeProfiles\.switchAccount\?/,
+      'non-active row is a command link'
+    );
+    const encoded = linkArgs(md);
+    assert.deepEqual(
+      JSON.parse(decodeURIComponent(encoded)),
+      ['mike@x.com'],
+      'positional args are a JSON array'
+    );
+    assert.ok(!lines[2].includes('command:'), 'the active row has nowhere to go');
+    assert.match(lines[2], /^\| \*\*motis\*\* • \| /, 'active row still bolded + marked');
+  });
+
+  it('leaves a row without an email as plain text', () => {
+    const md = formatAccountsTable([{ label: 'nomail', active: false, snap: snap() }]);
+    assert.equal(linkArgs(md), null, 'no email, no link');
+    assert.match(md.split('\n')[2], /^\| nomail \| /);
+  });
+
+  it('encodes an email that would otherwise break out of the link', () => {
+    const email = 'we ird+"x"(y)[z]@ex.com';
+    const md = formatAccountsTable([
+      { label: 'odd', active: false, snap: snap(), email, stale: true },
+    ]);
+    const encoded = linkArgs(md);
+    assert.deepEqual(JSON.parse(decodeURIComponent(encoded)), [email], 'round-trips intact');
+    assert.ok(
+      !/[()[\]"|\s]/.test(encoded),
+      `destination carries no markdown or table metacharacter: ${encoded}`
+    );
+    // The stale hint stays outside the link, where a click cannot reach it.
+    assert.match(md, /\) _\(stale\)_ \|/);
+  });
 });
