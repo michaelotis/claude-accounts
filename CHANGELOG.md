@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.9.20
+
+### Added
+- **Nothing could say which windows were using which account.** The extension
+  gives every window a config directory of its own, and that directory's
+  `.claude.json` names the account it runs — so the mapping was already on disk,
+  minus the two things no file carried: which workspace a window has open, and
+  whether the window is still there. Each window now records exactly those, as
+  one small file under `~/.config/claude-accounts/windows/`: the workspace name,
+  the config dir, its pid, the host that wrote it and a heartbeat. One file per
+  WINDOW, not per folder — two windows on one folder share a working directory
+  and an account, but not a record, so the second never overwrites the first and
+  neither one closing takes the other off the map. The hover card reads them back
+  under the accounts table, one line per account — `**work** — 2 windows: work-client,
+  my-project`, `(no folder)` for a window with nothing open, `+N` past the first
+  two names — and `scripts/claude-usage` reports the same per account as
+  `windows`, with an `otherWindows` list for live windows the usage cache has no
+  account for and a `WIN` count in the `--text` table — that table has no row to
+  hang the others on, so it prints one `other windows: N (no cached usage for
+  their account)` line and leaves each one's detail to `--json`. Hover text and a
+  CLI field: nothing pops up, nothing reloads. The record deliberately holds no
+  email and no token. The account is read from the window's config dir at
+  display time, so switching accounts shows up in the next reading and a record
+  left behind by a crash can never name the wrong account — the worst it can
+  claim is that a window exists. Which is where the cost sits: liveness is a
+  heartbeat, checked against the process AND a five-minute age bound (the pid
+  alone would be a lie the moment Linux reused it), so a window that has just
+  died can still be listed for up to five minutes, and a window closed cleanly
+  drops off at once. A record carrying another machine's host — a home directory
+  shared between them — is judged on its heartbeat alone, since its pid is a
+  number about a machine this one cannot ask. A window running an older build
+  records nothing and is simply not listed — it is neither counted nor guessed at. The CLI keeps its
+  one promise: it reads the records, and retiring dead ones is the extension's
+  job, not the command's.
+
 ## 0.9.19
 
 ### Added

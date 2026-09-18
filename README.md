@@ -102,6 +102,24 @@ Each window has its own extension host — work and personal can run at once:
 1. Window A → `/home/YOU/projects/work-client` → work Claude
 2. Window B → `/home/YOU/projects/side-project` → personal Claude
 
+**Which window is on which account.** Hovering the meter lists, under the accounts
+table, one line per account with a window on it:
+
+```text
+**work** — 2 windows: work-client, my-project
+**personal** — 1 window: side-project
+```
+
+Workspace names come from the workspace file or the first folder; a window with no
+folder open reads `(no folder)`, past two names collapse into `+N`, and a window
+whose directory names no readable account is grouped under `unknown account`. Every
+window keeps a record of its own, so two windows on the same folder — which share a
+working directory, and therefore an account — are two entries, and closing one leaves
+the other listed. It is hover text only — nothing pops up and nothing reloads. The
+same list is in
+[`scripts/claude-usage`](#reading-usage-from-a-script-scriptsclaude-usage), which
+also explains the five-minute liveness bound.
+
 Pin trees in settings (or **Switch Account** once so it learns):
 
 ```json
@@ -189,9 +207,12 @@ Legacy `primaryEmail` / `secondaryEmail` still seed `accountOrder` if that list 
 
 ## Reading usage from a script (`scripts/claude-usage`)
 
-The extension writes what it collects to a shared cache file. `scripts/claude-usage`
-reads that file — nothing else. It **never writes, locks or fetches**, so it works
-with every VS Code window closed and can never spend an account's rate limit.
+The extension writes what it collects to a shared cache file, and each open window
+records itself in `~/.config/claude-accounts/windows/` — one file per window, naming
+its workspace, its config directory, its pid, the `host` that wrote it and its last
+heartbeat. `scripts/claude-usage` reads those — nothing else. It **never writes,
+locks or fetches**, so it works with every VS Code window closed and can never spend
+an account's rate limit.
 
 ```bash
 scripts/claude-usage                      # JSON on stdout
@@ -218,9 +239,18 @@ scripts/claude-usage --max-age 2m         # how fresh a reading must be
       "models": [{ "name": "Fable", "percent": 40, "resetsAt": null }],
       "fetchedAt": 1767225595000,
       "ageMs": 5000,
-      "stale": false
+      "stale": false,
+      "windows": [
+        {
+          "workspace": "my-project",
+          "configDir": "/home/YOU/.claude-windows/aaaa1111",
+          "pid": 4242,
+          "lastSeen": 1767225597000
+        }
+      ]
     }
   ],
+  "otherWindows": [],
   "warnings": []
 }
 ```
@@ -260,6 +290,24 @@ scripts/claude-usage --max-age 2m         # how fresh a reading must be
 - An entry keyed by directory rather than email has `email: null`. Accounts sort by
   email. Warnings name such an entry by its directory's basename, with the parent's
   basename added when two of them share one (`projA/.claude`), never by its path.
+- `windows` is every **live** VS Code window running that account — always an array,
+  `[]` when none. Per window: `workspace` (the workspace file or first folder's
+  name, `""` for a window with no folder open), `configDir` (the `CLAUDE_CONFIG_DIR`
+  it runs), `pid` and `lastSeen` (epoch ms of its last heartbeat). The `--text`
+  table shows the count as `WIN`.
+- `otherWindows` is every live window no listed account claims — same fields plus
+  its own `email`, which is `null` when its `configDir` names no readable account.
+  A window belonging to an account that `--account` filtered out is **not** listed
+  here; it has been accounted for. `--text` has no row to hang them on, so it
+  prints one `other windows: N (no cached usage for their account)` line and the
+  per-window detail stays in `--json`.
+- A window counts as live while its process answers **and** its record has beaten
+  within five minutes, so a window that has just closed can be listed for up to
+  that long. A record whose `host` is not this machine's — a home directory shared
+  between machines — is judged on its heartbeat alone, and its pid is never probed:
+  that number is about a machine this one cannot ask. The account is read from the
+  window's `configDir` at report time, never from the record, so a switch shows up on
+  the next run and a record left behind by a crash can never name the wrong account.
 
 Exit codes: `0` everything listed is fresh · `1` some of it is stale · `2` no data
 (no cache yet, unreadable, nothing matched `--account`, or every account listed is

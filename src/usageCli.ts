@@ -18,6 +18,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { ModelLimit, UsageSnapshot } from './usageParse';
+import { readWindows, type WindowInfo } from './windowPresence';
 
 const SCHEMA = 'claude-accounts/usage@1';
 const CACHE_FILE = 'usage-cache.json';
@@ -30,6 +31,20 @@ interface ModelReport {
   name: string;
   percent: number | null;
   resetsAt: string | null;
+}
+
+/** One live VS Code window running an account. */
+interface WindowReport {
+  /** Workspace name, or '' for a window with no folder open. */
+  workspace: string;
+  configDir: string;
+  pid: number;
+  lastSeen: number;
+}
+
+/** A live window this cache has no account for — its email, if any, is its own. */
+interface OtherWindowReport extends WindowReport {
+  email: string | null;
 }
 
 interface AccountReport {
@@ -48,6 +63,8 @@ interface AccountReport {
   /** How old the reading is, or null when there is no reading to age. */
   ageMs: number | null;
   stale: boolean;
+  /** Live windows running this account — always an array, empty when none. */
+  windows: WindowReport[];
 }
 
 interface Report {
@@ -55,6 +72,8 @@ interface Report {
   generatedAt: number;
   stale: boolean;
   accounts: AccountReport[];
+  /** Live windows no listed account claims: unknown email, or none cached. */
+  otherWindows: OtherWindowReport[];
   warnings: string[];
 }
 
@@ -85,8 +104,10 @@ Usage: claude-usage [--json | --text] [--account <email>] [--max-age <n>[s|m]]
        claude-usage --help
 
 Reads ~/.config/claude-accounts/usage-cache.json, which the extension writes
-after a successful fetch. This command only reads it: it never writes, locks or
-fetches, so it never spends an account's rate limit.
+after a successful fetch, and ~/.config/claude-accounts/windows/, where each open
+window records the workspace it has open and the config dir it runs. This command
+only reads them: it never writes, locks or fetches, so it never spends an
+account's rate limit.
 
 Options:
   --json              JSON on stdout (default)
@@ -290,6 +311,21 @@ function presence(snap: Partial<UsageSnapshot>, label: string): Presence {
   }
 }
 
+/** The presence record as this report carries it — no id, and the email is the row's. */
+function toWindowReport(w: WindowInfo): WindowReport {
+  return { workspace: w.workspace, configDir: w.configDir, pid: w.pid, lastSeen: w.lastSeen };
+}
+
+/**
+ * The live windows running one account. A dir-keyed entry has no email to match
+ * on, so it gets none — never every unattributable window by default.
+ */
+function windowsForEmail(windows: WindowInfo[], email: string | null): WindowReport[] {
+  if (!email) return [];
+  const want = email.toLowerCase();
+  return windows.filter((w) => (w.email ?? '').toLowerCase() === want).map(toWindowReport);
+}
+
 /** The reading fields of an account nothing usable is known about. */
 function noReading() {
   return {
@@ -307,7 +343,8 @@ function toAccount(
   entry: Record<string, unknown>,
   now: number,
   maxAgeMs: number,
-  warnings: string[]
+  warnings: string[],
+  windows: WindowInfo[]
 ): AccountReport {
   const snap = (record(entry.snap) ?? {}) as Partial<UsageSnapshot>;
   const stamps = [entry.fetchedAt, snap.fetchedAt];
@@ -322,11 +359,15 @@ function toAccount(
   if (!here.present) {
     warnings.push(`${label}: no credentials in its config directory — left out of the exit code`);
   }
+  const email = text(snap.email) ?? emailFromKey(key);
   const identity = {
-    email: text(snap.email) ?? emailFromKey(key),
+    email,
     planLabel: text(snap.planLabel),
     orgName: text(snap.orgName),
     present: here.present,
+    // A window is running it or it is not — that has nothing to do with whether
+    // its usage was ever fetched, or whether the reading can be aged.
+    windows: windowsForEmail(windows, email),
   };
   // Never fetched: the snapshot's zeros are placeholders the extension writes to
   // have a shape at all, so reporting them as 0% would read as an idle account
@@ -409,7 +450,16 @@ function readEntries(file: string, warnings: string[]): Record<string, unknown> 
 function buildReport(opts: CliOptions, now: number): Report {
   const warnings: string[] = [];
   const file = cachePath();
+  // Presence is read, never written or swept here: this command's contract is
+  // that it changes nothing. A missing or unreadable directory is simply no
+  // windows — not worth a warning, since a machine with every window closed is
+  // exactly when this command is most useful.
+  const windows = readWindows(now);
   const accounts: AccountReport[] = [];
+  // Attribution is decided against the whole cache, before --account narrows the
+  // listing: a window belonging to an account the caller filtered out has been
+  // accounted for, and must not resurface as an unattributed one.
+  const cached = new Set<string>();
   const entries = Object.entries(readEntries(file, warnings));
   const labels = labelsByKey(entries.map(([key]) => key));
   for (const [key, value] of entries) {
@@ -423,7 +473,8 @@ function buildReport(opts: CliOptions, now: number): Report {
     // account, and a line about another one is both noise and an address the
     // caller never asked this command for. Cache-level lines stay above.
     const mine: string[] = [];
-    const account = toAccount(key, keyName, entry, now, opts.maxAgeMs, mine);
+    const account = toAccount(key, keyName, entry, now, opts.maxAgeMs, mine, windows);
+    if (account.email) cached.add(account.email.toLowerCase());
     if (opts.account && (account.email ?? '').toLowerCase() !== opts.account) continue;
     accounts.push(account);
     warnings.push(...mine);
@@ -441,12 +492,16 @@ function buildReport(opts: CliOptions, now: number): Report {
   if (opts.account && accounts.length === 0) {
     warnings.push(`no cached usage for ${opts.account}`);
   }
+  const otherWindows: OtherWindowReport[] = windows
+    .filter((w) => !w.email || !cached.has(w.email.toLowerCase()))
+    .map((w) => ({ ...toWindowReport(w), email: w.email }));
   const here = accounts.filter((a) => a.present);
   return {
     schema: SCHEMA,
     generatedAt: now,
     stale: here.length === 0 || here.some((a) => a.stale),
     accounts,
+    otherWindows,
     warnings,
   };
 }
@@ -476,13 +531,14 @@ function renderText(report: Report): string {
   const lines: string[] = [];
   if (report.accounts.length) {
     const rows = [
-      ['ACCOUNT', 'PLAN', '5H', '7D', 'MODELS', 'AGE', 'STATE'],
+      ['ACCOUNT', 'PLAN', '5H', '7D', 'MODELS', 'WIN', 'AGE', 'STATE'],
       ...report.accounts.map((a) => [
         a.email ?? '(no email)',
         a.planLabel ?? '—',
         formatPercent(a.sessionPercent),
         formatPercent(a.weeklyPercent),
         a.models.map((m) => `${m.name} ${formatPercent(m.percent)}`).join(' · ') || '—',
+        String(a.windows.length),
         formatAge(a),
         a.present ? (a.stale ? 'stale' : 'fresh') : 'gone',
       ]),
@@ -498,6 +554,12 @@ function renderText(report: Report): string {
     }
   } else {
     lines.push('no usage data');
+  }
+  // The table can only count windows against a row, so windows belonging to no
+  // cached account would vanish from this format entirely. The count says they
+  // are there; --json is where each one's workspace and dir live.
+  if (report.otherWindows.length) {
+    lines.push(`other windows: ${report.otherWindows.length} (no cached usage for their account)`);
   }
   for (const warning of report.warnings) lines.push(`! ${warning}`);
   return lines.join('\n');
