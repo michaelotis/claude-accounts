@@ -8,15 +8,17 @@ const crypto = require('crypto');
 
 /**
  * workdir.ts imports vscode (via log/accounts) — bundle with the same minimal
- * vscode stub the other unit bundles use.
+ * vscode stub the other unit bundles use. The output channel keeps its lines so a
+ * case can count what was logged.
  */
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), `self-heal-${process.pid}-`));
 const vscodeStub = path.join(tmpRoot, 'vscode-stub.js');
 fs.writeFileSync(
   vscodeStub,
-  `module.exports = {
+  `globalThis.__logLines = globalThis.__logLines || [];
+   module.exports = {
      window: {
-       createOutputChannel: () => ({ appendLine() {}, show() {} }),
+       createOutputChannel: () => ({ appendLine(l) { globalThis.__logLines.push(l); }, show() {} }),
        showWarningMessage: () => Promise.resolve(undefined),
        showInformationMessage: () => Promise.resolve(undefined),
        showErrorMessage: () => Promise.resolve(undefined),
@@ -37,21 +39,21 @@ function bundle(entry, name) {
   return require(out);
 }
 const {
+  ANCHOR_WINDOW_MS,
+  anchorOf,
+  sameAnchor,
   relateToStore,
   healVerdict,
   healAtActivation,
   refreshStore,
   restockTokenOnly,
   materialize,
+  readGrantChain,
   readGrantHistory,
-  recordGrantHistory,
+  observeStoreGrant,
+  foreignAnchorConflict,
+  grantChainPath,
   grantHistoryPath,
-  grantOriginPath,
-  readDirRecord,
-  observeDirGrant,
-  recordExtWrite,
-  noteTokenless,
-  signInObservedAt,
   credentialFingerprint,
 } = bundle('../src/workdir.ts', 'workdir.bundle.cjs');
 const { fetchUsageCoordinated, __ageInProcessStateForTests } = bundle(
@@ -61,83 +63,107 @@ const { fetchUsageCoordinated, __ageInProcessStateForTests } = bundle(
 
 // Every fixture hangs off one clock read. Expiries sit just inside the 8 h token
 // lifetime, so a grant is live for the whole run; refresh tokens rotate, so each
-// refresh below is a new fingerprint.
+// refresh below is a new fingerprint. Family anchors sit 30 days out, an hour
+// apart per family, like the 24-30 day lifetimes sign-ins mint.
 const T = Date.now();
+const SEC = 1_000;
 const MIN = 60_000;
+const HOUR = 60 * MIN;
 const LIVE = T + 479 * MIN;
-const grant = (rt, exp = LIVE) =>
+const F = (k) => T + 30 * 24 * HOUR + k * HOUR;
+const W = ANCHOR_WINDOW_MS;
+const grant = (rt, anchor, exp = LIVE) =>
   Buffer.from(
     JSON.stringify({
-      claudeAiOauth: { accessToken: `at-${rt.slice(3)}`, refreshToken: rt, expiresAt: exp },
+      claudeAiOauth: {
+        accessToken: `at-${rt.slice(3)}`,
+        refreshToken: rt,
+        expiresAt: exp,
+        ...(anchor == null ? {} : { refreshTokenExpiresAt: anchor }),
+      },
     })
   );
-const S = grant('rt-S');
-const L = grant('rt-L', LIVE - 30 * MIN);
-const A = grant('rt-A', LIVE + 30 * MIN);
-const E = grant('rt-E', T - 10 * MIN);
 const NOEXP = Buffer.from(
   JSON.stringify({ claudeAiOauth: { accessToken: 'at-N', refreshToken: 'rt-N' } })
 );
 const hash = (buf) => crypto.createHash('sha256').update(credentialFingerprint(buf)).digest('hex');
+const chainOf = (current, displaced = [], hashes = []) => ({ current, displaced, hashes });
 const OLD_MTIME = T - 10 * MIN;
-const rec = (h, held, by = 'cc') => ({ h, held, by, at: T });
-const opts = (o = {}) => ({
-  dirChanged: false,
-  signInObserved: false,
-  trusted: false,
-  nowMs: T,
-  ...o,
+const logged = (re) => globalThis.__logLines.filter((l) => re.test(l));
+
+describe('anchorOf and sameAnchor', () => {
+  it('reads refreshTokenExpiresAt and nothing else', () => {
+    assert.equal(anchorOf(grant('rt-a', F(0))), F(0));
+    assert.equal(anchorOf(grant('rt-a', null)), null);
+    assert.equal(anchorOf(Buffer.from('not json')), null);
+    assert.equal(
+      anchorOf(Buffer.from(JSON.stringify({ claudeAiOauth: { refreshTokenExpiresAt: 'x' } }))),
+      null
+    );
+  });
+
+  it('the window is 10 minutes: W - 1 s apart is one family, W + 1 s apart is not', () => {
+    assert.equal(W, 10 * MIN);
+    assert.ok(sameAnchor(F(0), F(0) + W - SEC));
+    assert.ok(sameAnchor(F(0), F(0) - W + SEC));
+    assert.ok(!sameAnchor(F(0), F(0) + W + SEC));
+    assert.ok(!sameAnchor(F(0), F(0) - W - SEC));
+    assert.ok(!sameAnchor(null, F(0)) && !sameAnchor(F(0), null) && !sameAnchor(null, null));
+  });
 });
 
 describe('relateToStore', () => {
+  const S = grant('rt-S', F(0));
+
   it('same for the store grant itself', () => {
-    assert.equal(relateToStore(S, S, [hash(S)], null, opts()), 'same');
+    assert.equal(relateToStore(S, S, chainOf(F(0), [], [hash(S)])), 'same');
   });
 
-  it('known for a grant the store held, whatever its expiry (R1-M1)', () => {
-    assert.equal(relateToStore(A, S, [hash(A), hash(S)], null, opts()), 'known');
-    assert.equal(relateToStore(E, S, [hash(E), hash(S)], null, opts()), 'known');
-    // A process-held predecessor does not turn a known copy into a continuation.
-    const r = rec(hash(L), hash(S));
-    assert.equal(relateToStore(A, S, [hash(A), hash(S)], r, opts({ dirChanged: true })), 'known');
+  it('a later family is a sign-in, an earlier one a fork, past the window either way', () => {
+    const c = chainOf(F(0), [], [hash(S)]);
+    assert.equal(relateToStore(grant('rt-L', F(0) + W + SEC), S, c), 'sign-in');
+    assert.equal(relateToStore(grant('rt-L', F(0) + W - SEC, LIVE + MIN), S, c), 'continuation');
+    assert.equal(relateToStore(grant('rt-K', F(0) - W - SEC), S, c), 'fork');
+    assert.equal(relateToStore(grant('rt-K', F(0) - W + SEC, LIVE + MIN), S, c), 'continuation');
   });
 
-  it('continues when the process held the store grant before Claude Code wrote', () => {
-    const r = rec(hash(S), hash(S));
-    assert.equal(relateToStore(L, S, [hash(S)], r, opts({ dirChanged: true })), 'continues');
+  it('within the family: known by hash whatever its expiry, known when older, else a continuation', () => {
+    const E = grant('rt-E', F(0), T - 10 * MIN);
+    assert.equal(relateToStore(E, S, chainOf(F(0), [], [hash(E), hash(S)])), 'known');
+    const A = grant('rt-A', F(0), LIVE + 30 * MIN);
+    assert.equal(relateToStore(A, S, chainOf(F(0), [], [hash(A), hash(S)])), 'known');
+    assert.equal(relateToStore(grant('rt-O', F(0), LIVE - MIN), S, chainOf(F(0))), 'known');
+    assert.equal(relateToStore(grant('rt-N', F(0), LIVE + MIN), S, chainOf(F(0))), 'continuation');
   });
 
-  it('unrelated when the extension, not Claude Code, last moved the disk', () => {
-    const r = rec(hash(S), hash(S));
-    assert.equal(relateToStore(L, S, [hash(S)], r, opts({ dirChanged: false })), 'unrelated');
+  it('a null anchor matches nothing: dir, store or both → legacy (M-6)', () => {
+    assert.equal(relateToStore(grant('rt-x', null, LIVE + MIN), S, chainOf(F(0))), 'legacy');
+    assert.equal(relateToStore(grant('rt-x', F(9)), grant('rt-S', null), chainOf(null)), 'legacy');
+    assert.equal(
+      relateToStore(grant('rt-x', null, LIVE + MIN), grant('rt-S', null), chainOf(null)),
+      'legacy'
+    );
+    assert.equal(relateToStore(NOEXP, S, chainOf(F(0))), 'legacy', 'null expiry on the dir');
   });
 
-  it('unrelated when the process held some other grant', () => {
-    const r = rec(hash(A), hash(A));
-    assert.equal(relateToStore(L, S, [hash(S)], r, opts({ dirChanged: true })), 'unrelated');
+  it('an unreadable store takes a grant with an anchor and an expiry, nothing else', () => {
+    assert.equal(relateToStore(grant('rt-x', F(0)), NOEXP, chainOf(null)), 'sign-in');
+    assert.equal(relateToStore(grant('rt-x', F(0)), Buffer.from('nope'), chainOf(null)), 'sign-in');
+    assert.equal(relateToStore(grant('rt-x', null), Buffer.from('nope'), chainOf(null)), 'legacy');
   });
 
-  it('unrelated with no record, no observed gap and no trust', () => {
-    assert.equal(relateToStore(L, S, [hash(S)], null, opts({ dirChanged: true })), 'unrelated');
+  it('ref is the later of the chain and the file: a regressed file is restored, its forks are not', () => {
+    const x = F(20);
+    const sBack = grant('rt-Sb', F(0));
+    const c = chainOf(x, [F(0)], []);
+    assert.equal(relateToStore(grant('rt-L', x), sBack, c), 'sign-in');
+    assert.equal(relateToStore(grant('rt-Sbb', F(0) + SEC, LIVE + MIN), sBack, c), 'fork');
   });
 
-  it('unrelated for an expired unknown grant, even with held = the store grant', () => {
-    const r = rec(hash(S), hash(S));
-    for (const o of [{ dirChanged: true }, { signInObserved: true }, { trusted: true }]) {
-      assert.equal(relateToStore(E, S, [hash(S)], r, opts(o)), 'unrelated');
-    }
-  });
-
-  it('continues on an observed sign-in or a trusted capture', () => {
-    assert.equal(relateToStore(L, S, [hash(S)], null, opts({ signInObserved: true })), 'continues');
-    assert.equal(relateToStore(L, S, [hash(S)], null, opts({ trusted: true })), 'continues');
-  });
-
-  it('null expiry: an unparseable dir grant is unrelated, an unparseable store is repaired (R1-m5)', () => {
-    const r = rec(hash(S), hash(S));
-    assert.equal(relateToStore(NOEXP, S, [hash(S)], r, opts({ dirChanged: true })), 'unrelated');
-    assert.equal(relateToStore(L, NOEXP, [], null, opts()), 'continues');
-    assert.equal(relateToStore(L, Buffer.from('not json'), [], null, opts()), 'continues');
+  it('is pure: the same inputs judge the same way at any time', () => {
+    const c = chainOf(F(0));
+    const d = grant('rt-N', F(0), LIVE + MIN);
+    assert.equal(relateToStore(d, S, c), relateToStore(d, S, c));
   });
 });
 
@@ -145,31 +171,27 @@ describe('healVerdict', () => {
   const v = (relation, selfHeal = true, mtime = OLD_MTIME) =>
     healVerdict(relation, selfHeal, mtime, T);
 
-  it('keeps the same grant, adopts a continuation, keeps an unrelated grant', () => {
+  it('keeps same, legacy and unrelated; adopts a continuation or a sign-in', () => {
     assert.deepEqual(v('same'), { verdict: 'keep', reason: 'same' });
-    assert.deepEqual(v('continues'), { verdict: 'adopt', reason: 'continues' });
+    assert.deepEqual(v('legacy'), { verdict: 'keep', reason: 'legacy' });
     assert.deepEqual(v('unrelated'), { verdict: 'keep', reason: 'unrelated' });
+    assert.deepEqual(v('continuation'), { verdict: 'adopt', reason: 'continuation' });
+    assert.deepEqual(v('sign-in'), { verdict: 'adopt', reason: 'sign-in' });
+    assert.deepEqual(v(null), { verdict: 'keep', reason: 'unjudged' });
   });
 
-  it('restocks a known copy', () => {
-    assert.deepEqual(v('known'), { verdict: 'restock', reason: 'known' });
-  });
-
-  it('keeps a known copy when selfHeal is off', () => {
-    assert.deepEqual(v('known', false), { verdict: 'keep', reason: 'selfHeal-off' });
-  });
-
-  it('keeps a known copy whose mtime could not be read', () => {
-    assert.deepEqual(v('known', true, null), { verdict: 'keep', reason: 'unreadable-mtime' });
-  });
-
-  it('keeps a known copy written in the last 10 s', () => {
-    assert.deepEqual(v('known', true, T - 3_000), { verdict: 'keep', reason: 'burst' });
-    assert.deepEqual(v('known', true, T - 10_000), { verdict: 'restock', reason: 'known' });
-  });
+  for (const rel of ['known', 'fork']) {
+    it(`restocks ${rel}, except selfHeal off, an unreadable mtime, or inside the burst`, () => {
+      assert.deepEqual(v(rel), { verdict: 'restock', reason: rel });
+      assert.deepEqual(v(rel, false), { verdict: 'keep', reason: 'selfHeal-off' });
+      assert.deepEqual(v(rel, true, null), { verdict: 'keep', reason: 'unreadable-mtime' });
+      assert.deepEqual(v(rel, true, T - 3_000), { verdict: 'keep', reason: 'burst' });
+      assert.deepEqual(v(rel, true, T - 10_000), { verdict: 'restock', reason: rel });
+    });
+  }
 });
 
-describe('refreshStore, the dir record and the activation heal', () => {
+describe('refreshStore, the chain and the activation heal', () => {
   let home;
   let prevHome;
   let keepalive;
@@ -191,15 +213,13 @@ describe('refreshStore, the dir record and the activation heal', () => {
   });
 
   let n = 0;
-  const mkDir = (prefix, token) => {
+  const mkDir = (prefix, token, email = 'b@example.com') => {
     const dir = path.join(home, `${prefix}${++n}`);
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     fs.writeFileSync(
       path.join(dir, '.claude.json'),
-      JSON.stringify({ oauthAccount: { emailAddress: 'b@example.com' } }),
-      {
-        mode: 0o600,
-      }
+      JSON.stringify({ oauthAccount: { emailAddress: email } }),
+      { mode: 0o600 }
     );
     if (token) put(dir, token);
     return dir;
@@ -212,200 +232,314 @@ describe('refreshStore, the dir record and the activation heal', () => {
     fs.writeFileSync(f, token, { mode: 0o600 });
     fs.utimesSync(f, ms / 1000, ms / 1000);
   };
-  const record = (dir) => readDirRecord(dir);
-  const writeRecord = (dir, r) =>
-    fs.writeFileSync(grantOriginPath(dir), JSON.stringify(r), { mode: 0o600 });
+  const mtime = (dir) => fs.statSync(path.join(dir, '.credentials.json')).mtimeMs;
+  const chainFile = (store) => JSON.parse(fs.readFileSync(grantChainPath(store), 'utf8'));
+  // A store that has moved from family `from` to `to`, as a sign-in carried in leaves it.
+  const signedInStore = (from, to) => {
+    const store = mkDir('.claude-b', from);
+    observeStoreGrant(store, from);
+    put(store, to);
+    observeStoreGrant(store, to);
+    return store;
+  };
+  // Another account's store, removed by the case that made it so no later case sees it.
+  const foreignStore = (token, chain) => {
+    const dir = mkDir('.claude-x', token, 'x@example.com');
+    if (chain) fs.writeFileSync(grantChainPath(dir), JSON.stringify({ v: 2, ...chain }));
+    return dir;
+  };
+  const drop = (dir) => fs.rmSync(dir, { recursive: true, force: true });
 
-  it('M-1: a fork refreshed after a restock never reaches the store, and A is never restocked', async () => {
-    const S1 = grant('rt-S1');
-    const L1 = grant('rt-L1', LIVE - 60 * MIN);
-    const S2 = grant('rt-S2'); // B's process refreshes the S1 it holds in memory
-    const L2 = grant('rt-L2', LIVE - 50 * MIN);
+  it('M-1: a fork never reaches the store, B is restocked, A is never written', async () => {
+    const s = F(0);
+    const x = F(5);
+    const S1 = grant('rt-S1', s);
+    const L1 = grant('rt-L1', x, LIVE - 60 * MIN);
+    const L2 = grant('rt-L2', x + SEC, LIVE - 50 * MIN);
     const store = mkDir('.claude-b', S1);
     const acct = account(store);
     const wa = mkDir('wd', S1);
     const wb = mkDir('wd', S1);
-    const storeNeverFork = () =>
-      assert.ok(!cred(store).equals(S2), 'the store never holds the fork');
+    let aHas = S1;
+    const invariants = () => {
+      assert.ok(cred(wa).equals(aHas), "A's file is only ever what its process wrote");
+      for (const fork of forks) assert.ok(!cred(store).equals(fork), 'the store never holds S′');
+    };
+    const forks = [];
 
-    // 0: both activated.
+    // 0: both activated on S.
     healAtActivation(acct, wa, { selfHeal: true });
     healAtActivation(acct, wb, { selfHeal: true });
-    assert.deepEqual((await refreshStore(acct, wa)).relation, 'same');
-    assert.equal(record(wa).held, hash(S1));
-    assert.equal(record(wb).held, hash(S1));
+    assert.equal((await refreshStore(acct, wa)).relation, 'same');
+    assert.equal(readGrantChain(store).current, s);
+    invariants();
 
     // 1: A signs in.
     put(wa, L1);
+    aHas = L1;
     const r1 = await refreshStore(acct, wa);
-    assert.equal(r1.relation, 'continues');
-    assert.ok(r1.wrote && cred(store).equals(L1));
-    assert.ok(cred(wa).equals(L1));
-    assert.deepEqual([record(wa).h, record(wa).held, record(wa).by], [hash(L1), hash(L1), 'cc']);
-
-    // 2: B holds S1, which the store has moved past.
-    const r2 = await refreshStore(acct, wb);
-    assert.equal(r2.relation, 'known');
+    assert.deepEqual([r1.relation, r1.wrote], ['sign-in', true]);
     assert.ok(cred(store).equals(L1));
-    assert.equal(healVerdict(r2.relation, true, OLD_MTIME, Date.now()).verdict, 'restock');
+    assert.deepEqual(chainFile(store).displaced, [s]);
+    invariants();
+
+    // 2: B still holds S, a family the sign-in replaced.
+    const r2 = await refreshStore(acct, wb);
+    assert.equal(r2.relation, 'fork');
+    assert.deepEqual(healVerdict(r2.relation, true, mtime(wb), Date.now()), {
+      verdict: 'restock',
+      reason: 'fork',
+    });
     assert.ok(restockTokenOnly(cred(store), wb, S1));
     assert.ok(cred(wb).equals(L1));
-    assert.deepEqual([record(wb).h, record(wb).held, record(wb).by], [hash(L1), hash(S1), 'ext']);
+    invariants();
 
-    // 3: B's process refreshes the S1 it still holds.
-    put(wb, S2);
-    const r3 = await refreshStore(acct, wb);
-    assert.equal(r3.relation, 'unrelated');
-    assert.equal(r3.wrote, false);
-    assert.equal(
-      relateToStore(
-        S2,
-        cred(store),
-        readGrantHistory(store),
-        rec(hash(L1), hash(S1)),
-        opts({ dirChanged: true, nowMs: Date.now() })
-      ),
-      'unrelated'
-    );
-    storeNeverFork();
-    assert.ok(cred(store).equals(L1));
-    assert.ok(cred(wb).equals(S2), "B's file is left alone");
-    assert.deepEqual([record(wb).h, record(wb).held, record(wb).by], [hash(S2), hash(S2), 'cc']);
+    // 3: B's process refreshes the S it holds in memory, drifting a few seconds.
+    for (const drift of [3 * SEC, -3 * SEC]) {
+      const S2 = grant(`rt-S2${drift}`, s + drift, LIVE + 60 * MIN);
+      forks.push(S2);
+      put(wb, S2);
+      const r3 = await refreshStore(acct, wb);
+      assert.deepEqual([r3.relation, r3.wrote], ['fork', false]);
+      assert.ok(cred(store).equals(L1));
+      assert.equal(healVerdict(r3.relation, true, mtime(wb), Date.now()).verdict, 'restock');
+      assert.ok(restockTokenOnly(cred(store), wb, S2));
+      assert.ok(cred(wb).equals(L1));
+      invariants();
+    }
 
-    // 4: A's process refreshes L1.
+    // 4: A's process refreshes L.
     put(wa, L2);
+    aHas = L2;
     const r4 = await refreshStore(acct, wa);
-    assert.equal(r4.relation, 'continues');
+    assert.deepEqual([r4.relation, r4.wrote], ['continuation', true]);
     assert.ok(cred(store).equals(L2));
-    assert.ok(cred(wa).equals(L2));
+    assert.equal(readGrantChain(store).current, x);
+    invariants();
 
-    // 5: B reconciles again.
+    // 5: B, restocked on L, now holds a copy the store has moved past; then same.
     const r5 = await refreshStore(acct, wb);
-    assert.equal(r5.relation, 'unrelated');
-    storeNeverFork();
-    assert.ok(cred(store).equals(L2));
-    assert.ok(cred(wb).equals(S2));
-    assert.notEqual(record(wa).by, 'ext', "A's file was never written by the extension");
+    assert.equal(r5.relation, 'known');
+    assert.ok(restockTokenOnly(cred(store), wb, L1));
+    assert.equal((await refreshStore(acct, wb)).relation, 'same');
+    invariants();
   });
 
-  it('M-1: a window reloaded after its restock continues the store on its next refresh', async () => {
-    const S1 = grant('rt-S1r');
-    const L1 = grant('rt-L1r', LIVE - 60 * MIN);
-    const L3 = grant('rt-L3r', LIVE - 40 * MIN);
+  it('dead-lineage drift: a refresh of a displaced family ±3 s is a fork, store unchanged', async () => {
+    const s = F(0);
+    const L = grant('rt-Ld', F(5));
+    const store = signedInStore(grant('rt-Sd', s), L);
+    for (const drift of [3 * SEC, -3 * SEC]) {
+      const wd = mkDir('wd', grant(`rt-Sd${drift}`, s + drift, LIVE + HOUR));
+      const r = await refreshStore(account(store), wd);
+      assert.deepEqual([r.relation, r.wrote], ['fork', false]);
+      assert.ok(cred(store).equals(L));
+    }
+  });
+
+  it('N2: a terminal on a displaced family is restocked at activation and after each fork', async () => {
+    const s = F(0);
+    const L = grant('rt-Ln2', F(5));
+    const store = signedInStore(grant('rt-Sn2', s), L);
+    const wb = mkDir('wd', grant('rt-Sn2', s));
+    healAtActivation(account(store), wb, { selfHeal: true });
+    assert.ok(cred(wb).equals(L), 'restocked at activation');
+    const S2 = grant('rt-Sn2b', s + SEC, LIVE + HOUR);
+    put(wb, S2);
+    assert.equal((await refreshStore(account(store), wb)).relation, 'fork');
+    healAtActivation(account(store), wb, { selfHeal: true });
+    assert.ok(cred(wb).equals(L), 'restocked again');
+    assert.ok(cred(store).equals(L));
+  });
+
+  it('exit flush: a later refresh of the current family is left at activation, then adopted', async () => {
+    const S1 = grant('rt-Sx', F(0));
     const store = mkDir('.claude-b', S1);
-    const acct = account(store);
-    const wb = mkDir('wd', S1);
-    healAtActivation(acct, wb, { selfHeal: true });
-    await refreshStore(acct, wb);
-    fs.writeFileSync(path.join(store, '.credentials.json'), L1); // A's sign-in, carried in
-    assert.equal((await refreshStore(acct, wb)).relation, 'known');
-    assert.ok(restockTokenOnly(cred(store), wb, S1));
-    assert.equal(record(wb).held, hash(S1));
-    // Reload: the activation step runs before Claude Code reads the dir.
-    healAtActivation(acct, wb, { selfHeal: true });
-    assert.deepEqual([record(wb).h, record(wb).held], [hash(L1), hash(L1)]);
-    put(wb, L3);
-    const r = await refreshStore(acct, wb);
-    assert.equal(r.relation, 'continues');
-    assert.ok(cred(store).equals(L3));
-  });
-
-  it('byte-equal: records the dir once and returns same; a second pass rewrites nothing', async () => {
-    const store = mkDir('.claude-b', S);
-    const wd = mkDir('wd', S);
+    observeStoreGrant(store, S1);
+    const later = grant('rt-Sx2', F(0) + SEC, LIVE + HOUR);
+    const wd = mkDir('wd', later);
+    healAtActivation(account(store), wd, { selfHeal: true });
+    assert.ok(cred(wd).equals(later), 'not restocked at activation');
+    assert.equal(materialize(account(store), wd, true), false, 'the forced stock leaves it');
+    assert.ok(cred(wd).equals(later));
     const r = await refreshStore(account(store), wd);
-    assert.deepEqual(r, { relation: 'same', wrote: false, deferred: false });
-    const got = JSON.parse(fs.readFileSync(grantOriginPath(wd), 'utf8'));
-    assert.deepEqual([got.h, got.held, got.by], [hash(S), hash(S), 'cc']);
-    assert.equal(fs.statSync(grantOriginPath(wd)).mode & 0o777, 0o600);
-    fs.utimesSync(grantOriginPath(wd), OLD_MTIME / 1000, OLD_MTIME / 1000);
-    const pinned = fs.statSync(grantOriginPath(wd)).mtimeMs;
-    await refreshStore(account(store), wd);
-    assert.equal(fs.statSync(grantOriginPath(wd)).mtimeMs, pinned);
+    assert.deepEqual([r.relation, r.wrote], ['continuation', true]);
+    assert.ok(cred(store).equals(later));
   });
 
-  it('R1-M3: records the store grant before the byte-equal return', async () => {
+  it('two sign-ins: each adoption moves current, and the first window then holds a fork', async () => {
+    const s = F(0);
+    const S = grant('rt-S2s', s);
+    const L1 = grant('rt-L1s', F(3));
+    const L2 = grant('rt-L2s', F(6));
     const store = mkDir('.claude-b', S);
-    const wd = mkDir('wd', S);
-    await refreshStore(account(store), wd);
-    assert.deepEqual(readGrantHistory(store), [hash(S)]);
+    const wa = mkDir('wd', L1);
+    const wb = mkDir('wd', L2);
+    assert.equal((await refreshStore(account(store), wa)).relation, 'sign-in');
+    assert.deepEqual(readGrantChain(store).current, F(3));
+    assert.equal((await refreshStore(account(store), wb)).relation, 'sign-in');
+    assert.deepEqual([chainFile(store).current, chainFile(store).displaced], [F(6), [s, F(3)]]);
+    assert.ok(cred(store).equals(L2));
+    assert.equal((await refreshStore(account(store), wa)).relation, 'fork');
+    assert.ok(cred(store).equals(L2));
   });
 
-  it('R1-M3: a known copy held by a process that held the store grant is not adopted', async () => {
+  it('upgrade day, no chain: an earlier unknown family is a fork, restocked after the burst', async () => {
+    const s = F(10);
+    const S = grant('rt-Su', s);
     const store = mkDir('.claude-b', S);
-    recordGrantHistory(store, A);
-    const wd = mkDir('wd', A);
-    writeRecord(wd, rec(hash(L), hash(S)));
+    const early = grant('rt-Eu', F(5), LIVE + HOUR);
+    const wd = mkDir('wd');
+    put(wd, early, Date.now());
     const r = await refreshStore(account(store), wd);
-    assert.equal(r.relation, 'known');
-    assert.ok(cred(store).equals(S), 'a later expiry does not put a known copy back');
-    assert.ok(cred(wd).equals(A));
-  });
-
-  it('held stays put on an extension restock and follows the activation restock', () => {
-    const store = mkDir('.claude-b', S);
-    const wd = mkDir('wd', A);
-    observeDirGrant(wd, A);
-    assert.ok(restockTokenOnly(store, wd));
-    assert.deepEqual([record(wd).h, record(wd).held, record(wd).by], [hash(S), hash(A), 'ext']);
-
-    const S2 = grant('rt-S2h');
-    const store2 = mkDir('.claude-b', S2);
-    recordGrantHistory(store2, A);
-    const wd2 = mkDir('wd', A);
-    observeDirGrant(wd2, A);
-    healAtActivation(account(store2), wd2, { selfHeal: true });
-    assert.ok(cred(wd2).equals(S2), 'a known copy is restocked at activation');
-    assert.deepEqual(
-      [record(wd2).h, record(wd2).held, record(wd2).by],
-      [hash(S2), hash(S2), 'ext']
-    );
-  });
-
-  it('activation heal leaves a known copy when selfHeal is off and an unknown grant always', () => {
-    const store = mkDir('.claude-b', S);
-    recordGrantHistory(store, A);
-    const wd = mkDir('wd', A);
-    healAtActivation(account(store), wd, { selfHeal: false });
-    assert.ok(cred(wd).equals(A));
-    const wd2 = mkDir('wd', L);
-    healAtActivation(account(store), wd2, { selfHeal: true });
-    assert.ok(cred(wd2).equals(L));
-    assert.deepEqual([record(wd2).h, record(wd2).held], [hash(L), hash(L)]);
-  });
-
-  it('no record: an unknown live grant is unrelated — store and dir unchanged', async () => {
-    const store = mkDir('.claude-b', S);
-    const wd = mkDir('wd', L);
-    const r = await refreshStore(account(store), wd);
-    assert.equal(r.relation, 'unrelated');
+    assert.equal(r.relation, 'fork');
     assert.ok(cred(store).equals(S));
-    assert.ok(cred(wd).equals(L));
-    assert.ok(!readGrantHistory(store).includes(hash(L)));
+    assert.equal(healVerdict(r.relation, true, mtime(wd), Date.now()).reason, 'burst');
+    fs.utimesSync(path.join(wd, '.credentials.json'), OLD_MTIME / 1000, OLD_MTIME / 1000);
+    assert.equal(healVerdict(r.relation, true, mtime(wd), Date.now()).verdict, 'restock');
+    assert.ok(restockTokenOnly(cred(store), wd, early));
+    assert.ok(cred(wd).equals(S));
   });
 
-  it('expired: an unknown grant past its expiry is unrelated even when held = the store grant', async () => {
+  it('upgrade day, no chain: a later unknown family written 5 s ago is adopted', async () => {
+    const s = F(10);
+    const store = mkDir('.claude-b', grant('rt-Su2', s));
+    assert.ok(!fs.existsSync(grantChainPath(store)));
+    const later = grant('rt-Lu2', F(15), LIVE - HOUR);
+    const wd = mkDir('wd');
+    put(wd, later, Date.now() - 5 * SEC);
+    const r = await refreshStore(account(store), wd);
+    assert.deepEqual([r.relation, r.wrote], ['sign-in', true]);
+    assert.ok(cred(store).equals(later));
+    assert.deepEqual([chainFile(store).current, chainFile(store).displaced], [F(15), [s]]);
+  });
+
+  it('legacy array: its hashes are read and current is null until the first pass', async () => {
+    const S = grant('rt-Sl', F(0));
     const store = mkDir('.claude-b', S);
+    const old = grant('rt-Ol', F(0), T - HOUR);
+    fs.writeFileSync(grantHistoryPath(store), JSON.stringify([hash(old), hash(S)]));
+    assert.deepEqual(readGrantChain(store), {
+      current: null,
+      displaced: [],
+      hashes: [hash(old), hash(S)],
+    });
+    assert.deepEqual(readGrantHistory(store), [hash(old), hash(S)]);
+    const wd = mkDir('wd', old);
+    assert.equal((await refreshStore(account(store), wd)).relation, 'known');
+    assert.equal(readGrantChain(store).current, F(0));
+  });
+
+  it('an old writer cannot erase the chain: an r1 array beside it leaves current intact', () => {
+    const S = grant('rt-So', F(0));
+    const store = mkDir('.claude-b', S);
+    observeStoreGrant(store, S);
+    const other = 'e'.repeat(64);
+    fs.writeFileSync(grantHistoryPath(store), JSON.stringify([other]));
+    const c = readGrantChain(store);
+    assert.equal(c.current, F(0));
+    assert.deepEqual(c.hashes, [hash(S), other]);
+  });
+
+  it('M-4 regression: current never moves back, and a window on the current family restores the store', async () => {
+    const x = F(20);
+    const L = grant('rt-Lr', x);
+    const store = signedInStore(grant('rt-Sr', x - 20 * HOUR), L);
+    const S1 = grant('rt-Sr1', x - 20 * HOUR); // an old-version window writes this back
+    put(store, S1);
+    const before = logged(/moved back to an earlier family/).length;
+    observeStoreGrant(store, S1);
+    observeStoreGrant(store, S1);
+    assert.equal(readGrantChain(store).current, x);
+    assert.equal(logged(/moved back to an earlier family/).length, before + 1, 'logged once');
+
+    const wl = mkDir('wd', L);
+    const r = await refreshStore(account(store), wl);
+    assert.deepEqual([r.relation, r.wrote], ['sign-in', true]);
+    assert.ok(cred(store).equals(L));
+    assert.equal(logged(/restored store of b@example\.com from its current family/).length, 1);
+
+    put(store, S1);
+    const S2 = grant('rt-Sr2', x - 20 * HOUR + SEC, LIVE + HOUR); // a refresh of S′
+    const ws = mkDir('wd', S2);
+    const r2 = await refreshStore(account(store), ws);
+    assert.deepEqual([r2.relation, r2.wrote], ['fork', false]);
+    assert.ok(cred(store).equals(S1));
+    assert.equal(readGrantChain(store).current, x);
+  });
+
+  it('terminal login into the store: the previous family is displaced and its copies are forks', async () => {
+    const s = F(0);
+    const S = grant('rt-St', s);
+    const store = mkDir('.claude-b', S);
+    const wd = mkDir('wd', S);
+    assert.equal((await refreshStore(account(store), wd)).relation, 'same');
+    const L = grant('rt-Lt', F(4));
+    put(store, L);
+    const r = await refreshStore(account(store), wd);
+    assert.equal(r.relation, 'fork');
+    assert.deepEqual([chainFile(store).current, chainFile(store).displaced], [F(4), [s]]);
+    assert.ok(cred(store).equals(L));
+  });
+
+  it('null anchor: legacy on the dir, the store or both — no adopt, no restock', async () => {
+    const cases = [
+      [grant('rt-Sn', F(0)), grant('rt-Dn', null, LIVE + HOUR)],
+      [grant('rt-Sn2', null), grant('rt-Dn2', F(5), LIVE + HOUR)],
+      [grant('rt-Sn3', null), grant('rt-Dn3', null, LIVE + HOUR)],
+    ];
+    for (const [storeTok, dirTok] of cases) {
+      const store = mkDir('.claude-b', storeTok);
+      const wd = mkDir('wd', dirTok);
+      const r = await refreshStore(account(store), wd);
+      assert.deepEqual([r.relation, r.wrote], ['legacy', false]);
+      healAtActivation(account(store), wd, { selfHeal: true });
+      assert.ok(cred(store).equals(storeTok));
+      assert.ok(cred(wd).equals(dirTok));
+    }
+    assert.equal(foreignAnchorConflict(home, null, 'b@example.com'), null);
+  });
+
+  it('known regardless of expiry, and an older refresh of the family, are restocked at activation', async () => {
+    const S = grant('rt-Sk', F(0));
+    const E = grant('rt-Ek', F(0), T - 10 * MIN);
+    const store = mkDir('.claude-b', E);
+    observeStoreGrant(store, E);
+    put(store, S);
     const wd = mkDir('wd', E);
-    writeRecord(wd, rec(hash(S), hash(S)));
-    const r = await refreshStore(account(store), wd);
-    assert.equal(r.relation, 'unrelated');
+    assert.equal((await refreshStore(account(store), wd)).relation, 'known');
+    healAtActivation(account(store), wd, { selfHeal: true });
+    assert.ok(cred(wd).equals(S));
+
+    const older = grant('rt-Ok', F(0), LIVE - HOUR);
+    const wd2 = mkDir('wd', older);
+    assert.equal((await refreshStore(account(store), wd2)).relation, 'known');
     assert.ok(cred(store).equals(S));
+    healAtActivation(account(store), wd2, { selfHeal: false });
+    assert.ok(cred(wd2).equals(older), 'selfHeal off leaves it');
+    healAtActivation(account(store), wd2, { selfHeal: true });
+    assert.ok(cred(wd2).equals(S));
   });
 
-  it('a continuation is adopted only once Claude Code moved the disk', async () => {
-    const store = mkDir('.claude-b', S);
+  it('store repair: an unparseable store takes a grant with an anchor and an expiry', async () => {
+    const store = mkDir('.claude-b', NOEXP);
+    const L = grant('rt-Lp', F(0));
     const wd = mkDir('wd', L);
-    writeRecord(wd, rec(hash(L), hash(S), 'ext'));
-    assert.equal((await refreshStore(account(store), wd)).relation, 'unrelated');
-    assert.ok(cred(store).equals(S));
+    const r = await refreshStore(account(store), wd);
+    assert.deepEqual([r.relation, r.wrote], ['sign-in', true]);
+    assert.ok(cred(store).equals(L));
   });
 
   it("adopts the store grant's own in-place refresh with a later expiry", async () => {
-    const store = mkDir('.claude-b', S);
+    const store = mkDir('.claude-b', grant('rt-Si', F(0)));
     const refreshed = Buffer.from(
       JSON.stringify({
-        claudeAiOauth: { accessToken: 'at-S2', refreshToken: 'rt-S', expiresAt: LIVE + MIN },
+        claudeAiOauth: {
+          accessToken: 'at-Si2',
+          refreshToken: 'rt-Si',
+          expiresAt: LIVE + MIN,
+          refreshTokenExpiresAt: F(0),
+        },
       })
     );
     const wd = mkDir('wd', refreshed);
@@ -414,38 +548,90 @@ describe('refreshStore, the dir record and the activation heal', () => {
     assert.ok(cred(store).equals(refreshed));
   });
 
-  it('observed sign-in: a grant after a token-less observation is adopted and the observation spent', async () => {
-    const store = mkDir('.claude-b', S);
-    const wd = mkDir('wd', A);
-    observeDirGrant(wd, A);
-    fs.rmSync(path.join(wd, '.credentials.json'));
-    noteTokenless(wd);
-    const at = signInObservedAt(wd);
-    assert.ok(at != null);
-    put(wd, L, at);
-    const r = await refreshStore(account(store), wd);
-    assert.equal(r.relation, 'continues');
-    assert.notEqual(record(wd).held, hash(S));
-    assert.ok(cred(store).equals(L));
-    assert.equal(signInObservedAt(wd), null);
+  it('P1-M6: activation does not restock a store grant another email also holds', () => {
+    const S = grant('rt-Sm6', F(0));
+    const old = grant('rt-Om6', F(0), LIVE - HOUR);
+    const store = mkDir('.claude-b', old);
+    observeStoreGrant(store, old);
+    put(store, S);
+    // Same refresh token, no anchor: only the hash tripwire can see it.
+    const x = foreignStore(grant('rt-Sm6', null));
+    try {
+      const wd = mkDir('wd', old);
+      healAtActivation(account(store), wd, { selfHeal: true });
+      assert.ok(cred(wd).equals(old));
+    } finally {
+      drop(x);
+    }
   });
 
-  it('an observation older than the grant file does not count', async () => {
-    const store = mkDir('.claude-b', S);
-    const wd = mkDir('wd', L);
-    noteTokenless(wd);
-    put(wd, L, signInObservedAt(wd) - 5_000);
-    assert.equal((await refreshStore(account(store), wd)).relation, 'unrelated');
-    assert.ok(cred(store).equals(S));
+  it("anchor tripwire inbound: a family in another email's chain or file is refused", async () => {
+    const s = F(0);
+    const mine = grant('rt-Sti', s);
+    const theirs = F(40);
+    const shapes = [
+      [grant('rt-Xc', F(41)), { current: theirs, displaced: [], hashes: [] }],
+      [grant('rt-Xd', F(41)), { current: F(42), displaced: [theirs], hashes: [] }],
+      [grant('rt-Xf', theirs + SEC), null],
+    ];
+    for (const [xTok, chain] of shapes) {
+      const x = foreignStore(xTok, chain);
+      try {
+        const store = mkDir('.claude-b', mine);
+        const wd = mkDir('wd', grant('rt-Win', theirs + 2 * SEC));
+        const r = await refreshStore(account(store), wd);
+        assert.deepEqual([r.relation, r.wrote], ['unrelated', false]);
+        assert.ok(cred(store).equals(mine));
+      } finally {
+        drop(x);
+      }
+    }
+    const store = mkDir('.claude-b', mine);
+    const wd = mkDir('wd', grant('rt-Win', theirs + 2 * SEC));
+    assert.equal((await refreshStore(account(store), wd)).relation, 'sign-in', 'adopted alone');
   });
 
-  it('a lock skip judges nothing, consumes nothing and leaves the record; the retry adopts', async () => {
+  it("anchor tripwire outbound: activation does not restock a store family another email's chain knows", () => {
+    const S = grant('rt-Sto', F(50));
+    const old = grant('rt-Oto', F(50), LIVE - HOUR);
+    const store = mkDir('.claude-b', old);
+    observeStoreGrant(store, old);
+    put(store, S);
+    const x = foreignStore(grant('rt-Xo', F(52)), {
+      current: F(52),
+      displaced: [F(50)],
+      hashes: [],
+    });
+    try {
+      const wd = mkDir('wd', old);
+      healAtActivation(account(store), wd, { selfHeal: true });
+      assert.ok(cred(wd).equals(old));
+    } finally {
+      drop(x);
+    }
+    const wd = mkDir('wd', old);
+    healAtActivation(account(store), wd, { selfHeal: true });
+    assert.ok(cred(wd).equals(S), 'restocked once the other store is gone');
+  });
+
+  it('byte-equal: observes the store grant once and returns same; a second pass rewrites nothing', async () => {
+    const S = grant('rt-Sb', F(0));
     const store = mkDir('.claude-b', S);
     const wd = mkDir('wd', S);
-    observeDirGrant(wd, S);
-    put(wd, L, Date.now());
-    noteTokenless(wd);
-    const before = fs.readFileSync(grantOriginPath(wd), 'utf8');
+    const r = await refreshStore(account(store), wd);
+    assert.deepEqual(r, { relation: 'same', wrote: false, deferred: false });
+    assert.deepEqual(chainFile(store), { v: 2, current: F(0), displaced: [], hashes: [hash(S)] });
+    fs.utimesSync(grantChainPath(store), OLD_MTIME / 1000, OLD_MTIME / 1000);
+    const pinned = fs.statSync(grantChainPath(store)).mtimeMs;
+    await refreshStore(account(store), wd);
+    assert.equal(fs.statSync(grantChainPath(store)).mtimeMs, pinned);
+    assert.ok(!fs.existsSync(path.join(wd, '.grant-chain.json')), 'no chain in a window dir');
+  });
+
+  it('a lock skip judges nothing and writes nothing; the retry adopts', async () => {
+    const store = mkDir('.claude-b', grant('rt-Sls', F(0)));
+    const L = grant('rt-Lls', F(5));
+    const wd = mkDir('wd', L);
     const lock = path.join(store, '.credentials.json.lock');
     fs.mkdirSync(lock);
     fs.writeFileSync(
@@ -454,90 +640,103 @@ describe('refreshStore, the dir record and the activation heal', () => {
     );
     const r = await refreshStore(account(store), wd);
     assert.deepEqual(r, { relation: null, wrote: false, deferred: true });
-    assert.ok(signInObservedAt(wd) != null, 'the observation survives the skip');
-    assert.equal(fs.readFileSync(grantOriginPath(wd), 'utf8'), before);
-    assert.ok(cred(store).equals(S));
+    assert.ok(!fs.existsSync(grantChainPath(store)), 'no chain written');
+    assert.ok(cred(store).equals(grant('rt-Sls', F(0))));
     fs.rmSync(lock, { recursive: true, force: true });
     const again = await refreshStore(account(store), wd);
-    assert.equal(again.relation, 'continues');
+    assert.equal(again.relation, 'sign-in');
     assert.ok(cred(store).equals(L));
   });
 
-  it('trusted: the fresh-grant capture adopts with no record and no gap', async () => {
-    const store = mkDir('.claude-b', S);
-    const wd = mkDir('wd', L);
+  it('trusted is gone: an options argument adopts nothing more than none', async () => {
+    const s = F(0);
+    const store = signedInStore(grant('rt-Str', s), grant('rt-Ltr', F(5)));
+    const wd = mkDir('wd', grant('rt-Ftr', s + SEC, LIVE + HOUR));
     const r = await refreshStore(account(store), wd, { trusted: true });
-    assert.deepEqual([r.relation, r.wrote], ['continues', true]);
-    assert.ok(cred(store).equals(L));
+    assert.deepEqual([r.relation, r.wrote], ['fork', false]);
+    assert.ok(cred(store).equals(grant('rt-Ltr', F(5))));
   });
 
-  it('store repair: an unparseable store takes a live incoming grant', async () => {
-    const store = mkDir('.claude-b', NOEXP);
-    const wd = mkDir('wd', L);
-    assert.equal((await refreshStore(account(store), wd)).relation, 'continues');
-    assert.ok(cred(store).equals(L));
-  });
-
-  it('default dir: no record function writes into ~/.claude', () => {
-    const def = path.join(home, '.claude');
-    fs.mkdirSync(def, { recursive: true });
-    observeDirGrant(def, S);
-    recordExtWrite(def, S, { processReads: true });
-    assert.ok(!fs.existsSync(grantOriginPath(def)));
-    assert.equal(readDirRecord(def), null);
-  });
-
-  it('the record holds sha256 hashes, a source word and a time only', () => {
-    const wd = mkDir('wd', S);
-    observeDirGrant(wd, S);
-    recordExtWrite(wd, L, { processReads: false });
-    const raw = fs.readFileSync(grantOriginPath(wd), 'utf8');
+  it('the chain holds sha256 hashes and millisecond anchors only, mode 0o600', () => {
+    const store = mkDir('.claude-b', grant('rt-Sc', F(0)));
+    observeStoreGrant(store, grant('rt-Sc', F(0)));
+    observeStoreGrant(store, grant('rt-Lc', F(3)));
+    const raw = fs.readFileSync(grantChainPath(store), 'utf8');
     assert.ok(!raw.includes('rt-') && !raw.includes('at-'));
     const got = JSON.parse(raw);
-    assert.deepEqual(Object.keys(got).sort(), ['at', 'by', 'h', 'held']);
-    assert.ok(/^[0-9a-f]{64}$/.test(got.h) && /^[0-9a-f]{64}$/.test(got.held));
+    assert.deepEqual(Object.keys(got).sort(), ['current', 'displaced', 'hashes', 'v']);
+    assert.ok(got.hashes.every((h) => /^[0-9a-f]{64}$/.test(h)));
+    assert.ok([got.current, ...got.displaced].every((a) => Number.isInteger(a)));
+    assert.equal(fs.statSync(grantChainPath(store)).mode & 0o777, 0o600);
   });
 
-  it('materialize guard: a forced bind leaves a live grant the store never held', () => {
-    const store = mkDir('.claude-b', S);
+  it('caps: 4100 hashes keep the newest 4096; 300 forward moves keep 256 displaced', () => {
+    const store = mkDir('.claude-b', grant('rt-Scap', F(0)));
+    const seeded = Array.from({ length: 4099 }, (_, i) =>
+      crypto.createHash('sha256').update(`seed-${i}`).digest('hex')
+    );
+    fs.writeFileSync(
+      grantChainPath(store),
+      JSON.stringify({ v: 2, current: null, displaced: [], hashes: seeded })
+    );
+    const last = grant('rt-Last', null);
+    observeStoreGrant(store, last);
+    const got = chainFile(store);
+    assert.equal(got.hashes.length, 4096);
+    assert.deepEqual(got.hashes, [...seeded, hash(last)].slice(-4096));
+    assert.equal(fs.statSync(grantChainPath(store)).mode & 0o777, 0o600);
+
+    const store2 = mkDir('.claude-b', grant('rt-Scap2', F(0)));
+    for (let k = 0; k <= 300; k++) observeStoreGrant(store2, grant(`rt-m${k}`, F(k)));
+    const c = chainFile(store2);
+    assert.equal(c.current, F(300));
+    assert.equal(c.displaced.length, 256);
+    assert.deepEqual(
+      c.displaced,
+      Array.from({ length: 256 }, (_, i) => F(300 - 256 + i))
+    );
+  });
+
+  it('reads a missing or unparseable chain as empty', () => {
+    const store = mkDir('.claude-b', grant('rt-Se', F(0)));
+    assert.deepEqual(readGrantChain(store), { current: null, displaced: [], hashes: [] });
+    fs.writeFileSync(grantChainPath(store), '{not json');
+    fs.writeFileSync(grantHistoryPath(store), '{not json');
+    assert.deepEqual(readGrantChain(store), { current: null, displaced: [], hashes: [] });
+  });
+
+  it('materialize guard: a forced bind leaves a later family the store never replaced', () => {
+    const store = mkDir('.claude-b', grant('rt-Sg', F(0)));
+    const L = grant('rt-Lg', F(5));
     const wd = mkDir('wd', L);
     assert.equal(materialize(account(store), wd, true), false);
     assert.ok(cred(wd).equals(L));
   });
 
-  it('materialize: a forced bind over a known copy writes, and moves h only', () => {
+  it('P1-C2: the guard leaves an expired later-family grant and overwrites a known expired copy', () => {
+    const S = grant('rt-Sc2', F(0));
     const store = mkDir('.claude-b', S);
-    recordGrantHistory(store, A);
-    const wd = mkDir('wd', A);
-    observeDirGrant(wd, A);
+    const expiredLater = grant('rt-Lc2', F(5), T - HOUR);
+    const wd = mkDir('wd', expiredLater);
+    assert.equal(materialize(account(store), wd, true), false);
+    assert.ok(cred(wd).equals(expiredLater));
+
+    const E = grant('rt-Ec2', F(0), T - HOUR);
+    observeStoreGrant(store, E);
+    const wd2 = mkDir('wd', E);
+    assert.equal(materialize(account(store), wd2, true), true);
+    assert.ok(cred(wd2).equals(S));
+  });
+
+  it('materialize: a forced bind over a fork writes', () => {
+    const L = grant('rt-Lmf', F(5));
+    const store = signedInStore(grant('rt-Smf', F(0)), L);
+    const wd = mkDir('wd', grant('rt-Fmf', F(0) + SEC, LIVE + HOUR));
     assert.equal(materialize(account(store), wd, true), true);
-    assert.ok(cred(wd).equals(S));
-    assert.deepEqual([record(wd).h, record(wd).held, record(wd).by], [hash(S), hash(A), 'ext']);
+    assert.ok(cred(wd).equals(L));
   });
 
-  it('(vi) the history holds sha256 hashes only, capped at 32', () => {
-    const store = mkDir('.claude-b', S);
-    const grants = Array.from({ length: 40 }, (_, i) => grant(`rt-${i}`, T + i));
-    for (const g of grants) recordGrantHistory(store, g);
-    recordGrantHistory(store, grants[39]);
-    const raw = fs.readFileSync(grantHistoryPath(store), 'utf8');
-    assert.ok(!raw.includes('rt-'), 'no refresh token in the history file');
-    assert.ok(!raw.includes('at-'), 'no access token in the history file');
-    const history = JSON.parse(raw);
-    assert.equal(history.length, 32);
-    assert.ok(history.every((h) => /^[0-9a-f]{64}$/.test(h)));
-    assert.deepEqual(history, grants.slice(-32).map(hash));
-    assert.equal(fs.statSync(grantHistoryPath(store)).mode & 0o777, 0o600);
-  });
-
-  it('reads a missing or unparseable history as empty', () => {
-    const store = mkDir('.claude-b', S);
-    assert.deepEqual(readGrantHistory(store), []);
-    fs.writeFileSync(grantHistoryPath(store), '{not json');
-    assert.deepEqual(readGrantHistory(store), []);
-  });
-
-  describe('R1-M6: the poller rotating a store token', () => {
+  describe('the poller rotating a store token', () => {
     let realFetch;
     before(() => {
       realFetch = globalThis.fetch;
@@ -560,29 +759,73 @@ describe('refreshStore, the dir record and the activation heal', () => {
       globalThis.fetch = realFetch;
     });
 
-    it('records the displaced store grant, so a window copy of it restocks', async () => {
+    const rotate = async (store, email) => {
       __ageInProcessStateForTests(3_600_000);
-      const stale = grant('rt-OLDP', T - MIN);
+      await fetchUsageCoordinated({ dir: store, email, isStore: true }, { forceNetwork: true });
+    };
+
+    it('keeps the anchor byte-equal and records the displaced grant, so a window copy restocks', async () => {
+      const c = F(0);
+      const stale = grant('rt-OLDP', c, T - MIN);
       const store = mkDir('.claude-b', stale);
-      await fetchUsageCoordinated(
-        { dir: store, email: 'm6a@example.com', isStore: true },
-        { forceNetwork: true }
-      );
+      await rotate(store, 'm6a@example.com');
       const now = cred(store);
       assert.ok(!now.equals(stale), 'the poller rotated the store token');
-      assert.ok(readGrantHistory(store).includes(hash(stale)));
-      assert.ok(readGrantHistory(store).includes(hash(now)));
+      assert.match(
+        now.toString(),
+        new RegExp(`"refreshTokenExpiresAt": ?${c}[,\\s}]`),
+        'anchor byte-equal'
+      );
+      assert.equal(anchorOf(now), c);
+      const chain = readGrantChain(store);
+      assert.ok(chain.hashes.includes(hash(stale)) && chain.hashes.includes(hash(now)));
+      assert.deepEqual([chain.current, chain.displaced], [c, []]);
       const wd = mkDir('wd', stale);
       const r = await refreshStore(account(store), wd);
       assert.equal(r.relation, 'known');
       assert.equal(healVerdict(r.relation, true, OLD_MTIME, Date.now()).verdict, 'restock');
     });
 
-    it('records nothing for a window dir the poller refreshes', async () => {
+    it('poller drift: a Claude Code refresh moving the anchor 3 s displaces nothing', async () => {
+      const c = F(1);
+      const stale = grant('rt-OLDD', c, T - MIN);
+      const store = mkDir('.claude-b', stale);
+      await rotate(store, 'm6c@example.com');
+      const drifted = grant('rt-CCd', c + 3 * SEC, LIVE + HOUR);
+      put(store, drifted);
+      observeStoreGrant(store, drifted);
+      assert.deepEqual([chainFile(store).current, chainFile(store).displaced], [c, []]);
+      const wd = mkDir('wd', stale);
+      assert.equal((await refreshStore(account(store), wd)).relation, 'known');
+      const next = grant('rt-CCd2', c + 3 * SEC, LIVE + 2 * HOUR);
+      const wd2 = mkDir('wd', next);
+      const r = await refreshStore(account(store), wd2);
+      assert.deepEqual([r.relation, r.wrote], ['continuation', true]);
+      assert.ok(cred(store).equals(next));
+    });
+
+    it('N1: a window restocked after the rotation continues the store on its next refresh', async () => {
+      const c = F(2);
+      const C = grant('rt-OLDN', c, T - MIN);
+      const store = mkDir('.claude-b', C);
+      const wb = mkDir('wd', C);
+      await rotate(store, 'm6d@example.com');
+      const r = await refreshStore(account(store), wb);
+      assert.equal(r.relation, 'known');
+      assert.ok(restockTokenOnly(cred(store), wb, C));
+      const C2b = grant('rt-C2b', c, T + 600 * MIN);
+      put(wb, C2b);
+      const r2 = await refreshStore(account(store), wb);
+      assert.deepEqual([r2.relation, r2.wrote], ['continuation', true]);
+      assert.ok(cred(store).equals(C2b));
+    });
+
+    it('writes no chain into a window dir the poller refreshes', async () => {
       __ageInProcessStateForTests(3_600_000);
-      const wd = mkDir('wd', grant('rt-OLDW', T - MIN));
+      const wd = mkDir('wd', grant('rt-OLDW', F(3), T - MIN));
       await fetchUsageCoordinated({ dir: wd, email: 'm6b@example.com' }, { forceNetwork: true });
-      assert.ok(!cred(wd).equals(grant('rt-OLDW', T - MIN)), 'the poller rotated the window token');
+      assert.ok(!cred(wd).equals(grant('rt-OLDW', F(3), T - MIN)), 'the poller rotated it');
+      assert.ok(!fs.existsSync(grantChainPath(wd)));
       assert.ok(!fs.existsSync(grantHistoryPath(wd)));
     });
   });
