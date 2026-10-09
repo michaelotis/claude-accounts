@@ -212,6 +212,101 @@ export function isStaleAgainstStore(candidate: Buffer, reference: Buffer): boole
   return c != null && r != null && r > c;
 }
 
+/** How many grant hashes a store remembers; older ones fall off the front. */
+const GRANT_HISTORY_MAX = 32;
+
+/** A credential file written this recently may be a sign-in still in progress. */
+const LOGIN_BURST_MS = 10_000;
+
+/**
+ * How far past its file's write time a grant must expire to count as just issued.
+ * A sign-in or a refresh writes the file at mint time, so its expiry sits close to
+ * the 8 h token lifetime after the write; an old copy re-seeded into a window
+ * from somewhere it was saved earlier is written long after it was minted.
+ */
+export const MINTED_WINDOW_MS = 7 * 60 * 60 * 1000;
+
+/** True when `buf` was written at the moment its grant was minted. */
+export function mintedAtWrite(buf: Buffer, mtimeMs: number): boolean {
+  const exp = tokenExpiry(buf);
+  return exp != null && exp - mtimeMs >= MINTED_WINDOW_MS;
+}
+
+/** The store's record of which grants it has held, as hashes. */
+export function grantHistoryPath(storeDir: string): string {
+  return path.join(storeDir, '.grant-history.json');
+}
+
+/** sha256 of a grant's fingerprint — what the history stores, never the secret. */
+function grantHash(buf: Buffer): string {
+  return crypto.createHash('sha256').update(credentialFingerprint(buf)).digest('hex');
+}
+
+/** The hashes of every grant this store has held (newest last); [] when unknown. */
+export function readGrantHistory(storeDir: string): string[] {
+  try {
+    const d = JSON.parse(fs.readFileSync(grantHistoryPath(storeDir), 'utf-8')) as unknown;
+    return Array.isArray(d) ? d.filter((h): h is string => typeof h === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Remembers that the store has held `buf`'s grant. Only the hash is written: the
+ * history must be safe to leave lying around, so no token material goes in it.
+ * Writes nothing when the grant is already recorded.
+ */
+export function recordGrantHistory(storeDir: string, buf: Buffer): void {
+  try {
+    const hash = grantHash(buf);
+    const history = readGrantHistory(storeDir);
+    if (history.includes(hash)) return;
+    history.push(hash);
+    writeFileAtomic(grantHistoryPath(storeDir), JSON.stringify(history.slice(-GRANT_HISTORY_MAX)), {
+      mode: 0o600,
+    });
+  } catch (err) {
+    log(`workdir: could not record grant history in ${storeDir}: ${(err as Error).message}`);
+  }
+}
+
+export type HealVerdict = 'adopt' | 'restock' | 'keep';
+
+/**
+ * What reconcile does with a window grant that differs from its store's.
+ *
+ * A store grant that refreshes and reads usage can still be revoked at the API
+ * (2026-10-09), so a later expiry proves nothing about which grant works. The
+ * only grant safe to overwrite is one the store has held before — a lagging copy
+ * of a lineage the store has since rotated past. A grant the store has never
+ * held is adopted into the store only when its file was written at mint time (a
+ * sign-in or an external rotation); one that was not may be a dead copy the
+ * history has forgotten or never saw, so it is neither adopted nor restocked.
+ * A file written in the last few seconds is left alone either way: a sign-in is
+ * a burst of writes, and judging its middle would undo it.
+ */
+export function healVerdict(
+  dirTok: Buffer,
+  storeTok: Buffer,
+  history: string[],
+  dirMtimeMs: number,
+  nowMs: number,
+  selfHeal: boolean
+): HealVerdict {
+  if (sameCredential(dirTok, storeTok)) return 'keep';
+  const dirExp = tokenExpiry(dirTok);
+  if (dirExp == null) return 'keep';
+  if (!history.includes(grantHash(dirTok))) {
+    return mintedAtWrite(dirTok, dirMtimeMs) ? 'adopt' : 'keep';
+  }
+  if (!selfHeal) return 'keep';
+  if (nowMs - dirMtimeMs < LOGIN_BURST_MS) return 'keep';
+  const storeExp = tokenExpiry(storeTok);
+  if (storeExp != null && storeExp > dirExp) return 'restock';
+  return 'keep';
+}
+
 /**
  * Copies ONLY the credential file from an account store into a working dir —
  * never the store's frozen `.claude.json`, which would revert the window's live
@@ -351,23 +446,44 @@ export async function refreshStore(account: Account, workingDir: string): Promis
       () => {
         if (fs.existsSync(dst)) {
           const cur = fs.readFileSync(dst);
+          // The store's grant goes into its history before anything replaces it,
+          // so a copy of it left in another dir is recognised later as one the
+          // store has moved past.
+          recordGrantHistory(account.dir, cur);
           if (cur.equals(incoming)) return;
-          // Never regress the store — same lineage or not. A grant is adopted only
-          // when it is VALID (parseable expiry) AND either the store's current
-          // grant is unparseable or the incoming is strictly newer. A same-lineage
-          // in-place access refresh has a newer expiry, so it still writes through;
-          // an OLDER same-lineage copy (another window's lagging duplicate) is
-          // refused — with every window now watching the store (0.9.9), a
-          // write-through of older copies would let two idle windows re-trigger
-          // each other and flap the store indefinitely. Refusing keeps the store
-          // quiescent (a refused write changes nothing, so no watcher re-fires)
-          // while a valid grant can still repair an unparseable store.
+          // Never regress the store. A grant is adopted only when it is VALID
+          // (parseable expiry) AND one of: the store's grant is unparseable; the
+          // incoming is a grant the store has never held and was written at mint
+          // time (a sign-in or an external rotation — adopted whatever its expiry,
+          // because a later store expiry does not prove the store grant still
+          // works; an unknown grant written long after it was minted may be a
+          // dead copy the history no longer remembers); or it is the store's own
+          // grant refreshed in place to a later expiry. A grant the store HAS held
+          // and moved past is refused even when its expiry is later: after a
+          // sign-in replaces a revoked grant, other dirs (windows, ~/.claude) still
+          // hold the revoked one, and letting expiry win would put it straight
+          // back. Refusing also keeps the store quiescent — with every window
+          // watching it (0.9.9), write-through of older copies would let two idle
+          // windows re-trigger each other and flap the store indefinitely.
           const inExp = tokenExpiry(incoming);
           const curExp = tokenExpiry(cur);
-          const adopt = inExp != null && (curExp == null || inExp > curExp);
+          const known = readGrantHistory(account.dir).includes(grantHash(incoming));
+          let minted = false;
+          if (!known) {
+            try {
+              minted = mintedAtWrite(incoming, fs.statSync(src).mtimeMs);
+            } catch {
+              /* unreadable mtime — not provably minted */
+            }
+          }
+          const adopt =
+            inExp != null &&
+            (curExp == null || minted || (sameCredential(incoming, cur) && inExp > curExp));
           if (!adopt) {
             log(
-              `workdir: kept store of ${account.email ?? account.name} — incoming grant is not confirmably newer`
+              known
+                ? `workdir: ${account.email ?? account.name}: incoming grant is a known older copy — kept store`
+                : `workdir: ${account.email ?? account.name}: incoming grant is unknown and not freshly minted — kept store`
             );
             return;
           }
@@ -383,6 +499,7 @@ export async function refreshStore(account: Account, workingDir: string): Promis
         fs.mkdirSync(account.dir, { recursive: true, mode: 0o700 });
         // Unique-temp atomic write: a half-written store is worse than a stale one.
         writeFileAtomic(dst, incoming, { mode: 0o600 });
+        recordGrantHistory(account.dir, incoming);
         log(`workdir: refreshed store of ${account.email ?? account.name}`);
       },
       { capMs: 3_000, skipIfUnacquired: true }

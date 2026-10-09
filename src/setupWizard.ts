@@ -26,7 +26,9 @@ import {
   linkUserAssets,
   foreignTokenConflict,
   sameCredential,
-  isStaleAgainstStore,
+  healVerdict,
+  readGrantHistory,
+  type HealVerdict,
 } from './workdir';
 import { log } from './log';
 import { probeTurnForWindow, type TurnProbe } from './turnWatcher';
@@ -112,6 +114,13 @@ export class SetupWizard {
    * grant in memory until its next restart, and we never reload for it.
    */
   onStaleRestock?: (email?: string) => void;
+
+  /**
+   * The `claudeAccounts.selfHeal` setting. Off stops reconcile from ever
+   * overwriting a window's credential file; the store is still kept in step.
+   * Injected by the extension so the wizard needs no vscode config to test.
+   */
+  selfHealEnabled: () => boolean = () => true;
 
   /**
    * Is a turn running in this window? One look at this window's own transcripts,
@@ -572,7 +581,25 @@ export class SetupWizard {
       // fresh, exactly as before 0.9.9.
       await refreshStore(account, dir);
       const storeTok = this.readToken(account.dir);
-      if (ndTok && storeTok && isStaleAgainstStore(ndTok, storeTok)) {
+      let verdict: HealVerdict | undefined;
+      if (ndTok && storeTok) {
+        let mtimeMs = 0;
+        try {
+          mtimeMs = fs.statSync(path.join(dir, '.credentials.json')).mtimeMs;
+        } catch {
+          /* unreadable — treat as old */
+        }
+        verdict = healVerdict(
+          ndTok,
+          storeTok,
+          readGrantHistory(account.dir),
+          mtimeMs,
+          Date.now(),
+          this.selfHealEnabled()
+        );
+        log(`reconcile: heal verdict=${verdict} for ${email}`);
+      }
+      if (ndTok && storeTok && verdict === 'restock') {
         // Defence in depth against the dual-home blind spot: never pull a store
         // grant that also lives in ANOTHER account's store (a contaminated store
         // must not spread through the heal path).
@@ -590,7 +617,14 @@ export class SetupWizard {
         } else {
           log(`reconcile: dir grant is stale vs store and restock was not applied`);
         }
-      } else {
+      } else if (
+        verdict === undefined ||
+        verdict === 'adopt' ||
+        (ndTok && storeTok && sameCredential(ndTok, storeTok))
+      ) {
+        // A kept grant that differs from the store is a known older copy (or a
+        // sign-in still being written): mirroring it could push a superseded
+        // grant over ~/.claude.
         await mirrorToDefault(dir);
       }
     }

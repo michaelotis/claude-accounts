@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.9.23
+
+### Fixed
+- **A sign-in from the panel was undone within a second when the account's stored
+  token had been revoked.** Self-heal keeps windows that share an account on the
+  same token: when one window rotates it, the others are restocked from the
+  account store. It decided which token to keep by expiry alone, and a later
+  expiry says nothing about whether a token still works. A store token can be
+  revoked by Anthropic while it still refreshes and still reads usage. Then every
+  `/login` in a panel that came out with an earlier expiry was compared with it,
+  lost, and overwritten with the revoked token, and the window was signed out
+  again before it had made a call. A sign-in from a plain terminal stuck only
+  when its expiry happened to be later. The rule is now about history, not
+  expiry. Each account store keeps a short list of the grants it has held,
+  stored as hashes: no token is written to it. A window is restocked only when
+  its grant is one of those, an older copy the store has since moved past.
+  A grant the store has never held is carried into the store only when it was
+  just issued, whether its expiry is earlier than the store's or not. A sign-in
+  or a refresh writes its file at the moment the token is minted, with close to
+  the full 8 hours left; an unknown grant written with much less left was copied
+  in from somewhere else, so it is left alone and the store keeps its own. Once a
+  sign-in has replaced a store grant, the replaced grant is never taken back,
+  even from a window or `~/.claude` that still holds it with a later expiry.
+  And a credential file written in the last 10 seconds is never overwritten,
+  since a sign-in is several writes in a row. The new `claudeAccounts.selfHeal`
+  setting (on by default) turns the restock off. The store is still kept in
+  step, but no window credential file is ever overwritten. Nothing else about
+  the heal moved: it is still the file only, with no reload, no killed process
+  and no popup, and the cross-account tripwire still guards both directions.
+
 ## 0.9.22
 
 ### Changed

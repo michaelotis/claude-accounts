@@ -124,6 +124,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const registry = new AccountRegistry(context);
   const binding = new WindowBinding(context);
   const wizard = new SetupWizard(registry, binding, context);
+  wizard.selfHealEnabled = () =>
+    vscode.workspace.getConfiguration('claudeAccounts').get<boolean>('selfHeal', true);
   // 1 min poll — matches the (disk-shared, cross-window-deduped) usage cache TTL,
   // so the meter stays responsive without extra API pressure. A real 429 backs off.
   const usage = new UsageMonitor(60_000);

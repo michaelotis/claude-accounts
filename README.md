@@ -205,6 +205,10 @@ Thresholds: `sessionThreshold` / `weeklyThreshold` / `fableThreshold` (default 9
 
 Legacy `primaryEmail` / `secondaryEmail` still seed `accountOrder` if that list is empty.
 
+### Self-heal (`claudeAccounts.selfHeal`)
+
+When another window rotates an account's token, a window still holding the older copy has its credential file quietly restocked from the account store (file only, no reload). Only a copy the store has held before is restocked; a sign-in the store has never seen is carried into the store instead, and a credential file written in the last 10 seconds is left alone. Set `claudeAccounts.selfHeal` to `false` to stop the restock entirely; the store is still kept in step. If an account's stored sign-in has been revoked and a sign-in from the panel does not take, sign in from a plain terminal into the account's store: `CLAUDE_CONFIG_DIR=~/.claude-<name> claude`, then `/login`.
+
 ## Reading usage from a script (`scripts/claude-usage`)
 
 The extension writes what it collects to a shared cache file, and each open window

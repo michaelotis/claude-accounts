@@ -52,6 +52,7 @@ const {
   restockTokenOnly,
   tokenExpiry,
   isStaleAgainstStore,
+  recordGrantHistory,
 } = bundle('../src/workdir.ts', 'workdir.bundle.cjs');
 const { snapshotAccount } = bundle('../src/capture.ts', 'capture.bundle.cjs');
 
@@ -441,7 +442,9 @@ describe('refreshStore newest-wins (self-heal: never regress the store)', () => 
     await withHomeAsync(async (home, mk) => {
       // Store already holds the freshly-rotated grant; a second window still carries
       // the old copy. Its refreshStore must not drag the store backwards (the flap).
+      // The store held the old copy before it rotated, so its history knows it.
       const store = mk('.claude-b', 'b@example.com', GRANT_NEW);
+      recordGrantHistory(store, Buffer.from(GRANT_OLD));
       const wd = mk('wd', 'b@example.com', GRANT_OLD);
       await refreshStore({ name: 'b', dir: store, email: 'b@example.com' }, wd);
       assert.equal(
@@ -454,10 +457,18 @@ describe('refreshStore newest-wins (self-heal: never regress the store)', () => 
 
   it('DOES adopt a strictly-newer grant from the window (the one that refreshed)', async () => {
     await withHomeAsync(async (home, mk) => {
+      // A refresh writes its file at mint time, with the full 8 h lifetime left.
+      const minted = JSON.stringify({
+        claudeAiOauth: {
+          accessToken: 'AC2',
+          refreshToken: 'ROT_2',
+          expiresAt: Date.now() + 8 * 3_600_000,
+        },
+      });
       const store = mk('.claude-b', 'b@example.com', GRANT_OLD);
-      const wd = mk('wd', 'b@example.com', GRANT_NEW);
+      const wd = mk('wd', 'b@example.com', minted);
       await refreshStore({ name: 'b', dir: store, email: 'b@example.com' }, wd);
-      assert.equal(fs.readFileSync(path.join(store, '.credentials.json'), 'utf8'), GRANT_NEW);
+      assert.equal(fs.readFileSync(path.join(store, '.credentials.json'), 'utf8'), minted);
     });
   });
 
