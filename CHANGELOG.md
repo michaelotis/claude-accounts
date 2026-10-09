@@ -23,8 +23,10 @@
   family date is left alone. Each account store keeps a small list of family
   dates and grant hashes in its own file; no token is written to it.
   `~/.claude` follows the same rule, including after a terminal login there. A
-  restock still waits until a credential file has gone 10 seconds without a
-  write, since a sign-in is several writes in a row. The cross-account tripwire
+  restock made by the periodic check still waits until a credential file has
+  gone 10 seconds without a write, since a sign-in is several writes in a row;
+  the restock made when a window starts runs before Claude Code reads the
+  file. The cross-account tripwire
   now also refuses a grant whose family belongs to another saved account, and a
   window whose identity drifted onto a grant of its own account's family is
   left as it is and logged rather than saved under the other name. The new
@@ -39,10 +41,12 @@
   with no reload, no killed process and no popup.
 
   **Reload every window after updating:** a window still running the previous
-  version can write an earlier family back into an account store; the new
-  version does not record that as the store's current family and a window on
-  the later family puts it back at its next check, but until every window runs
-  the new version the store can change hands between checks.
+  version can write an earlier family back into an account store. The new
+  version does not record that as the store's current family and leaves such a
+  store alone: no window is restocked from it and nothing is carried into it
+  until a sign-in from any window, which puts it back on a current family.
+  Until every window runs the new version the store can change hands between
+  checks.
 
 ## 0.9.22
 
