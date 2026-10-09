@@ -5,7 +5,6 @@ import * as path from 'path';
 import { accountFingerprint } from './accounts';
 import { WindowBinding } from './binding';
 import { defaultSourceDir } from './capture';
-import { noteTokenless } from './workdir';
 
 /**
  * Files whose account-state changes should wake the watcher. Always includes
@@ -99,18 +98,6 @@ export class AccountWatcher implements vscode.Disposable {
     return accountFingerprint(this.dir, this.storeCredsFile);
   }
 
-  /**
-   * A fingerprint read from inside schedule(). An absent token file (creds field
-   * '', never '?') is noted as a sign-in gap even when the state is latched
-   * while a reconcile is in flight, since that reconcile may have seen the old
-   * grant.
-   */
-  private observedFingerprint(): string {
-    const fp = this.fingerprint();
-    if (fp.split('|')[2] === '') noteTokenless(this.dir);
-    return fp;
-  }
-
   private schedule(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = setTimeout(() => {
@@ -118,7 +105,7 @@ export class AccountWatcher implements vscode.Disposable {
       // during a turn — only fire when the ACCOUNT state (identity email or
       // credential bytes) actually changed, or every write cascades into a
       // reconcile + usage refresh + policy write.
-      const fp = this.observedFingerprint();
+      const fp = this.fingerprint();
       if (fp === this.lastFingerprint) return;
       this.lastFingerprint = fp;
       // A synchronous throw would escape the timer callback before Promise.resolve
@@ -133,7 +120,7 @@ export class AccountWatcher implements vscode.Disposable {
         // Latch what the handler LEFT on disk, not what triggered it: reconcile may
         // have repaired a drifted identity in place, and latching the pre-repair
         // value would make a repeat of the same bad write look like "no change".
-        this.lastFingerprint = this.observedFingerprint();
+        this.lastFingerprint = this.fingerprint();
       });
     }, 400);
   }
