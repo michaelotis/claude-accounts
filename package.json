@@ -190,7 +190,7 @@
         "claudeAccounts.selfHeal": {
           "type": "boolean",
           "default": true,
-          "description": "Restock a window whose grant is a known older copy of its account store with the store's grant (file only, no reload). Off = the store is still kept in step, but no window credential file is ever overwritten."
+          "description": "Restock a window whose credential file holds a copy its account store has moved past (file only, no reload). Off: the window keeps whatever it holds, and a sign-in there reaches the store only when it was seen in progress or the window still held the store's current grant. Switching accounts and saving a sign-in still write the window's file."
         }
       }
     }

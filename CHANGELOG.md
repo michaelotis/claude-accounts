@@ -12,23 +12,31 @@
   `/login` in a panel that came out with an earlier expiry was compared with it,
   lost, and overwritten with the revoked token, and the window was signed out
   again before it had made a call. A sign-in from a plain terminal stuck only
-  when its expiry happened to be later. The rule is now about history, not
-  expiry. Each account store keeps a short list of the grants it has held,
-  stored as hashes: no token is written to it. A window is restocked only when
-  its grant is one of those, an older copy the store has since moved past.
-  A grant the store has never held is carried into the store only when it was
-  just issued, whether its expiry is earlier than the store's or not. A sign-in
-  or a refresh writes its file at the moment the token is minted, with close to
-  the full 8 hours left; an unknown grant written with much less left was copied
-  in from somewhere else, so it is left alone and the store keeps its own. Once a
-  sign-in has replaced a store grant, the replaced grant is never taken back,
-  even from a window or `~/.claude` that still holds it with a later expiry.
-  And a credential file written in the last 10 seconds is never overwritten,
-  since a sign-in is several writes in a row. The new `claudeAccounts.selfHeal`
-  setting (on by default) turns the restock off. The store is still kept in
-  step, but no window credential file is ever overwritten. Nothing else about
-  the heal moved: it is still the file only, with no reload, no killed process
-  and no popup, and the cross-account tripwire still guards both directions.
+  when its expiry happened to be later. The rule is now about which grant the
+  window's Claude Code process held, not about expiry or when a file was
+  written. Each account store keeps a short list of the grants it has held,
+  stored as hashes. A window is restocked only when its grant is one of those,
+  a copy the store has since moved past, whatever either expiry says. A grant
+  the store has never held is carried into the store in three cases: the
+  window's process held the store's current grant and refreshed it or signed in
+  over it, the sign-in was seen in progress (the window's token went missing and
+  then a new one appeared), or it is a fresh sign-in as another account.
+  Otherwise the window keeps its grant, the store keeps its own, and nothing the
+  extension does replaces the window's: sign in there again, or switch to
+  another account and back. To tell these apart, each window dir keeps a small
+  record of two hashes and a word for who last wrote the file; no token is
+  written to it. `~/.claude` follows the same rule against the store's history,
+  including after a terminal login there: a grant the store has never held
+  stays. Saving the current account from the panel never overrides any of this.
+  A restock still waits until a credential file has gone 10 seconds without a
+  write, since a sign-in is several writes in a row. The new
+  `claudeAccounts.selfHeal` setting (on by default) turns the restock off. With
+  it off the window keeps whatever it holds, and a sign-in there reaches the
+  store only when it was seen in progress or the window still held the store's
+  current grant. Switching accounts and saving a sign-in still write the
+  window's file. Nothing else about the heal moved: it is still the file only,
+  with no reload, no killed process and no popup, and the cross-account
+  tripwire still guards both directions.
 
 ## 0.9.22
 
