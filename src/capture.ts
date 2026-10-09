@@ -586,6 +586,8 @@ function sameEmailKeepReason(
       return null;
     case 'continuation':
       return 'default holds a newer refresh of the store family';
+    case 'behind':
+      return 'store file is behind its chain';
     default:
       return 'default holds a grant the store has never replaced';
   }

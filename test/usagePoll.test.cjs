@@ -25,16 +25,23 @@ fs.writeFileSync(
      commands: { executeCommand: () => Promise.resolve(undefined) },
    };`
 );
-const bundleOut = path.join(tmpRoot, 'usage.bundle.cjs');
-esbuild.buildSync({
-  entryPoints: [path.join(__dirname, '../src/usage.ts')],
-  bundle: true,
-  platform: 'node',
-  format: 'cjs',
-  outfile: bundleOut,
-  alias: { vscode: vscodeStub },
-});
-const { UsageMonitor, __ageInProcessStateForTests } = require(bundleOut);
+function bundle(entry, name) {
+  const out = path.join(tmpRoot, name);
+  esbuild.buildSync({
+    entryPoints: [path.join(__dirname, entry)],
+    bundle: true,
+    platform: 'node',
+    format: 'cjs',
+    outfile: out,
+    alias: { vscode: vscodeStub },
+  });
+  return require(out);
+}
+const { UsageMonitor, __ageInProcessStateForTests } = bundle('../src/usage.ts', 'usage.bundle.cjs');
+const { foreignAnchorConflict, observeStoreGrant } = bundle(
+  '../src/workdir.ts',
+  'workdir.bundle.cjs'
+);
 
 // One clock read. A store grant that expired a minute ago is due for a refresh
 // on any poll (ensureFreshToken's fast path and its re-check under the lock both
@@ -183,34 +190,54 @@ describe('the poller rotating a store token', () => {
     assert.equal(fs.existsSync(path.join(windowDir, '.grant-chain.json')), false);
   });
 
-  it("the poller records none of another account's grant held in a store", async () => {
-    const activeTok = grant('rt-A0', ANCHOR + 2 * HOUR, T + 479 * MIN);
-    const active = mkAccountDir(path.join(home, '.claude-a'), 'a@x.com', activeTok);
-    const windowDir = mkAccountDir(path.join(home, '.claude-windows', 'w1'), 'a@x.com', activeTok);
-    const yAnchor = ANCHOR + 7 * HOUR;
-    const stale = grant('rt-Y0', yAnchor);
-    mkAccountDir(path.join(home, '.claude-y'), 'y@x.com', stale);
-    const other = mkAccountDir(path.join(home, '.claude-b'), 'b@x.com', stale);
-    const monitor = new UsageMonitor(60_000);
-    monitor.configure({
-      storeDirForEmail: (email) => (email === 'a@x.com' ? active : other),
+  // Y's store holds either the very grant B's store holds, or a later refresh of
+  // it (the poller rotated Y's store past the copy): the bytes differ, the family
+  // does not.
+  for (const [label, yTok] of [
+    ['the same grant', (anchor) => grant('rt-Y0', anchor)],
+    ['a later refresh of it', (anchor) => grant('rt-Y1', anchor, T + 479 * MIN)],
+  ]) {
+    it(`the poller records none of another account's grant held in a store (Y holds ${label})`, async () => {
+      const activeTok = grant('rt-A0', ANCHOR + 2 * HOUR, T + 479 * MIN);
+      const active = mkAccountDir(path.join(home, '.claude-a'), 'a@x.com', activeTok);
+      const windowDir = mkAccountDir(
+        path.join(home, '.claude-windows', 'w1'),
+        'a@x.com',
+        activeTok
+      );
+      const yAnchor = ANCHOR + 7 * HOUR;
+      const stale = grant('rt-Y0', yAnchor);
+      const yDir = mkAccountDir(path.join(home, '.claude-y'), 'y@x.com', yTok(yAnchor));
+      const other = mkAccountDir(path.join(home, '.claude-b'), 'b@x.com', stale);
+      const monitor = new UsageMonitor(60_000);
+      monitor.configure({
+        storeDirForEmail: (email) => (email === 'a@x.com' ? active : other),
+      });
+      monitor.listAccountsToPoll = () => [
+        { email: 'a@x.com', dir: active },
+        { email: 'b@x.com', dir: other },
+      ];
+      try {
+        await monitor.refresh(windowDir);
+        await monitor.refreshAllAccounts();
+      } finally {
+        monitor.dispose();
+      }
+      const rotated = JSON.parse(cred(other).toString()).claudeAiOauth.refreshToken;
+      assert.notEqual(rotated, 'rt-Y0', 'the poller rotated the store token');
+      const chainPath = path.join(other, '.grant-chain.json');
+      if (fs.existsSync(chainPath)) {
+        const chain = chainFile(other);
+        assert.deepEqual([chain.current, chain.hashes], [null, []], 'nothing of Y is recorded');
+      }
+      // B's file carries Y's family through the spread until B signs in; after the
+      // sign-in only B's chain could still name Y's family.
+      const bSignIn = grant('rt-B9', ANCHOR + 9 * HOUR, T + 479 * MIN);
+      fs.writeFileSync(path.join(other, '.credentials.json'), bSignIn, { mode: 0o600 });
+      observeStoreGrant(other, bSignIn);
+      assert.equal(foreignAnchorConflict(yDir, yAnchor, 'y@x.com'), null, "Y's family stays Y's");
     });
-    monitor.listAccountsToPoll = () => [
-      { email: 'a@x.com', dir: active },
-      { email: 'b@x.com', dir: other },
-    ];
-    try {
-      await monitor.refresh(windowDir);
-      await monitor.refreshAllAccounts();
-    } finally {
-      monitor.dispose();
-    }
-    const rotated = JSON.parse(cred(other).toString()).claudeAiOauth.refreshToken;
-    assert.notEqual(rotated, 'rt-Y0', 'the poller rotated the store token');
-    const chain = chainFile(other);
-    assert.equal(chain.hashes.includes(rtHash('rt-Y0')), false, 'the held grant is not recorded');
-    assert.deepEqual(chain.hashes, [rtHash(rotated)], 'the grant it minted is');
-  });
+  }
 
   it('a store grant with no anchor rotates and still has none', async () => {
     const stale = grant('rt-N0', undefined);

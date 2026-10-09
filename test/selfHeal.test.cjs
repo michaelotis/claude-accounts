@@ -153,14 +153,29 @@ describe('relateToStore', () => {
     assert.equal(relateToStore(grant('rt-x', null), Buffer.from('nope'), chainOf(null)), 'legacy');
   });
 
-  it('a file behind its chain is behind for every grant not of a later family than the chain', () => {
+  it("a file behind its chain is behind for every grant of neither the file's family nor a later one", () => {
     const x = F(20);
     const sBack = grant('rt-Sb', F(0));
     const c = chainOf(x, [F(0)], []);
     assert.equal(relateToStore(grant('rt-L', x), sBack, c), 'behind');
-    assert.equal(relateToStore(grant('rt-Sbb', F(0) + SEC, LIVE + MIN), sBack, c), 'behind');
+    assert.equal(relateToStore(grant('rt-Sbw', F(0) + W + SEC, LIVE + MIN), sBack, c), 'behind');
     assert.equal(relateToStore(grant('rt-Lw', x + W - SEC, LIVE + MIN), sBack, c), 'behind');
     assert.equal(relateToStore(grant('rt-Lx', x + W + SEC), sBack, c), 'sign-in');
+  });
+
+  it('a file behind its chain judges its own family within itself: known by hash or when older, else a continuation', () => {
+    const x = F(20);
+    const sBack = grant('rt-Sb', F(0));
+    const held = grant('rt-Sbh', F(0) + SEC, LIVE + MIN);
+    const c = chainOf(x, [F(0)], [hash(held)]);
+    assert.equal(relateToStore(held, sBack, c), 'known');
+    assert.equal(relateToStore(grant('rt-Sbo', F(0) - SEC, LIVE - MIN), sBack, c), 'known');
+    assert.equal(relateToStore(grant('rt-Sbn', F(0) + SEC), sBack, c), 'known');
+    assert.equal(relateToStore(grant('rt-Sbb', F(0) + SEC, LIVE + MIN), sBack, c), 'continuation');
+    assert.equal(
+      relateToStore(grant('rt-Sbe', F(0) + W - SEC, LIVE + MIN), sBack, c),
+      'continuation'
+    );
   });
 
   it('behind boundary: a store file W - 1 s before current is not behind, W + 1 s before is', () => {
@@ -451,19 +466,26 @@ describe('refreshStore, the chain and the activation heal', () => {
     assert.deepEqual(c.hashes, [hash(S), other]);
   });
 
-  it("behind: current never moves back, and no grant of the chain's family is adopted or restocked", async () => {
+  // A store whose chain moved to family x (L1, then L2) and whose file an
+  // old-version window wrote back to S1, 20 h before x.
+  const behindStore = (tag) => {
     const x = F(20);
-    const L1 = grant('rt-Lr1', x, LIVE - HOUR);
-    const L2 = grant('rt-Lr2', x, LIVE);
+    const L1 = grant(`rt-L${tag}1`, x, LIVE - HOUR);
+    const L2 = grant(`rt-L${tag}2`, x, LIVE);
     const store = signedInStore(L1, L2);
+    const S1 = grant(`rt-S${tag}1`, x - 20 * HOUR);
+    put(store, S1);
+    return { x, L1, L2, S1, store };
+  };
+
+  it("behind: current never moves back, and no grant of the chain's family is adopted or restocked", async () => {
+    const { x, L1, L2, S1, store } = behindStore('r');
     assert.deepEqual(chainFile(store), {
       v: 2,
       current: x,
       displaced: [],
       hashes: [hash(L1), hash(L2)],
     });
-    const S1 = grant('rt-Sr1', x - 20 * HOUR); // an old-version window writes this back
-    put(store, S1);
     const before = logged(/moved back to an earlier family/).length;
     observeStoreGrant(store, S1);
     observeStoreGrant(store, S1);
@@ -472,13 +494,15 @@ describe('refreshStore, the chain and the activation heal', () => {
 
     const keptLog =
       /b@example\.com: store file is behind its chain — kept both; a sign-in restores it/;
-    const S2 = grant('rt-Sr2', x - 20 * HOUR + SEC, LIVE + HOUR); // a refresh of S′
-    for (const tok of [L1, L2, S2]) {
+    const guardLog = new RegExp(
+      `store file of ${path.basename(store)} is behind its chain — left in place`
+    );
+    const seen = logged(keptLog).length;
+    const guarded = logged(guardLog).length;
+    for (const tok of [L1, L2, L1]) {
       const wd = mkDir('wd', tok);
-      const seen = logged(keptLog).length;
       const r = await refreshStore(account(store), wd);
       assert.deepEqual([r.relation, r.wrote], ['behind', false]);
-      assert.equal(logged(keptLog).length, seen + 1);
       assert.ok(cred(store).equals(S1), 'the store is not moved');
       assert.deepEqual(healVerdict(r.relation, true, OLD_MTIME, Date.now()), {
         verdict: 'keep',
@@ -488,6 +512,12 @@ describe('refreshStore, the chain and the activation heal', () => {
       healAtActivation(account(store), wd, { selfHeal: true });
       assert.ok(cred(wd).equals(tok), 'never restocked from the file behind the chain');
     }
+    assert.equal(logged(keptLog).length, seen + 1, 'logged once per store and anchor');
+    assert.equal(logged(guardLog).length, guarded + 3, 'the forced stock names behind');
+    const S0 = grant('rt-Sr0', x - 30 * HOUR); // another write-back, another family
+    put(store, S0);
+    await refreshStore(account(store), mkDir('wd', L2));
+    assert.equal(logged(keptLog).length, seen + 2, 'a different anchor logs again');
     assert.equal(readGrantChain(store).current, x);
 
     const L3 = grant('rt-Lr3', x + 20 * HOUR);
@@ -496,6 +526,63 @@ describe('refreshStore, the chain and the activation heal', () => {
     assert.ok(cred(store).equals(L3));
     assert.equal(readGrantChain(store).current, x + 20 * HOUR);
     assert.equal(logged(/restored store/).length, 0);
+  });
+
+  it("behind: a consumed copy of the file's own family is known and restocked from the file", async () => {
+    const { x, store } = behindStore('k');
+    // The poller rotated the file from S0 to S1: S0's hash is in the chain.
+    const s = x - 20 * HOUR;
+    const S0 = grant('rt-Sk0', s, LIVE + HOUR);
+    put(store, S0);
+    observeStoreGrant(store, S0);
+    const S1 = grant('rt-Sk1', s);
+    put(store, S1);
+    observeStoreGrant(store, S1);
+    assert.equal(readGrantChain(store).current, x);
+    const older = grant('rt-Sko', s + SEC, LIVE - HOUR); // unknown hash, earlier expiry
+    for (const tok of [S0, older]) {
+      const wd = mkDir('wd', tok);
+      put(wd, tok, Date.now());
+      const r = await refreshStore(account(store), wd);
+      assert.deepEqual([r.relation, r.wrote], ['known', false]);
+      assert.ok(cred(store).equals(S1));
+      assert.equal(healVerdict(r.relation, true, mtime(wd), Date.now()).reason, 'burst');
+      assert.deepEqual(healVerdict(r.relation, true, OLD_MTIME, Date.now()), {
+        verdict: 'restock',
+        reason: 'known',
+      });
+      const wa = mkDir('wd', tok);
+      healAtActivation(account(store), wa, { selfHeal: true });
+      assert.ok(cred(wa).equals(S1), 'restocked at activation');
+      const wm = mkDir('wd', tok);
+      assert.equal(materialize(account(store), wm, true), true, 'the forced stock overwrites');
+      assert.ok(cred(wm).equals(S1));
+    }
+    assert.equal(readGrantChain(store).current, x);
+  });
+
+  it("behind: a later refresh of the file's own family is carried in, and current stays", async () => {
+    const { x, L1, L2, S1, store } = behindStore('c');
+    observeStoreGrant(store, S1);
+    const regressions = /moved back to an earlier family/;
+    const S2 = grant('rt-Sc2', x - 20 * HOUR + SEC, LIVE + HOUR); // a refresh of S1
+    const wd = mkDir('wd', S2);
+    const r = await refreshStore(account(store), wd);
+    assert.deepEqual([r.relation, r.wrote], ['continuation', true]);
+    assert.ok(cred(store).equals(S2));
+    assert.equal(readGrantChain(store).current, x, 'the backward move is not recorded');
+    const seen = logged(regressions).length;
+    const again = await refreshStore(account(store), wd);
+    assert.deepEqual([again.relation, again.wrote], ['same', false]);
+    assert.equal(logged(regressions).length, seen, 'no regression line repeats');
+    assert.equal(readGrantChain(store).current, x);
+    for (const tok of [L1, L2]) {
+      const r2 = await refreshStore(account(store), mkDir('wd', tok));
+      assert.deepEqual([r2.relation, r2.wrote], ['behind', false]);
+    }
+    const L3 = grant('rt-Lc3', x + 20 * HOUR);
+    const r3 = await refreshStore(account(store), mkDir('wd', L3));
+    assert.deepEqual([r3.relation, r3.wrote], ['sign-in', true]);
   });
 
   it('negative live drift: a store file 3 s before current is not behind', async () => {
@@ -519,44 +606,53 @@ describe('refreshStore, the chain and the activation heal', () => {
     assert.ok(cred(store).equals(E));
   });
 
-  it("chain feed gated: a store holding another account's grant records none of it", async () => {
-    const y = F(500);
-    const Yg = grant('rt-Yg', y);
-    const other = foreignStore(Yg);
-    const yAcct = { name: path.basename(other), dir: other, email: 'x@example.com' };
-    try {
-      observeStoreGrant(other, Yg);
-      const store = mkDir('.claude-b', Yg);
-      const wd = mkDir('wd', Yg);
-      const refused = new RegExp(
-        `store of ${path.basename(store)} holds another account's grant — not recorded in its chain`
-      );
-      await refreshStore(account(store), wd);
-      await refreshStore(account(store), wd);
-      assert.deepEqual(readGrantChain(store), { current: null, displaced: [], hashes: [] });
-      assert.equal(logged(refused).length, 1, 'logged once');
+  // The owner's store holds either the very grant the contaminated store holds,
+  // or a later refresh of it (the poller rotated the owner past the copy): the
+  // bytes differ, the family does not.
+  for (const [label, ownerTok] of [
+    ['the same grant', (y) => grant('rt-Yg', y)],
+    ['a later refresh of it', (y) => grant('rt-Yg1', y, LIVE + MIN)],
+  ]) {
+    it(`chain feed gated: a store holding another account's grant records none of it (owner holds ${label})`, async () => {
+      const y = F(500);
+      const Yg = grant('rt-Yg', y);
+      const Yo = ownerTok(y);
+      const other = foreignStore(Yo);
+      const yAcct = { name: path.basename(other), dir: other, email: 'x@example.com' };
+      try {
+        observeStoreGrant(other, Yo);
+        const store = mkDir('.claude-b', Yg);
+        const wd = mkDir('wd', Yg);
+        const refused = new RegExp(
+          `store of ${path.basename(store)} holds another account's grant — not recorded in its chain`
+        );
+        await refreshStore(account(store), wd);
+        await refreshStore(account(store), wd);
+        assert.deepEqual(readGrantChain(store), { current: null, displaced: [], hashes: [] });
+        assert.equal(logged(refused).length, 1, 'logged once');
 
-      const Xl = grant('rt-Xl', F(510));
-      put(wd, Xl);
-      const r = await refreshStore(account(store), wd);
-      assert.deepEqual([r.relation, r.wrote], ['sign-in', true]);
-      assert.deepEqual(chainFile(store), {
-        v: 2,
-        current: F(510),
-        displaced: [],
-        hashes: [hash(Xl)],
-      });
-      assert.equal(foreignAnchorConflict(other, y, 'x@example.com'), null);
+        const Xl = grant('rt-Xl', F(510));
+        put(wd, Xl);
+        const r = await refreshStore(account(store), wd);
+        assert.deepEqual([r.relation, r.wrote], ['sign-in', true]);
+        assert.deepEqual(chainFile(store), {
+          v: 2,
+          current: F(510),
+          displaced: [],
+          hashes: [hash(Xl)],
+        });
+        assert.equal(foreignAnchorConflict(other, y, 'x@example.com'), null);
 
-      const Yc = grant('rt-Yc', y + SEC, LIVE + HOUR);
-      const wy = mkDir('wd', Yc, 'x@example.com');
-      const ry = await refreshStore(yAcct, wy);
-      assert.deepEqual([ry.relation, ry.wrote], ['continuation', true]);
-      assert.ok(cred(other).equals(Yc));
-    } finally {
-      drop(other);
-    }
-  });
+        const Yc = grant('rt-Yc', y + SEC, LIVE + HOUR);
+        const wy = mkDir('wd', Yc, 'x@example.com');
+        const ry = await refreshStore(yAcct, wy);
+        assert.deepEqual([ry.relation, ry.wrote], ['continuation', true]);
+        assert.ok(cred(other).equals(Yc));
+      } finally {
+        drop(other);
+      }
+    });
+  }
 
   it('terminal login into the store: the previous family is displaced and its copies are forks', async () => {
     const s = F(0);

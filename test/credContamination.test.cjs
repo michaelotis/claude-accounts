@@ -284,13 +284,14 @@ describe('refreshStore contamination guard', () => {
     });
   });
 
-  it('refuses an OLDER same-lineage copy (store-watch flap guard, 0.9.9)', async () => {
+  it('refuses a same-lineage copy the store has held, even with a later expiry (store-watch flap guard, 0.9.9)', async () => {
     await withHomeAsync(async (home, mk) => {
-      // Store holds b's refreshed grant; a lagging window still carries the older
-      // access token of the SAME lineage. Writing it through would regress the
-      // store — and with every window watching the store, two idle windows would
-      // re-trigger each other and flap it indefinitely. It must be refused. Both
-      // carry one family anchor, so the copy is judged within the family.
+      // Store holds b's refreshed grant; a lagging window still carries a copy of
+      // the SAME lineage the store held before. Writing it through would regress
+      // the store — and with every window watching the store, two idle windows
+      // would re-trigger each other and flap it indefinitely. It must be refused.
+      // Both carry one family anchor, and the copy's expiry is later than the
+      // store's, so only the store's memory of its hash marks it as known.
       const refreshed = JSON.stringify({
         claudeAiOauth: {
           accessToken: 'ACCESS_B2',
@@ -300,8 +301,11 @@ describe('refreshStore contamination guard', () => {
         },
       });
       const b = mk('.claude-b', 'b@example.com', refreshed);
-      const older = JSON.stringify({ claudeAiOauth: { ...grantB, refreshTokenExpiresAt: FAMILY } });
-      const wd = mk('wd', 'b@example.com', older); // expiresAt: 1 — older, same family
+      const older = JSON.stringify({
+        claudeAiOauth: { ...grantB, expiresAt: 999, refreshTokenExpiresAt: FAMILY },
+      });
+      observeStoreGrant(b, Buffer.from(older));
+      const wd = mk('wd', 'b@example.com', older);
       const r = await refreshStore({ name: 'b', dir: b, email: 'b@example.com' }, wd);
       assert.equal(r.relation, 'known');
       assert.equal(

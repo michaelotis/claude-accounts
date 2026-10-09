@@ -401,7 +401,7 @@ describe('reconcile self-heal through SetupWizard', () => {
     assert.ok(read(b).equals(N), 'the window file is untouched');
   });
 
-  it('a manual save keeps the store over a fork and takes a later family; both bind and stock', async () => {
+  it('a manual save keeps the store over a fork and the bind stocks the window; a later family is taken', async () => {
     const S = grant('rt-S', F(0));
     putStore(account.dir, S, { current: F(0), hashes: [hash(S)] });
     const d = windowDir('d');
@@ -418,7 +418,6 @@ describe('reconcile self-heal through SetupWizard', () => {
     put(d, U);
     await wd.captureCurrentAccount({ quiet: true, silent: true, sourceDir: d });
     assert.ok(read(account.dir).equals(U));
-    assert.ok(read(d).equals(U));
     assert.deepEqual(wd.binds, ['acct', 'acct']);
   });
 
