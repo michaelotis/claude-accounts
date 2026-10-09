@@ -12,31 +12,37 @@
   `/login` in a panel that came out with an earlier expiry was compared with it,
   lost, and overwritten with the revoked token, and the window was signed out
   again before it had made a call. A sign-in from a plain terminal stuck only
-  when its expiry happened to be later. The rule is now about which grant the
-  window's Claude Code process held, not about expiry or when a file was
-  written. Each account store keeps a short list of the grants it has held,
-  stored as hashes. A window is restocked only when its grant is one of those,
-  a copy the store has since moved past, whatever either expiry says. A grant
-  the store has never held is carried into the store in three cases: the
-  window's process held the store's current grant and refreshed it or signed in
-  over it, the sign-in was seen in progress (the window's token went missing and
-  then a new one appeared), or it is a fresh sign-in as another account.
-  Otherwise the window keeps its grant, the store keeps its own, and nothing the
-  extension does replaces the window's: sign in there again, or switch to
-  another account and back. To tell these apart, each window dir keeps a small
-  record of two hashes and a word for who last wrote the file; no token is
-  written to it. `~/.claude` follows the same rule against the store's history,
-  including after a terminal login there: a grant the store has never held
-  stays. Saving the current account from the panel never overrides any of this.
-  A restock still waits until a credential file has gone 10 seconds without a
-  write, since a sign-in is several writes in a row. The new
-  `claudeAccounts.selfHeal` setting (on by default) turns the restock off. With
-  it off the window keeps whatever it holds, and a sign-in there reaches the
-  store only when it was seen in progress or the window still held the store's
-  current grant. Switching accounts and saving a sign-in still write the
-  window's file. Nothing else about the heal moved: it is still the file only,
-  with no reload, no killed process and no popup, and the cross-account
-  tripwire still guards both directions.
+  when its expiry happened to be later. The rule no longer looks at
+  access-token expiry or at when a file was written. Every sign-in starts a new
+  token family and every refresh stays in it; Claude Code records the family's
+  expiry date in the credential file, and the extension now orders families by
+  that date. A window is restocked only when it holds an older refresh of the
+  store's current family or a refresh of an earlier family. A later family
+  written in a window is carried into the store, whatever its access-token
+  expiry; a refresh of an earlier family is never carried in; a grant with no
+  family date is left alone. Each account store keeps a small list of family
+  dates and grant hashes in its own file; no token is written to it.
+  `~/.claude` follows the same rule, including after a terminal login there. A
+  restock still waits until a credential file has gone 10 seconds without a
+  write, since a sign-in is several writes in a row. The cross-account tripwire
+  now also refuses a grant whose family belongs to another saved account, and a
+  window whose identity drifted onto a grant of its own account's family is
+  left as it is and logged rather than saved under the other name. The new
+  `claudeAccounts.selfHeal` setting (on by default) restocks a window whose
+  credential file holds a copy its account store has moved past: an older
+  refresh of the account's current sign-in, or any refresh of a sign-in a later
+  one replaced (file only, no reload). Off: reconcile leaves the window's file
+  alone. Not gated by this setting: the copy made when a folder route or a
+  manual save binds the window, which also replaces such a copy. A sign-in
+  made in the window reaches the store when it is later than the store's
+  current one. Nothing else about the heal moved: it is still the file only,
+  with no reload, no killed process and no popup.
+
+  **Reload every window after updating:** a window still running the previous
+  version can write an earlier family back into an account store; the new
+  version does not record that as the store's current family and a window on
+  the later family puts it back at its next check, but until every window runs
+  the new version the store can change hands between checks.
 
 ## 0.9.22
 

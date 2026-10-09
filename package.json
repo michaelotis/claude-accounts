@@ -190,7 +190,7 @@
         "claudeAccounts.selfHeal": {
           "type": "boolean",
           "default": true,
-          "description": "Restock a window whose credential file holds a copy its account store has moved past (file only, no reload). Off: the window keeps whatever it holds, and a sign-in there reaches the store only when it was seen in progress or the window still held the store's current grant. Switching accounts and saving a sign-in still write the window's file."
+          "description": "Restock a window whose credential file holds a copy its account store has moved past: an older refresh of the account's current sign-in, or any refresh of a sign-in a later one replaced (file only, no reload). Off: reconcile leaves the window's file alone. Not gated by this setting: the copy made when a folder route or a manual save binds the window, which also replaces such a copy. A sign-in made in the window reaches the store when it is later than the store's current one."
         }
       }
     }
