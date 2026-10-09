@@ -183,6 +183,35 @@ describe('the poller rotating a store token', () => {
     assert.equal(fs.existsSync(path.join(windowDir, '.grant-chain.json')), false);
   });
 
+  it("the poller records none of another account's grant held in a store", async () => {
+    const activeTok = grant('rt-A0', ANCHOR + 2 * HOUR, T + 479 * MIN);
+    const active = mkAccountDir(path.join(home, '.claude-a'), 'a@x.com', activeTok);
+    const windowDir = mkAccountDir(path.join(home, '.claude-windows', 'w1'), 'a@x.com', activeTok);
+    const yAnchor = ANCHOR + 7 * HOUR;
+    const stale = grant('rt-Y0', yAnchor);
+    mkAccountDir(path.join(home, '.claude-y'), 'y@x.com', stale);
+    const other = mkAccountDir(path.join(home, '.claude-b'), 'b@x.com', stale);
+    const monitor = new UsageMonitor(60_000);
+    monitor.configure({
+      storeDirForEmail: (email) => (email === 'a@x.com' ? active : other),
+    });
+    monitor.listAccountsToPoll = () => [
+      { email: 'a@x.com', dir: active },
+      { email: 'b@x.com', dir: other },
+    ];
+    try {
+      await monitor.refresh(windowDir);
+      await monitor.refreshAllAccounts();
+    } finally {
+      monitor.dispose();
+    }
+    const rotated = JSON.parse(cred(other).toString()).claudeAiOauth.refreshToken;
+    assert.notEqual(rotated, 'rt-Y0', 'the poller rotated the store token');
+    const chain = chainFile(other);
+    assert.equal(chain.hashes.includes(rtHash('rt-Y0')), false, 'the held grant is not recorded');
+    assert.deepEqual(chain.hashes, [rtHash(rotated)], 'the grant it minted is');
+  });
+
   it('a store grant with no anchor rotates and still has none', async () => {
     const stale = grant('rt-N0', undefined);
     const store = mkAccountDir(path.join(home, '.claude-acct'), 'a@x.com', stale);

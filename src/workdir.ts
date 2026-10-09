@@ -116,7 +116,10 @@ export function materialize(account: Account, workingDir: string, force = false)
       if (sameCredential(dirTok, storeTok)) return false;
       const relation = relateToStore(dirTok, storeTok, readGrantChain(account.dir));
       if (
-        (relation === 'continuation' || relation === 'sign-in' || relation === 'legacy') &&
+        (relation === 'continuation' ||
+          relation === 'sign-in' ||
+          relation === 'legacy' ||
+          relation === 'behind') &&
         tokenExpiry(dirTok) != null &&
         foreignTokenConflict(account.dir, dirTok, account.email) == null &&
         foreignAnchorConflict(account.dir, anchorOf(dirTok), account.email) == null
@@ -323,8 +326,8 @@ const regressionLogged = new Set<string>();
  * Notes the grant the store holds. Its hash joins the list; its family becomes
  * current when it is later than the current one, which moves to the displaced
  * list. `current` never moves back: an earlier family in the store's file means
- * a window on an older version wrote it, and a window on the current family puts
- * the store right at its next reconcile. Hashes and anchors only, and nothing is
+ * a window on an older version wrote it, and the store is left behind its chain
+ * until a sign-in of a later family. Hashes and anchors only, and nothing is
  * written when nothing changed.
  */
 export function observeStoreGrant(storeDir: string, buf: Buffer): void {
@@ -374,13 +377,26 @@ export function observeStoreGrant(storeDir: string, buf: Buffer): void {
   }
 }
 
-/** @deprecated The r1 name; callers move to observeStoreGrant. */
-export function recordGrantHistory(storeDir: string, buf: Buffer): void {
-  observeStoreGrant(storeDir, buf);
+/** Stores whose foreign grant has been logged as kept out of their chain. */
+const foreignObservationLogged = new Set<string>();
+
+/**
+ * Logs, once per store, that its file holds another account's grant and so was
+ * not observed: recording that family would make the other account's own grants
+ * read as foreign here until it signs in again.
+ */
+export function noteForeignStoreGrant(storeDir: string): void {
+  const key = path.normalize(storeDir);
+  if (foreignObservationLogged.has(key)) return;
+  foreignObservationLogged.add(key);
+  log(
+    `workdir: store of ${path.basename(storeDir)} holds another account's grant — ` +
+      `not recorded in its chain`
+  );
 }
 
 export type StoreRelation =
-  'same' | 'known' | 'continuation' | 'fork' | 'sign-in' | 'legacy' | 'unrelated';
+  'same' | 'known' | 'continuation' | 'fork' | 'sign-in' | 'behind' | 'legacy' | 'unrelated';
 
 /**
  * How a window's grant relates to its store's, by family order.
@@ -391,9 +407,12 @@ export type StoreRelation =
  * current family and the store file's): a later family is a sign-in, an earlier
  * one a fork of a family the store moved past. Within the reference family, a
  * hash the store has held or an older refresh is `known`, a later refresh a
- * `continuation`, and any grant of it is a `sign-in` when the store's file has
- * fallen behind its chain. A grant without an anchor is `legacy` and matches
- * nothing; an unreadable store takes a grant that has an anchor and an expiry.
+ * `continuation`. A store file that has fallen behind its chain (an older
+ * version wrote an earlier family back) is left for a sign-in: every grant that
+ * is not of a later family than the chain is `behind`, since the file cannot
+ * tell a live grant of the current family from a consumed one. A grant without
+ * an anchor is `legacy` and matches nothing; an unreadable store takes a grant
+ * that has an anchor and an expiry.
  * Pure: no clock, no mtime. `unrelated` is only ever set by a caller whose
  * tripwire refused the grant.
  */
@@ -405,10 +424,12 @@ export function relateToStore(dirTok: Buffer, storeTok: Buffer, chain: GrantChai
   if (storeExp == null) return dirExp != null && a != null ? 'sign-in' : 'legacy';
   const s = anchorOf(storeTok);
   if (a == null || s == null) return 'legacy';
+  if (chain.current != null && s < chain.current - ANCHOR_WINDOW_MS) {
+    return a > chain.current + ANCHOR_WINDOW_MS ? 'sign-in' : 'behind';
+  }
   const ref = chain.current != null ? Math.max(chain.current, s) : s;
   if (a > ref + ANCHOR_WINDOW_MS) return 'sign-in';
   if (a < ref - ANCHOR_WINDOW_MS) return 'fork';
-  if (s < ref - ANCHOR_WINDOW_MS) return 'sign-in';
   if (chain.hashes.includes(grantHash(dirTok))) return 'known';
   if (dirExp != null && dirExp > storeExp) return 'continuation';
   return 'known';
@@ -424,9 +445,10 @@ export interface HealDecision {
 /**
  * What reconcile does with a window grant once it is related to the store. A
  * sign-in or a continuation is adopted; a known copy or a fork is restocked,
- * whatever its expiry; anything else is kept. A file written in the last few
- * seconds is left alone: a sign-in is a burst of writes, and judging its middle
- * would undo it.
+ * whatever its expiry; anything else is kept, a grant of a store behind its
+ * chain included (that store is left for a sign-in). A file written in the last
+ * few seconds is left alone: a sign-in is a burst of writes, and judging its
+ * middle would undo it.
  */
 export function healVerdict(
   relation: StoreRelation | null,
@@ -438,6 +460,7 @@ export function healVerdict(
     case 'same':
     case 'legacy':
     case 'unrelated':
+    case 'behind':
       return { verdict: 'keep', reason: relation };
     case 'continuation':
     case 'sign-in':
@@ -688,7 +711,11 @@ export async function refreshStore(account: Account, workingDir: string): Promis
           // The store's grant goes into its chain before anything replaces it, so
           // a copy of it left in another dir is recognised later as one the store
           // has moved past, and a family the store's file moved to becomes current.
-          observeStoreGrant(account.dir, cur);
+          if (foreignTokenConflict(account.dir, cur, account.email) == null) {
+            observeStoreGrant(account.dir, cur);
+          } else {
+            noteForeignStoreGrant(account.dir);
+          }
           if (cur.equals(incoming)) {
             out.relation = 'same';
             return;
@@ -731,27 +758,19 @@ export async function refreshStore(account: Account, workingDir: string): Promis
                 : relation === 'fork'
                   ? `workdir: ${who}: incoming grant is a refresh of a family a later sign-in ` +
                     `replaced — kept store`
-                  : `workdir: ${who}: incoming grant has no family anchor — kept both`
+                  : relation === 'behind'
+                    ? `workdir: ${who}: store file is behind its chain — kept both; ` +
+                      `a sign-in restores it`
+                    : `workdir: ${who}: incoming grant has no family anchor — kept both`
           );
           return;
         }
-        const curAnchor = anchorOf(cur);
-        const regressed =
-          relation === 'sign-in' &&
-          chain.current != null &&
-          curAnchor != null &&
-          curExp != null &&
-          curAnchor < chain.current - ANCHOR_WINDOW_MS;
         fs.mkdirSync(account.dir, { recursive: true, mode: 0o700 });
         // Unique-temp atomic write: a half-written store is worse than a stale one.
         writeFileAtomic(dst, incoming, { mode: 0o600 });
         observeStoreGrant(account.dir, incoming);
         out.wrote = true;
-        log(
-          regressed
-            ? `workdir: restored store of ${who} from its current family`
-            : `workdir: refreshed store of ${who} (${relation})`
-        );
+        log(`workdir: refreshed store of ${who} (${relation})`);
       },
       { capMs: 3_000, skipIfUnacquired: true }
     );

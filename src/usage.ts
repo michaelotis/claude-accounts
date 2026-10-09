@@ -11,7 +11,7 @@ import { log } from './log';
 import { readIdentity, hasCredentials } from './accounts';
 import { writeFileAtomic, withLockAsync } from './fsSafe';
 import { isWindowsPath } from './sidecars';
-import { observeStoreGrant } from './workdir';
+import { foreignTokenConflict, noteForeignStoreGrant, observeStoreGrant } from './workdir';
 import {
   buildSnapshot,
   formatUsageBar,
@@ -694,9 +694,17 @@ async function ensureFreshToken(
           };
           const next = { ...(creds || {}), claudeAiOauth: nextOauth };
           // A store's displaced grant goes into its chain, so the window copies of
-          // it are recognised as ones the store has moved past and restocked. Both
-          // calls run under the store lock; a window dir never gets a chain.
-          if (isStore) observeStoreGrant(configDir, Buffer.from(JSON.stringify(creds || {})));
+          // it are recognised as ones the store has moved past and restocked; never
+          // one another account's store holds. Both calls run under the store lock;
+          // a window dir never gets a chain.
+          if (isStore) {
+            const prev = Buffer.from(JSON.stringify(creds || {}));
+            if (foreignTokenConflict(configDir, prev, readIdentity(configDir)?.email) == null) {
+              observeStoreGrant(configDir, prev);
+            } else {
+              noteForeignStoreGrant(configDir);
+            }
+          }
           writeCredsAtomic(configDir, next);
           if (isStore) observeStoreGrant(configDir, Buffer.from(JSON.stringify(next)));
           log(`usage: token refreshed, expiry ${new Date(nextOauth.expiresAt).toISOString()}`);

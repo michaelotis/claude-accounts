@@ -51,7 +51,7 @@ const {
   materialize,
   restockTokenOnly,
   tokenExpiry,
-  recordGrantHistory,
+  observeStoreGrant,
   readGrantChain,
   ANCHOR_WINDOW_MS,
 } = bundle('../src/workdir.ts', 'workdir.bundle.cjs');
@@ -289,13 +289,21 @@ describe('refreshStore contamination guard', () => {
       // Store holds b's refreshed grant; a lagging window still carries the older
       // access token of the SAME lineage. Writing it through would regress the
       // store — and with every window watching the store, two idle windows would
-      // re-trigger each other and flap it indefinitely. It must be refused.
+      // re-trigger each other and flap it indefinitely. It must be refused. Both
+      // carry one family anchor, so the copy is judged within the family.
       const refreshed = JSON.stringify({
-        claudeAiOauth: { accessToken: 'ACCESS_B2', refreshToken: 'REFRESH_B', expiresAt: 99 },
+        claudeAiOauth: {
+          accessToken: 'ACCESS_B2',
+          refreshToken: 'REFRESH_B2',
+          expiresAt: 99,
+          refreshTokenExpiresAt: FAMILY,
+        },
       });
       const b = mk('.claude-b', 'b@example.com', refreshed);
-      const wd = mk('wd', 'b@example.com', TOKEN_B); // expiresAt: 1 — older, same lineage
-      await refreshStore({ name: 'b', dir: b, email: 'b@example.com' }, wd);
+      const older = JSON.stringify({ claudeAiOauth: { ...grantB, refreshTokenExpiresAt: FAMILY } });
+      const wd = mk('wd', 'b@example.com', older); // expiresAt: 1 — older, same family
+      const r = await refreshStore({ name: 'b', dir: b, email: 'b@example.com' }, wd);
+      assert.equal(r.relation, 'known');
       assert.equal(
         fs.readFileSync(path.join(b, '.credentials.json'), 'utf8'),
         refreshed,
@@ -509,7 +517,7 @@ describe('refreshStore newest-wins (self-heal: never regress the store)', () => 
       // the old copy. Its refreshStore must not drag the store backwards (the flap).
       // The store held the old copy before it rotated, so its history knows it.
       const store = mk('.claude-b', 'b@example.com', GRANT_NEW);
-      recordGrantHistory(store, Buffer.from(GRANT_OLD));
+      observeStoreGrant(store, Buffer.from(GRANT_OLD));
       const wd = mk('wd', 'b@example.com', GRANT_OLD);
       const r = await refreshStore({ name: 'b', dir: store, email: 'b@example.com' }, wd);
       assert.equal(r.relation, 'fork');

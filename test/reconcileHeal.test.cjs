@@ -154,8 +154,10 @@ function wizardFor(dir, opts = {}) {
   const binding = {
     getEnvDir: () => dir,
     getActiveName: () => bound.name,
+    // What the real bind does to the window file: a forced stock (binding.ts).
     bind: async (a) => {
       binds.push(a.name);
+      workdir.materialize(a, dir, true);
     },
   };
   const context = {
@@ -399,7 +401,7 @@ describe('reconcile self-heal through SetupWizard', () => {
     assert.ok(read(b).equals(N), 'the window file is untouched');
   });
 
-  it('a manual save keeps the store over a fork and takes a later family; both bind', async () => {
+  it('a manual save keeps the store over a fork and takes a later family; both bind and stock', async () => {
     const S = grant('rt-S', F(0));
     putStore(account.dir, S, { current: F(0), hashes: [hash(S)] });
     const d = windowDir('d');
@@ -408,7 +410,7 @@ describe('reconcile self-heal through SetupWizard', () => {
     const wd = wizardFor(d);
     await wd.captureCurrentAccount({ quiet: true, silent: true, sourceDir: d });
     assert.ok(read(account.dir).equals(S));
-    assert.ok(read(d).equals(E));
+    assert.ok(read(d).equals(S), 'the forced stock restocks the fork');
     assert.deepEqual(wd.binds, ['acct']);
     assert.ok(logged(/refresh of a family a later sign-in replaced — kept store/));
 
@@ -416,6 +418,7 @@ describe('reconcile self-heal through SetupWizard', () => {
     put(d, U);
     await wd.captureCurrentAccount({ quiet: true, silent: true, sourceDir: d });
     assert.ok(read(account.dir).equals(U));
+    assert.ok(read(d).equals(U));
     assert.deepEqual(wd.binds, ['acct', 'acct']);
   });
 

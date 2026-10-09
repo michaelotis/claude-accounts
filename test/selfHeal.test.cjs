@@ -38,6 +38,7 @@ function bundle(entry, name) {
   });
   return require(out);
 }
+const workdir = bundle('../src/workdir.ts', 'workdir.bundle.cjs');
 const {
   ANCHOR_WINDOW_MS,
   anchorOf,
@@ -55,7 +56,7 @@ const {
   grantChainPath,
   grantHistoryPath,
   credentialFingerprint,
-} = bundle('../src/workdir.ts', 'workdir.bundle.cjs');
+} = workdir;
 const { fetchUsageCoordinated, __ageInProcessStateForTests } = bundle(
   '../src/usage.ts',
   'usage.bundle.cjs'
@@ -152,12 +153,21 @@ describe('relateToStore', () => {
     assert.equal(relateToStore(grant('rt-x', null), Buffer.from('nope'), chainOf(null)), 'legacy');
   });
 
-  it('ref is the later of the chain and the file: a regressed file is restored, its forks are not', () => {
+  it('a file behind its chain is behind for every grant not of a later family than the chain', () => {
     const x = F(20);
     const sBack = grant('rt-Sb', F(0));
     const c = chainOf(x, [F(0)], []);
-    assert.equal(relateToStore(grant('rt-L', x), sBack, c), 'sign-in');
-    assert.equal(relateToStore(grant('rt-Sbb', F(0) + SEC, LIVE + MIN), sBack, c), 'fork');
+    assert.equal(relateToStore(grant('rt-L', x), sBack, c), 'behind');
+    assert.equal(relateToStore(grant('rt-Sbb', F(0) + SEC, LIVE + MIN), sBack, c), 'behind');
+    assert.equal(relateToStore(grant('rt-Lw', x + W - SEC, LIVE + MIN), sBack, c), 'behind');
+    assert.equal(relateToStore(grant('rt-Lx', x + W + SEC), sBack, c), 'sign-in');
+  });
+
+  it('behind boundary: a store file W - 1 s before current is not behind, W + 1 s before is', () => {
+    const c = F(0);
+    const older = grant('rt-Ob', c, LIVE - MIN);
+    assert.equal(relateToStore(older, grant('rt-Sb1', c - W + SEC), chainOf(c)), 'known');
+    assert.equal(relateToStore(older, grant('rt-Sb2', c - W - SEC), chainOf(c)), 'behind');
   });
 
   it('is pure: the same inputs judge the same way at any time', () => {
@@ -441,10 +451,17 @@ describe('refreshStore, the chain and the activation heal', () => {
     assert.deepEqual(c.hashes, [hash(S), other]);
   });
 
-  it('M-4 regression: current never moves back, and a window on the current family restores the store', async () => {
+  it("behind: current never moves back, and no grant of the chain's family is adopted or restocked", async () => {
     const x = F(20);
-    const L = grant('rt-Lr', x);
-    const store = signedInStore(grant('rt-Sr', x - 20 * HOUR), L);
+    const L1 = grant('rt-Lr1', x, LIVE - HOUR);
+    const L2 = grant('rt-Lr2', x, LIVE);
+    const store = signedInStore(L1, L2);
+    assert.deepEqual(chainFile(store), {
+      v: 2,
+      current: x,
+      displaced: [],
+      hashes: [hash(L1), hash(L2)],
+    });
     const S1 = grant('rt-Sr1', x - 20 * HOUR); // an old-version window writes this back
     put(store, S1);
     const before = logged(/moved back to an earlier family/).length;
@@ -453,19 +470,92 @@ describe('refreshStore, the chain and the activation heal', () => {
     assert.equal(readGrantChain(store).current, x);
     assert.equal(logged(/moved back to an earlier family/).length, before + 1, 'logged once');
 
-    const wl = mkDir('wd', L);
-    const r = await refreshStore(account(store), wl);
-    assert.deepEqual([r.relation, r.wrote], ['sign-in', true]);
-    assert.ok(cred(store).equals(L));
-    assert.equal(logged(/restored store of b@example\.com from its current family/).length, 1);
-
-    put(store, S1);
+    const keptLog =
+      /b@example\.com: store file is behind its chain — kept both; a sign-in restores it/;
     const S2 = grant('rt-Sr2', x - 20 * HOUR + SEC, LIVE + HOUR); // a refresh of S′
-    const ws = mkDir('wd', S2);
-    const r2 = await refreshStore(account(store), ws);
-    assert.deepEqual([r2.relation, r2.wrote], ['fork', false]);
-    assert.ok(cred(store).equals(S1));
+    for (const tok of [L1, L2, S2]) {
+      const wd = mkDir('wd', tok);
+      const seen = logged(keptLog).length;
+      const r = await refreshStore(account(store), wd);
+      assert.deepEqual([r.relation, r.wrote], ['behind', false]);
+      assert.equal(logged(keptLog).length, seen + 1);
+      assert.ok(cred(store).equals(S1), 'the store is not moved');
+      assert.deepEqual(healVerdict(r.relation, true, OLD_MTIME, Date.now()), {
+        verdict: 'keep',
+        reason: 'behind',
+      });
+      assert.equal(materialize(account(store), wd, true), false, 'the forced stock leaves it');
+      healAtActivation(account(store), wd, { selfHeal: true });
+      assert.ok(cred(wd).equals(tok), 'never restocked from the file behind the chain');
+    }
     assert.equal(readGrantChain(store).current, x);
+
+    const L3 = grant('rt-Lr3', x + 20 * HOUR);
+    const r3 = await refreshStore(account(store), mkDir('wd', L3));
+    assert.deepEqual([r3.relation, r3.wrote], ['sign-in', true]);
+    assert.ok(cred(store).equals(L3));
+    assert.equal(readGrantChain(store).current, x + 20 * HOUR);
+    assert.equal(logged(/restored store/).length, 0);
+  });
+
+  it('negative live drift: a store file 3 s before current is not behind', async () => {
+    const c = F(1);
+    const C = grant('rt-Cnd', c, LIVE - HOUR);
+    const store = mkDir('.claude-b', C);
+    observeStoreGrant(store, C);
+    const D = grant('rt-Dnd', c - 3 * SEC, LIVE); // an adopted continuation, drifted
+    put(store, D);
+    observeStoreGrant(store, D);
+    assert.equal(readGrantChain(store).current, c);
+    const wd = mkDir('wd', C);
+    const r = await refreshStore(account(store), wd);
+    assert.deepEqual([r.relation, r.wrote], ['known', false]);
+    healAtActivation(account(store), wd, { selfHeal: true });
+    assert.ok(cred(wd).equals(D), 'the older copy is restocked');
+    const E = grant('rt-End', c - 3 * SEC, LIVE + HOUR);
+    put(wd, E);
+    const r2 = await refreshStore(account(store), wd);
+    assert.deepEqual([r2.relation, r2.wrote], ['continuation', true]);
+    assert.ok(cred(store).equals(E));
+  });
+
+  it("chain feed gated: a store holding another account's grant records none of it", async () => {
+    const y = F(500);
+    const Yg = grant('rt-Yg', y);
+    const other = foreignStore(Yg);
+    const yAcct = { name: path.basename(other), dir: other, email: 'x@example.com' };
+    try {
+      observeStoreGrant(other, Yg);
+      const store = mkDir('.claude-b', Yg);
+      const wd = mkDir('wd', Yg);
+      const refused = new RegExp(
+        `store of ${path.basename(store)} holds another account's grant — not recorded in its chain`
+      );
+      await refreshStore(account(store), wd);
+      await refreshStore(account(store), wd);
+      assert.deepEqual(readGrantChain(store), { current: null, displaced: [], hashes: [] });
+      assert.equal(logged(refused).length, 1, 'logged once');
+
+      const Xl = grant('rt-Xl', F(510));
+      put(wd, Xl);
+      const r = await refreshStore(account(store), wd);
+      assert.deepEqual([r.relation, r.wrote], ['sign-in', true]);
+      assert.deepEqual(chainFile(store), {
+        v: 2,
+        current: F(510),
+        displaced: [],
+        hashes: [hash(Xl)],
+      });
+      assert.equal(foreignAnchorConflict(other, y, 'x@example.com'), null);
+
+      const Yc = grant('rt-Yc', y + SEC, LIVE + HOUR);
+      const wy = mkDir('wd', Yc, 'x@example.com');
+      const ry = await refreshStore(yAcct, wy);
+      assert.deepEqual([ry.relation, ry.wrote], ['continuation', true]);
+      assert.ok(cred(other).equals(Yc));
+    } finally {
+      drop(other);
+    }
   });
 
   it('terminal login into the store: the previous family is displaced and its copies are forks', async () => {
@@ -695,6 +785,10 @@ describe('refreshStore, the chain and the activation heal', () => {
       c.displaced,
       Array.from({ length: 256 }, (_, i) => F(300 - 256 + i))
     );
+  });
+
+  it('the r1 alias is gone: the bundle exports no recordGrantHistory', () => {
+    assert.equal('recordGrantHistory' in workdir, false);
   });
 
   it('reads a missing or unparseable chain as empty', () => {
