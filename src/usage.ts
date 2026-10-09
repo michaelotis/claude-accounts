@@ -11,7 +11,7 @@ import { log } from './log';
 import { readIdentity, hasCredentials } from './accounts';
 import { writeFileAtomic, withLockAsync } from './fsSafe';
 import { isWindowsPath } from './sidecars';
-import { recordGrantHistory } from './workdir';
+import { observeStoreGrant } from './workdir';
 import {
   buildSnapshot,
   formatUsageBar,
@@ -162,6 +162,9 @@ interface CredsFile {
     accessToken?: string;
     refreshToken?: string;
     expiresAt?: number;
+    // The family anchor: set by Claude Code at sign-in and carried unchanged by
+    // the spread in ensureFreshToken, never recomputed from a refresh response.
+    refreshTokenExpiresAt?: number;
     scopes?: string[];
     subscriptionType?: string;
     [k: string]: unknown;
@@ -690,11 +693,12 @@ async function ensureFreshToken(
             subscriptionType: parsed.subscription_type || oauth?.subscriptionType,
           };
           const next = { ...(creds || {}), claudeAiOauth: nextOauth };
-          // A store's displaced grant goes into its history, so the window copies
-          // of it are recognised as ones the store has moved past and restocked.
-          if (isStore) recordGrantHistory(configDir, Buffer.from(JSON.stringify(creds || {})));
+          // A store's displaced grant goes into its chain, so the window copies of
+          // it are recognised as ones the store has moved past and restocked. Both
+          // calls run under the store lock; a window dir never gets a chain.
+          if (isStore) observeStoreGrant(configDir, Buffer.from(JSON.stringify(creds || {})));
           writeCredsAtomic(configDir, next);
-          if (isStore) recordGrantHistory(configDir, Buffer.from(JSON.stringify(next)));
+          if (isStore) observeStoreGrant(configDir, Buffer.from(JSON.stringify(next)));
           log(`usage: token refreshed, expiry ${new Date(nextOauth.expiresAt).toISOString()}`);
           return parsed.access_token;
         } finally {

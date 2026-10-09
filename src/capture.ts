@@ -5,9 +5,11 @@ import { AuthStatus } from './cli';
 import { AccountIdentity, readIdentity } from './accounts';
 import { writeFileAtomic, copyFileAtomic, withLockAsync } from './fsSafe';
 import {
+  anchorOf,
+  foreignAnchorConflict,
   foreignTokenConflict,
-  grantHash,
-  readGrantHistory,
+  readGrantChain,
+  relateToStore,
   sameCredential,
   tokenExpiry,
 } from './workdir';
@@ -37,7 +39,12 @@ export function snapshotAccount(
   // belongs to a DIFFERENT account. Without this, a working dir whose identity
   // drifted from its token (or a restore-forgotten of an email whose dir holds a
   // foreign token) would snapshot one account's credential under another's name.
-  const conflict = foreignTokenConflict(targetDir, fs.readFileSync(srcCreds), status.email);
+  const srcToken = fs.readFileSync(srcCreds);
+  // The family form: a grant whose sign-in another account's chain knows is that
+  // account's, even when no copy of it matches byte-wise.
+  const conflict =
+    foreignTokenConflict(targetDir, srcToken, status.email) ??
+    foreignAnchorConflict(targetDir, anchorOf(srcToken), status.email);
   if (conflict) {
     throw new Error(
       `Refusing to save ${status.email ?? 'this account'} from ${sourceDir}: that token already ` +
@@ -546,12 +553,13 @@ function mirrorUnderLock(
 
 /**
  * Why a same-email default keeps its grant over `incoming`, or null to write.
- * Expiry alone never decides across lineages: a refresh of a revoked lineage
+ * Expiry alone never decides across families: a refresh of a replaced sign-in
  * carries a later expiry than a sign-in made before it. So the default takes an
- * in-place refresh of its own lineage, or the store's current grant when the
- * default holds a grant that store has held and moved past. A grant the store
- * has never held — a terminal login into ~/.claude — stays, and with no store
- * to ask, any grant of another lineage stays.
+ * in-place refresh of its own grant, or the store's current grant when the
+ * default holds an older refresh of the store's family or a refresh of an
+ * earlier family. A later family — a terminal login into ~/.claude — or a later
+ * refresh of the store's family stays, and with no store to ask, any grant of
+ * another lineage stays. The store's chain is read here, never written.
  */
 function sameEmailKeepReason(
   incoming: Buffer,
@@ -572,10 +580,15 @@ function sameEmailKeepReason(
     /* unreadable store: the incoming grant cannot be shown to be its own */
   }
   if (!storeTok || !sameCredential(incoming, storeTok)) return "source grant is not the store's";
-  if (!readGrantHistory(storeDir).includes(grantHash(current))) {
-    return 'default holds a grant the store has never held';
+  switch (relateToStore(current, storeTok, readGrantChain(storeDir))) {
+    case 'known':
+    case 'fork':
+      return null;
+    case 'continuation':
+      return 'default holds a newer refresh of the store family';
+    default:
+      return 'default holds a grant the store has never replaced';
   }
-  return null;
 }
 
 /**
