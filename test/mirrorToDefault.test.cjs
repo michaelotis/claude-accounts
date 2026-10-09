@@ -55,11 +55,14 @@ function modeOf(file) {
   return fs.statSync(file).mode & 0o777;
 }
 
-/** Production-shaped grant: stable refreshToken per account, distinct accessToken per grant. */
-function grant(expiresAt, email, accessToken) {
-  return JSON.stringify({
-    claudeAiOauth: { accessToken, refreshToken: `RT_${email}`, expiresAt },
-  });
+/** Production-shaped grant: stable refreshToken per account unless `rt` names a lineage. */
+function grant(expiresAt, email, accessToken, rt = `RT_${email}`) {
+  return JSON.stringify({ claudeAiOauth: { accessToken, refreshToken: rt, expiresAt } });
+}
+
+/** The store history's entry for a lineage: sha256 of its fingerprint, as workdir writes it. */
+function rtHash(rt) {
+  return require('crypto').createHash('sha256').update(`rt:${rt}`).digest('hex');
 }
 
 function writeJson(file, obj, mode = 0o600) {
@@ -809,6 +812,69 @@ describe('mirrorToDefault', () => {
     assert.equal(fs.readFileSync(defaultToken(), 'utf-8'), second);
     // Neither call contended with the other for the default dir's lock.
     assert.equal(logText().includes('default dir busy'), false);
+  });
+
+  const E = 'x@ex.com';
+  function makeStore(storeGrant, heldRts) {
+    const dir = path.join(tmpHome, 'store');
+    writeJson(path.join(dir, '.credentials.json'), storeGrant);
+    writeJson(path.join(dir, '.grant-history.json'), heldRts.map(rtHash));
+    return dir;
+  }
+  function namedDefault(tok) {
+    if (tok) writeJson(defaultToken(), tok);
+    writeJson(homeCfg(), { oauthAccount: { emailAddress: E, displayName: E } });
+  }
+
+  it("the store's earlier-expiry sign-in replaces a default grant the store moved past", async () => {
+    for (const takeover of [false, true]) {
+      namedDefault(grant(9_000, E, 'OLD', 'RT_OLD'));
+      const signIn = grant(1_000, E, 'NEW', 'RT_NEW');
+      const storeDir = makeStore(signIn, ['RT_OLD', 'RT_NEW']);
+      assert.equal(await mirrorToDefault(makeSource(E, signIn), { takeover, storeDir }), true);
+      assert.equal(fs.readFileSync(defaultToken(), 'utf-8'), signIn, `takeover=${takeover}`);
+    }
+  });
+
+  it('a grant the store has never held, or a source that is not the store, keeps the default', async () => {
+    const cases = [
+      // A later-expiry store lineage over a terminal login unknown to the history.
+      [grant(1_000, E, 'LOGIN', 'RT_LOGIN'), grant(9_000, E, 'S', 'RT_S'), ['RT_S'], 'never held'],
+      // A fork that is not the store's current grant over a known default.
+      [grant(1_000, E, 'OLD', 'RT_OLD'), grant(5_000, E, 'S', 'RT_S'), ['RT_OLD', 'RT_S'], null],
+    ];
+    for (const [cur, storeGrant, held, reason] of cases) {
+      const srcGrant = reason ? storeGrant : grant(9_000, E, 'FORK', 'RT_FORK');
+      for (const [takeover, storeDir] of [[false, 1], [true, 1], [false], [true]]) {
+        namedDefault(cur);
+        const opts = { takeover, storeDir: storeDir && makeStore(storeGrant, held) };
+        assert.equal(await mirrorToDefault(makeSource(E, srcGrant), opts), takeover);
+        assert.equal(fs.readFileSync(defaultToken(), 'utf-8'), cur, JSON.stringify(opts));
+      }
+    }
+    assert.ok(logText().includes('default holds a grant the store has never held'));
+    assert.ok(logText().includes("source grant is not the store's"));
+  });
+
+  it('a terminal login into ~/.claude survives the mid-OAuth re-check', async () => {
+    const storeGrant = grant(9_000, E, 'S', 'RT_S');
+    for (const withStore of [true, false]) {
+      disposeMirrorTimers();
+      _setMidOauthAbandonMs(50);
+      global.__caLog = [];
+      fs.rmSync(defaultToken(), { force: true });
+      namedDefault(null);
+      const storeDir = withStore ? makeStore(storeGrant, ['RT_S']) : undefined;
+      assert.equal(await mirrorToDefault(makeSource(E, storeGrant), { storeDir }), false);
+      const login = grant(1_000, E, 'LOGIN', 'RT_LOGIN');
+      writeJson(defaultToken(), login);
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline && !logText().includes('re-check for')) {
+        if (fs.readFileSync(defaultToken(), 'utf-8') !== login) break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.equal(fs.readFileSync(defaultToken(), 'utf-8'), login, `withStore=${withStore}`);
+    }
   });
 
   it('does not log a success line when the token write throws', async () => {
