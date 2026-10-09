@@ -11,6 +11,7 @@ import { log } from './log';
 import { readIdentity, hasCredentials } from './accounts';
 import { writeFileAtomic, withLockAsync } from './fsSafe';
 import { isWindowsPath } from './sidecars';
+import { recordGrantHistory } from './workdir';
 import {
   buildSnapshot,
   formatUsageBar,
@@ -577,7 +578,11 @@ const inflightTokenRefresh = new Map<string, Promise<string>>();
  * Refreshes when expiresAt is missing/past or within TOKEN_HEADROOM_MS.
  * Writes the new pair back into this config dir only.
  */
-async function ensureFreshToken(configDir: string, force = false): Promise<string> {
+async function ensureFreshToken(
+  configDir: string,
+  force = false,
+  isStore = false
+): Promise<string> {
   // Key by force: a forced refresh (the 401-retry path) must NOT join an
   // in-flight non-force refresh, which can resolve to the still-valid-looking
   // OLD access token via the `!force` short-circuit below and defeat the retry.
@@ -684,7 +689,12 @@ async function ensureFreshToken(configDir: string, force = false): Promise<strin
             scopes: typeof parsed.scope === 'string' ? parsed.scope.split(' ') : oauth?.scopes,
             subscriptionType: parsed.subscription_type || oauth?.subscriptionType,
           };
-          writeCredsAtomic(configDir, { ...(creds || {}), claudeAiOauth: nextOauth });
+          const next = { ...(creds || {}), claudeAiOauth: nextOauth };
+          // A store's displaced grant goes into its history, so the window copies
+          // of it are recognised as ones the store has moved past and restocked.
+          if (isStore) recordGrantHistory(configDir, Buffer.from(JSON.stringify(creds || {})));
+          writeCredsAtomic(configDir, next);
+          if (isStore) recordGrantHistory(configDir, Buffer.from(JSON.stringify(next)));
           log(`usage: token refreshed, expiry ${new Date(nextOauth.expiresAt).toISOString()}`);
           return parsed.access_token;
         } finally {
@@ -922,7 +932,11 @@ export function __ageInProcessStateForTests(ms = 0): void {
  * + cache. No pre-checks — callers (fetchUsageDetailed legacy path and the
  * coordinator) decide when a network call is warranted.
  */
-async function fetchUsageNetwork(dir: string, key: string): Promise<UsageFetchResult> {
+async function fetchUsageNetwork(
+  dir: string,
+  key: string,
+  isStore = false
+): Promise<UsageFetchResult> {
   const gap = callGapWaitMs(key);
   if (gap != null) {
     // The shared gates said go, this process's own memory says otherwise. This is
@@ -940,7 +954,7 @@ async function fetchUsageNetwork(dir: string, key: string): Promise<UsageFetchRe
   // (3) PRELIMINARY call path: ensureFreshToken (OAuth refresh when near expiry)
   let token: string;
   try {
-    token = await ensureFreshToken(dir, false);
+    token = await ensureFreshToken(dir, false, isStore);
   } catch (err) {
     const kind =
       typeof err === 'object' && err && 'kind' in err
@@ -977,7 +991,7 @@ async function fetchUsageNetwork(dir: string, key: string): Promise<UsageFetchRe
         // Force a refresh (bypasses the expiry check and re-reads creds under the
         // per-store lock) then retry once. No unlocked pre-write of expiresAt — it
         // was redundant with force=true and could clobber another window's refresh.
-        token = await ensureFreshToken(dir, true);
+        token = await ensureFreshToken(dir, true, isStore);
         // A second call for this key, sub-second after the first — record it or a
         // poll tick could chain straight onto it during a rotation storm.
         lastCallAttemptAt.set(key, Date.now());
@@ -1090,12 +1104,12 @@ export interface CoordinatedResult {
  * and past that ALSO skips — it never runs the network unlocked.
  */
 export async function fetchUsageCoordinated(
-  target: { dir: string; email?: string | null },
+  target: { dir: string; email?: string | null; isStore?: boolean },
   opts: {
     forceNetwork?: boolean;
     freshForMs?: number;
     /** Test seam: replaces the network step. */
-    _network?: (dir: string, key: string) => Promise<UsageFetchResult>;
+    _network?: (dir: string, key: string, isStore?: boolean) => Promise<UsageFetchResult>;
   } = {}
 ): Promise<CoordinatedResult> {
   const dir = resolveConfigDir(target.dir);
@@ -1161,7 +1175,7 @@ export async function fetchUsageCoordinated(
       // for, and this runs once per real fetch, not once per repaint.
       forgetMeta();
       if (inRateLimitBackoff(key)) return bestEffort();
-      const r = await network(dir, key);
+      const r = await network(dir, key, target.isStore === true);
       return { result: r, fromNetwork: true };
     },
     lockOpts
@@ -1616,7 +1630,7 @@ export class UsageMonitor {
         }
       }
       let { result, fromNetwork } = await fetchUsageCoordinated(
-        { dir: fetchDir, email },
+        { dir: fetchDir, email, isStore: fetchDir !== d },
         { forceNetwork }
       );
       if (
@@ -1636,7 +1650,7 @@ export class UsageMonitor {
           log(`usage: retry pre-sync failed — ${err instanceof Error ? err.message : String(err)}`);
         }
         ({ result, fromNetwork } = await fetchUsageCoordinated(
-          { dir: fetchDir, email },
+          { dir: fetchDir, email, isStore: fetchDir !== d },
           { forceNetwork }
         ));
       }
@@ -1759,7 +1773,7 @@ export class UsageMonitor {
       // afterwards would hold the NEW, good grant and never poll it again.
       const grantSent = grantFingerprint(a.dir);
       const { result, fromNetwork } = await fetchUsageCoordinated(
-        { dir: a.dir, email: a.email },
+        { dir: a.dir, email: a.email, isStore: true },
         { freshForMs: BACKGROUND_TTL_MS }
       );
       if (!result.ok) {

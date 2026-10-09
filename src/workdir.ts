@@ -7,6 +7,7 @@ import { isDeepStrictEqual } from 'util';
 import { Account, readIdentity, hasCredentials } from './accounts';
 import { isReservedClaudeDirName } from './sidecars';
 import { log } from './log';
+import { emailsEqual } from './workspaceRoutes';
 import { writeFileAtomic, copyFileAtomic, withLockAsync } from './fsSafe';
 
 /**
@@ -110,7 +111,25 @@ export function materialize(account: Account, workingDir: string, force = false)
     try {
       const dirTok = fs.readFileSync(path.join(workingDir, '.credentials.json'));
       const storeTok = fs.readFileSync(path.join(account.dir, '.credentials.json'));
-      if (sameCredential(dirTok, storeTok)) return false;
+      if (sameCredential(dirTok, storeTok)) {
+        observeDirGrant(workingDir, dirTok);
+        return false;
+      }
+      // A live grant the store has never held, under this account's own identity,
+      // is most likely a sign-in the store has not taken in (kept both, or not yet
+      // judged). Forcing the store's grant over it would undo that sign-in.
+      const exp = tokenExpiry(dirTok);
+      if (
+        !readGrantHistory(account.dir).includes(grantHash(dirTok)) &&
+        exp != null &&
+        exp > Date.now() &&
+        foreignTokenConflict(account.dir, dirTok, account.email) == null
+      ) {
+        log(
+          `workdir: ${workingDir} holds a grant ${account.name}'s store has never held — left in place`
+        );
+        return false;
+      }
     } catch {
       return false; // can't compare — leave the dir as-is rather than risk churn
     }
@@ -121,6 +140,14 @@ export function materialize(account: Account, workingDir: string, force = false)
       path.join(account.dir, '.credentials.json'),
       path.join(workingDir, '.credentials.json')
     );
+    try {
+      const copied = fs.readFileSync(path.join(workingDir, '.credentials.json'));
+      if (copied.equals(fs.readFileSync(path.join(account.dir, '.credentials.json')))) {
+        recordExtWrite(workingDir, copied, { processReads: false });
+      }
+    } catch {
+      /* no token copied — nothing to record */
+    }
     // The config carries the account's identity AND its per-project state (folder
     // trust, allowed tools, MCP servers), so an account keeps those wherever it runs.
     copyFile(path.join(account.dir, '.claude.json'), path.join(workingDir, '.claude.json'));
@@ -193,44 +220,17 @@ export function tokenExpiry(buf: Buffer): number | null {
   }
 }
 
-/**
- * True when `candidate` is a STRICTLY-OLDER, DIFFERENT grant than `reference` —
- * i.e. `reference` is the fresher of two grants for one account.
- *
- * Used by reconcile to refuse propagating a stale grant: when two windows run the
- * same account, each holds a copy of the store's grant; when either refreshes,
- * Anthropic rotates the refresh token, so the copies diverge into a newer grant
- * (the one that refreshed) and one or more older, now-dead ones. "Same account,
- * different refresh token, older expiry" is exactly that stale copy — and never a
- * legitimate state to mirror into ~/.claude. The same-lineage case (`sameCredential`,
- * e.g. an access-token refresh in place) is NOT stale; nor is an equal/newer expiry.
- */
-export function isStaleAgainstStore(candidate: Buffer, reference: Buffer): boolean {
-  if (sameCredential(candidate, reference)) return false;
-  const c = tokenExpiry(candidate);
-  const r = tokenExpiry(reference);
-  return c != null && r != null && r > c;
-}
-
 /** How many grant hashes a store remembers; older ones fall off the front. */
 const GRANT_HISTORY_MAX = 32;
 
 /** A credential file written this recently may be a sign-in still in progress. */
-const LOGIN_BURST_MS = 10_000;
+export const LOGIN_BURST_MS = 10_000;
 
-/**
- * How far past its file's write time a grant must expire to count as just issued.
- * A sign-in or a refresh writes the file at mint time, so its expiry sits close to
- * the 8 h token lifetime after the write; an old copy re-seeded into a window
- * from somewhere it was saved earlier is written long after it was minted.
- */
-export const MINTED_WINDOW_MS = 7 * 60 * 60 * 1000;
+/** How long a token-less dir counts as a sign-in in progress. */
+const SIGN_IN_OBSERVATION_MS = 60 * 60 * 1000;
 
-/** True when `buf` was written at the moment its grant was minted. */
-export function mintedAtWrite(buf: Buffer, mtimeMs: number): boolean {
-  const exp = tokenExpiry(buf);
-  return exp != null && exp - mtimeMs >= MINTED_WINDOW_MS;
-}
+/** Slack between the token-less observation and the new file's mtime (fs clocks). */
+const SIGN_IN_MTIME_SLACK_MS = 1_000;
 
 /** The store's record of which grants it has held, as hashes. */
 export function grantHistoryPath(storeDir: string): string {
@@ -238,7 +238,7 @@ export function grantHistoryPath(storeDir: string): string {
 }
 
 /** sha256 of a grant's fingerprint — what the history stores, never the secret. */
-function grantHash(buf: Buffer): string {
+export function grantHash(buf: Buffer): string {
   return crypto.createHash('sha256').update(credentialFingerprint(buf)).digest('hex');
 }
 
@@ -271,40 +271,217 @@ export function recordGrantHistory(storeDir: string, buf: Buffer): void {
   }
 }
 
-export type HealVerdict = 'adopt' | 'restock' | 'keep';
+/**
+ * A window dir's record of its grant: `h` is the grant on disk as the extension
+ * last saw or wrote it, `held` the grant the window's Claude Code process last
+ * demonstrably held, `by` who wrote `h`. Hashes only, like the store history.
+ *
+ * A refresh of a dead lineage in another window is file-identical to a sign-in
+ * (refresh tokens rotate), so nothing on disk can tell them apart. What can is
+ * which grant the process held before it wrote: Claude Code only writes what its
+ * process holds, so a write the extension did not make moves `held`; an
+ * extension write moves `h` only, because the running process keeps its
+ * in-memory grant until it restarts.
+ */
+export interface DirRecord {
+  h: string;
+  held: string | null;
+  by: 'ext' | 'cc';
+  at: number;
+}
+
+export function grantOriginPath(dir: string): string {
+  return path.join(dir, '.grant-origin.json');
+}
+
+/** ~/.claude is shared by every unbound window, so no one process's grant is its. */
+function isDefaultDir(dir: string): boolean {
+  return path.normalize(dir) === path.normalize(path.join(os.homedir(), '.claude'));
+}
+
+export function readDirRecord(dir: string): DirRecord | null {
+  if (isDefaultDir(dir)) return null;
+  try {
+    const d = JSON.parse(fs.readFileSync(grantOriginPath(dir), 'utf-8')) as Partial<DirRecord>;
+    if (typeof d.h !== 'string') return null;
+    return {
+      h: d.h,
+      held: typeof d.held === 'string' ? d.held : null,
+      by: d.by === 'ext' ? 'ext' : 'cc',
+      at: typeof d.at === 'number' ? d.at : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeDirRecord(dir: string, rec: Omit<DirRecord, 'at'>): void {
+  if (isDefaultDir(dir)) return;
+  try {
+    writeFileAtomic(grantOriginPath(dir), JSON.stringify({ ...rec, at: Date.now() }), {
+      mode: 0o600,
+    });
+  } catch (err) {
+    log(`workdir: could not record grant origin in ${dir}: ${(err as Error).message}`);
+  }
+}
 
 /**
- * What reconcile does with a window grant that differs from its store's.
+ * Notes the grant on disk. One the extension did not write is Claude Code's, so
+ * the process holds it. Writes nothing when the disk still matches the record,
+ * so a poll every minute rewrites nothing.
+ */
+export function observeDirGrant(dir: string, buf: Buffer): void {
+  if (isDefaultDir(dir)) return;
+  const h = grantHash(buf);
+  if (readDirRecord(dir)?.h === h) return;
+  writeDirRecord(dir, { h, held: h, by: 'cc' });
+}
+
+/**
+ * Notes a grant the extension wrote into a dir. `processReads` only when the
+ * window's Claude Code has not read the dir yet; otherwise the process keeps
+ * whatever it held.
+ */
+export function recordExtWrite(dir: string, buf: Buffer, opts: { processReads: boolean }): void {
+  if (isDefaultDir(dir)) return;
+  const h = grantHash(buf);
+  writeDirRecord(dir, {
+    h,
+    held: opts.processReads ? h : (readDirRecord(dir)?.held ?? null),
+    by: 'ext',
+  });
+}
+
+/** Dirs this host saw token-less, and when: a refresh never passes through that. */
+const tokenlessSeen = new Map<string, number>();
+
+export function noteTokenless(dir: string): void {
+  tokenlessSeen.set(path.normalize(dir), Date.now());
+}
+
+export function signInObservedAt(dir: string): number | null {
+  const key = path.normalize(dir);
+  const at = tokenlessSeen.get(key);
+  if (at === undefined) return null;
+  if (Date.now() - at > SIGN_IN_OBSERVATION_MS) {
+    tokenlessSeen.delete(key);
+    return null;
+  }
+  return at;
+}
+
+export type StoreRelation = 'same' | 'known' | 'continues' | 'unrelated';
+
+/**
+ * How a window's grant relates to its store's.
  *
  * A store grant that refreshes and reads usage can still be revoked at the API
- * (2026-10-09), so a later expiry proves nothing about which grant works. The
- * only grant safe to overwrite is one the store has held before — a lagging copy
- * of a lineage the store has since rotated past. A grant the store has never
- * held is adopted into the store only when its file was written at mint time (a
- * sign-in or an external rotation); one that was not may be a dead copy the
- * history has forgotten or never saw, so it is neither adopted nor restocked.
- * A file written in the last few seconds is left alone either way: a sign-in is
- * a burst of writes, and judging its middle would undo it.
+ * (2026-10-09), so expiry proves nothing about which grant works, and a
+ * refreshed dead lineage looks exactly like a sign-in. A grant the store has
+ * held and moved past is `known`. A grant it has never held `continues` the
+ * store's only when it is live and the window's process held the store's grant
+ * before Claude Code wrote it, or the dir was seen token-less first (a sign-in),
+ * or the caller is the fresh-grant capture; or when the store's own grant is
+ * unreadable and needs repair. Anything else is `unrelated`.
  */
-export function healVerdict(
+export function relateToStore(
   dirTok: Buffer,
   storeTok: Buffer,
   history: string[],
-  dirMtimeMs: number,
-  nowMs: number,
-  selfHeal: boolean
-): HealVerdict {
-  if (sameCredential(dirTok, storeTok)) return 'keep';
+  record: DirRecord | null,
+  opts: { dirChanged: boolean; signInObserved: boolean; trusted: boolean; nowMs: number }
+): StoreRelation {
+  if (sameCredential(dirTok, storeTok)) return 'same';
+  if (history.includes(grantHash(dirTok))) return 'known';
   const dirExp = tokenExpiry(dirTok);
-  if (dirExp == null) return 'keep';
-  if (!history.includes(grantHash(dirTok))) {
-    return mintedAtWrite(dirTok, dirMtimeMs) ? 'adopt' : 'keep';
+  if (dirExp == null || dirExp <= opts.nowMs) return 'unrelated';
+  if (
+    tokenExpiry(storeTok) == null ||
+    opts.trusted ||
+    opts.signInObserved ||
+    (opts.dirChanged && record?.held === grantHash(storeTok))
+  ) {
+    return 'continues';
   }
-  if (!selfHeal) return 'keep';
-  if (nowMs - dirMtimeMs < LOGIN_BURST_MS) return 'keep';
-  const storeExp = tokenExpiry(storeTok);
-  if (storeExp != null && storeExp > dirExp) return 'restock';
-  return 'keep';
+  return 'unrelated';
+}
+
+export type HealVerdict = 'adopt' | 'restock' | 'keep';
+
+export interface HealDecision {
+  verdict: HealVerdict;
+  reason: string;
+}
+
+/**
+ * What reconcile does with a window grant once it is related to the store. Only
+ * a known copy is ever restocked, whatever its expiry; a kept grant is never
+ * replaced by the extension. A file written in the last few seconds is left
+ * alone: a sign-in is a burst of writes, and judging its middle would undo it.
+ */
+export function healVerdict(
+  relation: StoreRelation | null,
+  selfHeal: boolean,
+  dirMtimeMs: number | null,
+  nowMs: number
+): HealDecision {
+  switch (relation) {
+    case 'same':
+      return { verdict: 'keep', reason: 'same' };
+    case 'continues':
+      return { verdict: 'adopt', reason: 'continues' };
+    case 'known':
+      if (!selfHeal) return { verdict: 'keep', reason: 'selfHeal-off' };
+      if (dirMtimeMs == null) return { verdict: 'keep', reason: 'unreadable-mtime' };
+      if (nowMs - dirMtimeMs < LOGIN_BURST_MS) return { verdict: 'keep', reason: 'burst' };
+      return { verdict: 'restock', reason: 'known' };
+    case 'unrelated':
+      return { verdict: 'keep', reason: 'unrelated' };
+    default:
+      return { verdict: 'keep', reason: 'unjudged' };
+  }
+}
+
+/**
+ * The activation step's half of the self-heal. It runs synchronously before
+ * Claude Code reads the env (see windowWorkingDir), so whatever the dir holds
+ * now is what the window's process will hold: that is the one moment an
+ * extension write reaches the process, and the record says so. A known copy is
+ * restocked here, before the process can refresh it into a fork.
+ */
+export function healAtActivation(account: Account, dir: string, opts: { selfHeal: boolean }): void {
+  try {
+    const file = path.join(dir, '.credentials.json');
+    if (!fs.existsSync(file)) return;
+    const dirTok = fs.readFileSync(file);
+    observeDirGrant(dir, dirTok);
+    const record = readDirRecord(dir);
+    if (record && record.held !== record.h) {
+      recordExtWrite(dir, dirTok, { processReads: true });
+    }
+    if (!opts.selfHeal) return;
+    if (!hasCredentials(dir) || !emailsEqual(readIdentity(dir)?.email, account.email)) return;
+    const storeTok = fs.readFileSync(path.join(account.dir, '.credentials.json'));
+    const relation = relateToStore(dirTok, storeTok, readGrantHistory(account.dir), record, {
+      dirChanged: false,
+      signInObserved: false,
+      trusted: false,
+      nowMs: Date.now(),
+    });
+    if (relation !== 'known') return;
+    const storeForeign = foreignTokenConflict(account.dir, storeTok, account.email);
+    if (storeForeign) {
+      log(`workdir: store grant of ${account.name} also lives in ${storeForeign} — not restocked`);
+      return;
+    }
+    if (restockTokenOnly(storeTok, dir, dirTok)) {
+      recordExtWrite(dir, storeTok, { processReads: true });
+      log(`workdir: ${dir} restocked at activation`);
+    }
+  } catch (err) {
+    log(`workdir: activation heal of ${dir} failed: ${(err as Error).message}`);
+  }
 }
 
 /**
@@ -352,6 +529,7 @@ export function restockTokenOnly(
     }
     fs.mkdirSync(workingDir, { recursive: true, mode: 0o700 });
     writeFileAtomic(dst, src, { mode: 0o600 });
+    recordExtWrite(workingDir, src, { processReads: false });
     return true;
   } catch (err) {
     log(`workdir: could not restock token into ${workingDir}: ${(err as Error).message}`);
@@ -416,6 +594,13 @@ export function foreignTokenConflict(
   return null;
 }
 
+/** What one refreshStore pass concluded; `deferred` when the store lock was busy. */
+export interface StoreRefresh {
+  relation: StoreRelation | null;
+  wrote: boolean;
+  deferred: boolean;
+}
+
 /**
  * Copies a working dir's (possibly refreshed) token back into the account's
  * store, so the store never falls far behind the credential actually in use.
@@ -425,17 +610,24 @@ export function foreignTokenConflict(
  * Refuses when the incoming token already belongs to a DIFFERENT account (the
  * contamination tripwire): a working dir whose identity has drifted from its
  * token would otherwise write one account's credential into another's store.
+ *
+ * `trusted` is for the fresh-grant capture only: a sign-in as another account,
+ * which no dead lineage can produce.
  */
-export async function refreshStore(account: Account, workingDir: string): Promise<void> {
+export async function refreshStore(
+  account: Account,
+  workingDir: string,
+  opts: { trusted?: boolean } = {}
+): Promise<StoreRefresh> {
   const src = path.join(workingDir, '.credentials.json');
   const dst = path.join(account.dir, '.credentials.json');
+  const out: StoreRefresh = { relation: null, wrote: false, deferred: false };
   try {
-    if (!fs.existsSync(src)) return;
-    const incoming = fs.readFileSync(src);
+    if (!fs.existsSync(src)) return out;
     // Serialize the read-compare-write on the store's credentials — the SAME lock
-    // ensureFreshToken (usage.ts) takes when it rotates a store token — so newest-
-    // wins is a real compare-and-set, not a lock-free RMW that could publish an
-    // older grant over a concurrently-written newer one. Async lock: it awaits
+    // ensureFreshToken (usage.ts) takes when it rotates a store token — so the
+    // judgment is a real compare-and-set, not a lock-free RMW that could publish
+    // an older grant over a concurrently-written newer one. Async lock: it awaits
     // between attempts (never a synchronous Atomics.wait), so it can't freeze the
     // extension host even while ensureFreshToken holds this lock across a
     // multi-second OAuth refresh. skipIfUnacquired: never write unlocked on a stale
@@ -444,72 +636,101 @@ export async function refreshStore(account: Account, workingDir: string): Promis
     const { locked } = await withLockAsync(
       `${dst}.lock`,
       () => {
-        if (fs.existsSync(dst)) {
-          const cur = fs.readFileSync(dst);
-          // The store's grant goes into its history before anything replaces it,
-          // so a copy of it left in another dir is recognised later as one the
-          // store has moved past.
-          recordGrantHistory(account.dir, cur);
-          if (cur.equals(incoming)) return;
-          // Never regress the store. A grant is adopted only when it is VALID
-          // (parseable expiry) AND one of: the store's grant is unparseable; the
-          // incoming is a grant the store has never held and was written at mint
-          // time (a sign-in or an external rotation — adopted whatever its expiry,
-          // because a later store expiry does not prove the store grant still
-          // works; an unknown grant written long after it was minted may be a
-          // dead copy the history no longer remembers); or it is the store's own
-          // grant refreshed in place to a later expiry. A grant the store HAS held
-          // and moved past is refused even when its expiry is later: after a
-          // sign-in replaces a revoked grant, other dirs (windows, ~/.claude) still
-          // hold the revoked one, and letting expiry win would put it straight
-          // back. Refusing also keeps the store quiescent — with every window
-          // watching it (0.9.9), write-through of older copies would let two idle
-          // windows re-trigger each other and flap the store indefinitely.
-          const inExp = tokenExpiry(incoming);
-          const curExp = tokenExpiry(cur);
-          const known = readGrantHistory(account.dir).includes(grantHash(incoming));
-          let minted = false;
-          if (!known) {
-            try {
-              minted = mintedAtWrite(incoming, fs.statSync(src).mtimeMs);
-            } catch {
-              /* unreadable mtime — not provably minted */
+        let incoming: Buffer;
+        let mtimeMs: number | null = null;
+        try {
+          incoming = fs.readFileSync(src);
+        } catch {
+          return; // emptied since the check — a logout, nothing to carry
+        }
+        try {
+          mtimeMs = fs.statSync(src).mtimeMs;
+        } catch {
+          /* unreadable mtime — cannot be placed after a sign-in observation */
+        }
+        // The record as it stood before this write: its `held` is the grant the
+        // window's process held when Claude Code wrote what is on disk now.
+        const record = readDirRecord(workingDir);
+        const observedAt = signInObservedAt(workingDir);
+        const signInObserved =
+          observedAt != null && mtimeMs != null && mtimeMs >= observedAt - SIGN_IN_MTIME_SLACK_MS;
+        try {
+          let cur = Buffer.alloc(0);
+          if (fs.existsSync(dst)) {
+            cur = fs.readFileSync(dst);
+            // The store's grant goes into its history before anything replaces it,
+            // so a copy of it left in another dir is recognised later as one the
+            // store has moved past.
+            recordGrantHistory(account.dir, cur);
+            if (cur.equals(incoming)) {
+              out.relation = 'same';
+              return;
             }
           }
-          const adopt =
-            inExp != null &&
-            (curExp == null || minted || (sameCredential(incoming, cur) && inExp > curExp));
-          if (!adopt) {
+          const conflict = foreignTokenConflict(account.dir, incoming, account.email);
+          if (conflict) {
+            out.relation = 'unrelated';
             log(
-              known
-                ? `workdir: ${account.email ?? account.name}: incoming grant is a known older copy — kept store`
-                : `workdir: ${account.email ?? account.name}: incoming grant is unknown and not freshly minted — kept store`
+              `workdir: REFUSED store refresh of ${account.name} — that token already belongs to ` +
+                `${conflict} (cross-account contamination guard)`
             );
             return;
           }
+          // Never regress the store, and never take in a grant only because it
+          // looks newer: a later expiry does not prove a grant works, and a dead
+          // lineage refreshed in another window looks exactly like a sign-in. A
+          // grant the store has held and moved past stays out (other dirs still
+          // hold the revoked one after a sign-in replaces it, and with every
+          // window watching the store, write-through of older copies would flap
+          // it). The store's own grant refreshed in place is written through when
+          // its expiry is later.
+          const relation = relateToStore(incoming, cur, readGrantHistory(account.dir), record, {
+            dirChanged: record != null && record.h !== grantHash(incoming),
+            signInObserved,
+            trusted: opts.trusted === true,
+            nowMs: Date.now(),
+          });
+          out.relation = relation;
+          const inExp = tokenExpiry(incoming);
+          const curExp = tokenExpiry(cur);
+          const write =
+            relation === 'continues' ||
+            (relation === 'same' && inExp != null && (curExp == null || inExp > curExp));
+          if (!write) {
+            const who = account.email ?? account.name;
+            log(
+              relation === 'known'
+                ? `workdir: ${who}: incoming grant is a known older copy — kept store`
+                : relation === 'same'
+                  ? `workdir: ${who}: incoming grant is not newer than the store's — kept store`
+                  : `workdir: ${who}: incoming grant is unrelated to the store's ` +
+                    `(${record ? `last written by ${record.by}` : 'no record'}) — kept store`
+            );
+            return;
+          }
+          fs.mkdirSync(account.dir, { recursive: true, mode: 0o700 });
+          // Unique-temp atomic write: a half-written store is worse than a stale one.
+          writeFileAtomic(dst, incoming, { mode: 0o600 });
+          recordGrantHistory(account.dir, incoming);
+          out.wrote = true;
+          log(`workdir: refreshed store of ${account.email ?? account.name}`);
+        } finally {
+          observeDirGrant(workingDir, incoming);
+          if (signInObserved) tokenlessSeen.delete(path.normalize(workingDir));
         }
-        const conflict = foreignTokenConflict(account.dir, incoming, account.email);
-        if (conflict) {
-          log(
-            `workdir: REFUSED store refresh of ${account.name} — that token already belongs to ` +
-              `${conflict} (cross-account contamination guard)`
-          );
-          return;
-        }
-        fs.mkdirSync(account.dir, { recursive: true, mode: 0o700 });
-        // Unique-temp atomic write: a half-written store is worse than a stale one.
-        writeFileAtomic(dst, incoming, { mode: 0o600 });
-        recordGrantHistory(account.dir, incoming);
-        log(`workdir: refreshed store of ${account.email ?? account.name}`);
       },
       { capMs: 3_000, skipIfUnacquired: true }
     );
     if (!locked) {
+      // Nothing judged, so nothing observed or consumed: noting the dir now would
+      // move `held` past the grant the retry has to judge against.
+      out.deferred = true;
       log(`workdir: store of ${account.email ?? account.name} is busy — deferred refresh`);
     }
   } catch (err) {
     log(`workdir: could not refresh store of ${account.name}: ${(err as Error).message}`);
   }
+  return out;
 }
 
 /** Every working dir on disk — used to sign an account out of all of them. */

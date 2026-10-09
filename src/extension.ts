@@ -400,7 +400,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   } else if (preferredAtStart && !preferredAtStart.account) {
     log(`workspace route ${preferredAtStart.email} has no saved account yet — sign in as it once`);
   }
-  const appliedStart = binding.applyStored(resolveAccount, preferredName);
+  const appliedStart = binding.applyStored(resolveAccount, preferredName, {
+    selfHeal: wizard.selfHealEnabled(),
+  });
   // applyStored moves this window's config dir without raising onDidChange, so
   // the record has to be told: without this the map would name the dir the
   // window came up on until the next heartbeat, and a card painted in between
@@ -494,7 +496,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         `Sign in with /login as that email once, then reopen the folder.`
     );
   } else if (!bound) {
-    const again = binding.applyStored(resolveAccount);
+    const again = binding.applyStored(resolveAccount, undefined, {
+      selfHeal: wizard.selfHealEnabled(),
+    });
     bound = again?.stocked ? again.account : again?.account;
     notePresence();
   }
@@ -702,7 +706,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   await wizard.reconcile({ atActivation: true });
   // reconcile() may have just bound this window to a freshly-saved account.
   if (!bound) {
-    const after = binding.applyStored(resolveAccount);
+    const after = binding.applyStored(resolveAccount, undefined, {
+      selfHeal: wizard.selfHealEnabled(),
+    });
     bound = after?.stocked ? after.account : after?.account;
     notePresence();
   }

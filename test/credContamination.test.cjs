@@ -51,8 +51,9 @@ const {
   materialize,
   restockTokenOnly,
   tokenExpiry,
-  isStaleAgainstStore,
   recordGrantHistory,
+  grantHash,
+  grantOriginPath,
 } = bundle('../src/workdir.ts', 'workdir.bundle.cjs');
 const { snapshotAccount } = bundle('../src/capture.ts', 'capture.bundle.cjs');
 
@@ -76,20 +77,32 @@ const TOKEN_A_ACCESS_ROTATED = JSON.stringify({
 // Self-heal fixtures: one account, but the refresh token ROTATED (a new grant
 // lineage) with a newer expiry — the shape of a token after Anthropic rotates it.
 // GRANT_OLD is the stale copy a second window keeps; GRANT_NEW is what the window
-// that refreshed (and the store) now holds. GRANT_NEW_SAMELINEAGE shares GRANT_OLD's
-// refresh token (an access-token refresh in place) so it is NOT a different grant.
+// that refreshed (and the store) now holds.
 const GRANT_OLD = JSON.stringify({
   claudeAiOauth: { accessToken: 'AC1', refreshToken: 'ROT_1', expiresAt: 1000 },
 });
 const GRANT_NEW = JSON.stringify({
   claudeAiOauth: { accessToken: 'AC2', refreshToken: 'ROT_2', expiresAt: 2000 },
 });
-const GRANT_NEW_SAMELINEAGE = JSON.stringify({
-  claudeAiOauth: { accessToken: 'AC1b', refreshToken: 'ROT_1', expiresAt: 2000 },
-});
 const GRANT_NOEXP = JSON.stringify({
   claudeAiOauth: { accessToken: 'AC3', refreshToken: 'ROT_3' },
 });
+
+// A's grant refreshed in place, still live: without the tripwire, a window whose
+// process held its store's grant would carry it in as a continuation.
+const LIVE_EXP = Date.now() + 479 * 60_000;
+const TOKEN_A_LIVE = JSON.stringify({
+  claudeAiOauth: { accessToken: 'ACCESS_A_live', refreshToken: 'REFRESH_A', expiresAt: LIVE_EXP },
+});
+
+/** The dir record of a window whose process held `held` before Claude Code wrote. */
+function heldBefore(dir, held) {
+  fs.writeFileSync(
+    grantOriginPath(dir),
+    JSON.stringify({ h: 'f'.repeat(64), held: grantHash(Buffer.from(held)), by: 'cc', at: 0 }),
+    { mode: 0o600 }
+  );
+}
 
 /** Fresh isolated HOME per test — no shared fixture, so no order-coupling. */
 function withHome(fn) {
@@ -208,6 +221,12 @@ describe('refreshStore contamination guard', () => {
         TOKEN_B,
         'b store must be unchanged — the foreign grant was refused'
       );
+      // Live, and the window's process held b's grant: only the tripwire refuses it.
+      const wd2 = mk('wd2', 'b@example.com', TOKEN_A_LIVE);
+      heldBefore(wd2, TOKEN_B);
+      const r = await refreshStore({ name: 'b', dir: b, email: 'b@example.com' }, wd2);
+      assert.equal(r.relation, 'unrelated');
+      assert.equal(fs.readFileSync(path.join(b, '.credentials.json'), 'utf8'), TOKEN_B);
     });
   });
 
@@ -223,6 +242,14 @@ describe('refreshStore contamination guard', () => {
         fs.readFileSync(path.join(b, '.credentials.json'), 'utf8'),
         TOKEN_B,
         'refused despite the access-token rotation — refresh token still identifies account A'
+      );
+      const wd2 = mk('wd2', 'b@example.com', TOKEN_A_LIVE);
+      heldBefore(wd2, TOKEN_B);
+      await refreshStore({ name: 'b', dir: b, email: 'b@example.com' }, wd2, { trusted: true });
+      assert.equal(
+        fs.readFileSync(path.join(b, '.credentials.json'), 'utf8'),
+        TOKEN_B,
+        'refused even as a trusted continuation'
       );
     });
   });
@@ -408,32 +435,11 @@ describe('snapshotAccount contamination guard (capture path)', () => {
   });
 });
 
-describe('tokenExpiry / isStaleAgainstStore (self-heal staleness)', () => {
+describe('tokenExpiry', () => {
   it('reads expiresAt and returns null when absent/unparseable', () => {
     assert.equal(tokenExpiry(Buffer.from(GRANT_OLD)), 1000);
     assert.equal(tokenExpiry(Buffer.from(GRANT_NOEXP)), null);
     assert.equal(tokenExpiry(Buffer.from('not json')), null);
-  });
-
-  it('flags a strictly-older, DIFFERENT grant as stale', () => {
-    // The second window's old copy vs the store's freshly-rotated grant.
-    assert.equal(isStaleAgainstStore(Buffer.from(GRANT_OLD), Buffer.from(GRANT_NEW)), true);
-  });
-
-  it('does NOT flag the newer grant, the same lineage, equal expiry, or a missing expiry', () => {
-    // The window that just refreshed is newer — not stale (must not be pulled back).
-    assert.equal(isStaleAgainstStore(Buffer.from(GRANT_NEW), Buffer.from(GRANT_OLD)), false);
-    // Same refresh token (access-token refresh in place) — same lineage, not stale.
-    assert.equal(
-      isStaleAgainstStore(Buffer.from(GRANT_OLD), Buffer.from(GRANT_NEW_SAMELINEAGE)),
-      false
-    );
-    // Equal expiry, different grants — ambiguous, so never deemed stale (no flap).
-    const eqA = JSON.stringify({ claudeAiOauth: { refreshToken: 'RX', expiresAt: 1000 } });
-    const eqB = JSON.stringify({ claudeAiOauth: { refreshToken: 'RY', expiresAt: 1000 } });
-    assert.equal(isStaleAgainstStore(Buffer.from(eqA), Buffer.from(eqB)), false);
-    // A missing expiry can't be compared — never stale.
-    assert.equal(isStaleAgainstStore(Buffer.from(GRANT_NOEXP), Buffer.from(GRANT_NEW)), false);
   });
 });
 
@@ -455,9 +461,8 @@ describe('refreshStore newest-wins (self-heal: never regress the store)', () => 
     });
   });
 
-  it('DOES adopt a strictly-newer grant from the window (the one that refreshed)', async () => {
+  it('DOES adopt the grant of the window that refreshed the store grant', async () => {
     await withHomeAsync(async (home, mk) => {
-      // A refresh writes its file at mint time, with the full 8 h lifetime left.
       const minted = JSON.stringify({
         claudeAiOauth: {
           accessToken: 'AC2',
@@ -465,8 +470,10 @@ describe('refreshStore newest-wins (self-heal: never regress the store)', () => 
           expiresAt: Date.now() + 8 * 3_600_000,
         },
       });
+      // The window's process held the store's grant when Claude Code wrote it.
       const store = mk('.claude-b', 'b@example.com', GRANT_OLD);
       const wd = mk('wd', 'b@example.com', minted);
+      heldBefore(wd, GRANT_OLD);
       await refreshStore({ name: 'b', dir: store, email: 'b@example.com' }, wd);
       assert.equal(fs.readFileSync(path.join(store, '.credentials.json'), 'utf8'), minted);
     });
@@ -492,35 +499,37 @@ describe('refreshStore newest-wins (self-heal: never regress the store)', () => 
       const wd = mk('wd', 'b@example.com', TOKEN_A); // foreign + older than the store
       await refreshStore({ name: 'b', dir: store, email: 'b@example.com' }, wd);
       assert.equal(fs.readFileSync(path.join(store, '.credentials.json'), 'utf8'), GRANT_NEW);
+      const wd2 = mk('wd2', 'b@example.com', TOKEN_A_LIVE); // foreign + live
+      heldBefore(wd2, GRANT_NEW);
+      await refreshStore({ name: 'b', dir: store, email: 'b@example.com' }, wd2);
+      assert.equal(fs.readFileSync(path.join(store, '.credentials.json'), 'utf8'), GRANT_NEW);
     });
   });
 
   it('repairs an UNPARSEABLE store with a valid incoming grant', async () => {
     await withHomeAsync(async (home, mk) => {
       const store = mk('.claude-b', 'b@example.com', 'not json at all'); // corrupt store token
-      const wd = mk('wd', 'b@example.com', GRANT_NEW);
+      const live = JSON.stringify({
+        claudeAiOauth: { accessToken: 'AC2', refreshToken: 'ROT_2', expiresAt: LIVE_EXP },
+      });
+      const wd = mk('wd', 'b@example.com', live);
       await refreshStore({ name: 'b', dir: store, email: 'b@example.com' }, wd);
       assert.equal(
         fs.readFileSync(path.join(store, '.credentials.json'), 'utf8'),
-        GRANT_NEW,
+        live,
         'a valid grant may replace a corrupt/unparseable store'
       );
     });
   });
 });
 
-describe('tokenExpiry / isStaleAgainstStore edges', () => {
+describe('tokenExpiry edges', () => {
   it('tokenExpiry reads a flat (non-nested) expiresAt and rejects a non-number', () => {
     assert.equal(tokenExpiry(Buffer.from(JSON.stringify({ expiresAt: 4242 }))), 4242);
     assert.equal(
       tokenExpiry(Buffer.from(JSON.stringify({ claudeAiOauth: { expiresAt: 'soon' } }))),
       null
     );
-  });
-
-  it('isStaleAgainstStore is null-safe on the REFERENCE side too', () => {
-    // reference (store) has no expiry → cannot prove the candidate older → not stale.
-    assert.equal(isStaleAgainstStore(Buffer.from(GRANT_OLD), Buffer.from(GRANT_NOEXP)), false);
   });
 });
 

@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import { Account, hasCredentials, readIdentity } from './accounts';
 import {
   materialize,
+  healAtActivation,
   windowWorkingDir,
   syncMcpServers,
   linkUserSettings,
@@ -262,7 +263,8 @@ export class WindowBinding {
    */
   applyStored(
     resolve: (name: string) => Account | undefined,
-    preferredName?: string
+    preferredName?: string,
+    opts: { selfHeal?: boolean } = {}
   ): ApplyStoredResult | undefined {
     const tryResolve = (name: string | undefined): Account | undefined =>
       name ? resolve(name) : undefined;
@@ -294,6 +296,9 @@ export class WindowBinding {
     const isLogout = looksLikeLogout(dir);
     const fromPreferred = Boolean(preferredName && account.name === preferredName);
     materialize(account, dir, fromPreferred && !isLogout);
+    // Still ahead of Claude Code: whatever the dir holds now is what its process
+    // will read, so this is where a copy the store has moved past is restocked.
+    if (!isLogout) healAtActivation(account, dir, { selfHeal: opts.selfHeal !== false });
 
     const dirEmail = readIdentity(dir)?.email;
     const accountEmail = account.email ?? readIdentity(account.dir)?.email;
