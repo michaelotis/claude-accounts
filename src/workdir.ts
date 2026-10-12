@@ -97,24 +97,17 @@ export function windowWorkingDir(context: vscode.ExtensionContext): string {
  *     server-side. The window would look fine and fail on its first request, and
  *     the logout would never be noticed at all. `force` is for an explicit switch,
  *     where stocking an empty dir is exactly what the user asked for.
- *
- * A dir whose identity drifted from the account's is judged by its grant, forced
- * or not: the store's own grant gets the identity back and keeps its token, a
- * grant another account's store holds by hash or family is replaced, and any
- * other grant is left untouched for reconcile's drift path.
  */
 export function materialize(account: Account, workingDir: string, force = false): boolean {
   const exists = fs.existsSync(workingDir);
   if (exists && !hasCredentials(workingDir) && !force) return false; // emptied by a logout
-  const dirIdentity = readIdentity(workingDir)?.email;
-  const hasTok = hasCredentials(workingDir);
-  if (hasTok && emailsEqual(dirIdentity, account.email)) {
+  if (hasCredentials(workingDir) && readIdentity(workingDir)?.email === account.email) {
     // Same account already. Without force, never churn (the dir's copy may hold a
     // newer refreshed token). WITH force, still skip when the GRANT matches, and
     // leave a grant of a family the store has never replaced: a later sign-in, a
     // later refresh of the current family, or a grant with no family anchor; and
     // leave a dir alone while the store's file is behind its chain, unless the
-    // dir holds an older copy of the file's own family. A forced
+    // dir holds the file's own family. A forced
     // restock repairs a dir that wears this identity but holds another account's
     // grant, a grant of a family another account's chain knows, or a copy this
     // store has moved past.
@@ -137,36 +130,6 @@ export function materialize(account: Account, workingDir: string, force = false)
           relation === 'behind'
             ? `workdir: ${workingDir}: store file of ${account.name} is behind its chain — left in place`
             : `workdir: ${workingDir} holds a grant ${account.name}'s store has never held — left in place`
-        );
-        return false;
-      }
-    } catch {
-      return false; // can't compare — leave the dir as-is rather than risk churn
-    }
-  } else if (hasTok) {
-    // Identity drifted over a grant: Claude Code restamps a dir from the shared
-    // home file while its token stays put, so the token is judged, not the name.
-    // The store's own grant only needs the identity back; a grant another
-    // account's store holds is replaced as before; anything else may be a live
-    // grant this store cannot vouch for, and reconcile's drift path decides it.
-    try {
-      const dirTok = fs.readFileSync(path.join(workingDir, '.credentials.json'));
-      const storeTok = fs.readFileSync(path.join(account.dir, '.credentials.json'));
-      if (sameCredential(dirTok, storeTok)) {
-        copyFile(path.join(account.dir, '.claude.json'), path.join(workingDir, '.claude.json'));
-        log(
-          `workdir: ${workingDir}: identity drifted over ${account.name}'s own grant — ` +
-            `restamped, token kept`
-        );
-        return true;
-      }
-      const foreign =
-        foreignTokenConflict(account.dir, dirTok, account.email) ??
-        foreignAnchorConflict(account.dir, anchorOf(dirTok), account.email);
-      if (foreign == null) {
-        log(
-          `workdir: ${workingDir}: identity drifted over a grant ${account.name}'s store ` +
-            `cannot place — left for reconcile`
         );
         return false;
       }

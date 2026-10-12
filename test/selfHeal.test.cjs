@@ -183,8 +183,8 @@ describe('relateToStore', () => {
     const older = grant('rt-Ob', c, LIVE - MIN);
     assert.equal(relateToStore(older, grant('rt-Sb1', c - W + SEC), chainOf(c)), 'known');
     assert.equal(relateToStore(older, grant('rt-Sb2', c - W - SEC), chainOf(c)), 'behind');
-    // A grant of the chain's family at the far edge of its window reads `known`
-    // only because the slack keeps a file W - 1 s before current out of `behind`.
+    // A grant of the chain's family at the far edge of its window: within W of a
+    // file W - 1 s before current only through the slack.
     const edge = grant('rt-Oe', c + W - SEC, LIVE - MIN);
     assert.equal(relateToStore(edge, grant('rt-Sb1', c - W + SEC), chainOf(c)), 'known');
   });
