@@ -19,7 +19,8 @@
   that date. A window is restocked only when it holds an older refresh of the
   store's current family or a refresh of an earlier family. A later family
   written in a window is carried into the store, whatever its access-token
-  expiry; a refresh of an earlier family is never carried in; a grant with no
+  expiry; a refresh of an earlier family is never carried in, except the family
+  an older version wrote back into the store (below); a grant with no
   family date is left alone. Each account store keeps a small list of family
   dates and grant hashes in its own file; no token is written to it.
   `~/.claude` follows the same rule, including after a terminal login there,
@@ -44,8 +45,9 @@
   **Reload every window after updating:** a window still running the previous
   version can write an earlier family back into an account store. The new
   version does not record that as the store's current family and leaves such a
-  store alone: no window is restocked from it and nothing is carried into it
-  until a sign-in from any window, which puts it back on a current family.
+  store on that family: windows holding it are restocked from it when older
+  and carry newer refreshes into it, windows on the later sign-in keep what
+  they hold, and a sign-in from any window puts it back on a current family.
 
 ## 0.9.22
 
