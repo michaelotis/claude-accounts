@@ -189,3 +189,75 @@ describe('applyStored heals the window before Claude Code reads it (P1-M1)', () 
     assertEnv(dir);
   });
 });
+
+describe('applyStored judges a window whose identity drifted before stocking it (P5-C1)', () => {
+  const OTHER = 'b@x.com';
+  const config = (dir) => fs.readFileSync(path.join(dir, '.claude.json'));
+  const emailOf = (dir) => JSON.parse(config(dir)).oauthAccount.emailAddress;
+  /** What Claude Code leaves when it restamps the dir from the shared home file. */
+  function bleed(dir) {
+    fs.writeFileSync(
+      path.join(dir, '.claude.json'),
+      JSON.stringify({ oauthAccount: { emailAddress: OTHER, displayName: 'B' } })
+    );
+  }
+  /** A store behind its chain, and a window holding the chain's live grant. */
+  function behindStore(dir) {
+    const L1 = grant('rt-L1', F(0));
+    const L2 = grant('rt-L2', F(0), LIVE + 10 * MIN);
+    stock(dir, L2, grant('rt-Sb', F(-20)), { current: F(0), hashes: [hash(L1), hash(L2)] });
+    bleed(dir);
+    return L2;
+  }
+
+  it('leaves a live grant of the chain family under a drifted identity', () => {
+    const { binding, dir } = windowBinding();
+    const L2 = behindStore(dir);
+    const before = config(dir);
+    binding.applyStored(resolve, undefined, { selfHeal: true });
+    assert.ok(read(dir).equals(L2));
+    assert.ok(config(dir).equals(before));
+    assert.ok(globalThis.__logLines.some((l) => /cannot place — left for reconcile/.test(l)));
+  });
+
+  it('leaves it on a forced stock too', () => {
+    const { binding, dir } = windowBinding();
+    const L2 = behindStore(dir);
+    const before = config(dir);
+    binding.applyStored(resolve, 'acct', { selfHeal: true });
+    assert.ok(read(dir).equals(L2));
+    assert.ok(config(dir).equals(before));
+  });
+
+  it("restamps the identity over the store's own grant and keeps the token", () => {
+    const { binding, dir } = windowBinding();
+    const S = grant('rt-S', F(0));
+    // The window's copy of the store's grant, carrying a field the store's lacks.
+    const W = Buffer.from(JSON.stringify({ ...JSON.parse(S), window: 'own' }));
+    stock(dir, W, S, { current: F(0), hashes: [hash(S)] });
+    bleed(dir);
+    const r = binding.applyStored(resolve, undefined, { selfHeal: true });
+    assert.equal(r.stocked, true);
+    assert.ok(read(dir).equals(W));
+    assert.equal(emailOf(dir), EMAIL);
+    assert.ok(globalThis.__logLines.some((l) => /restamped, token kept/.test(l)));
+    assertEnv(dir);
+  });
+
+  it("replaces a grant another account's store holds", () => {
+    const { binding, dir } = windowBinding();
+    const other = path.join(home, '.claude-other');
+    fs.mkdirSync(other, { recursive: true });
+    const O = grant('rt-O', F(-100));
+    fs.writeFileSync(creds(other), O);
+    bleed(other);
+    const S = grant('rt-S', F(0));
+    stock(dir, O, S, { current: F(0), hashes: [hash(S)] });
+    bleed(dir);
+    const r = binding.applyStored(resolve, undefined, { selfHeal: true });
+    assert.equal(r.stocked, true);
+    assert.ok(read(dir).equals(S));
+    assert.equal(emailOf(dir), EMAIL);
+    assertEnv(dir);
+  });
+});
