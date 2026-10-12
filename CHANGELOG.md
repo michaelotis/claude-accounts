@@ -12,8 +12,8 @@
   `/login` in a panel that came out with an earlier expiry was compared with it,
   lost, and overwritten with the revoked token, and the window was signed out
   again before it had made a call. A sign-in from a plain terminal stuck only
-  when its expiry happened to be later. The rule no longer looks at
-  access-token expiry or at when a file was written. Every sign-in starts a new
+  when its expiry happened to be later. The rule no longer decides between
+  sign-ins by access-token expiry. Every sign-in starts a new
   token family and every refresh stays in it; Claude Code records the family's
   expiry date in the credential file, and the extension now orders families by
   that date. A window is restocked only when it holds an older refresh of the
@@ -29,9 +29,11 @@
   sign-in is several writes in a row;
   the restock made when a window starts runs before Claude Code reads the
   file. The cross-account tripwire
-  now also refuses a grant whose family belongs to another saved account, and a
-  window whose identity drifted onto a grant of its own account's family is
-  left as it is and logged rather than saved under the other name. The new
+  now also refuses a grant whose family belongs to another saved account, and
+  on the periodic check a window whose identity drifted onto a grant of its
+  own account's family gets its identity back when the store has held that
+  grant and is otherwise left as it is and logged rather than saved under the
+  other name. The new
   `claudeAccounts.selfHeal` setting (on by default) restocks a window whose
   credential file holds a copy its account store has moved past: an older
   refresh of the account's current sign-in, or any refresh of a sign-in a later

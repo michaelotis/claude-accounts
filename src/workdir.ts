@@ -107,7 +107,7 @@ export function materialize(account: Account, workingDir: string, force = false)
     // leave a grant of a family the store has never replaced: a later sign-in, a
     // later refresh of the current family, or a grant with no family anchor; and
     // leave a dir alone while the store's file is behind its chain, unless the
-    // dir holds the file's own family. A forced
+    // dir holds an older copy of the file's own family. A forced
     // restock repairs a dir that wears this identity but holds another account's
     // grant, a grant of a family another account's chain knows, or a copy this
     // store has moved past.
