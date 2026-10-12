@@ -286,12 +286,12 @@ describe('refreshStore contamination guard', () => {
 
   it('refuses a same-lineage copy the store has held, even with a later expiry (store-watch flap guard, 0.9.9)', async () => {
     await withHomeAsync(async (home, mk) => {
-      // Store holds b's refreshed grant; a lagging window still carries a copy of
-      // the SAME lineage the store held before. Writing it through would regress
-      // the store — and with every window watching the store, two idle windows
-      // would re-trigger each other and flap it indefinitely. It must be refused.
-      // Both carry one family anchor, and the copy's expiry is later than the
-      // store's, so only the store's memory of its hash marks it as known.
+      // A window carries a copy of b's family whose hash the store's chain holds.
+      // Writing a held copy through would regress the store — and with every
+      // window watching the store, two idle windows would re-trigger each other and
+      // flap it indefinitely. It must be refused. The copy's expiry is set later
+      // than the store's (a constructed order: a refresh never mints an earlier
+      // expiry), so only the store's memory of its hash marks it as known.
       const refreshed = JSON.stringify({
         claudeAiOauth: {
           accessToken: 'ACCESS_B2',

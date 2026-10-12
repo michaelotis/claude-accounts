@@ -909,6 +909,44 @@ describe('mirrorToDefault', () => {
     }
   });
 
+  it("a store file behind its chain: the chain's family is kept, the file's own family is judged within it", async () => {
+    // The chain moved to F(20) (L1, then L2); an older version wrote S, of the
+    // displaced family F(0), back into the file.
+    const B = 'behind@ex.com';
+    const S = grant(5_000, B, 'S', 'RT_S', F(0));
+    const cases = [
+      [grant(5_000, B, 'L2', 'RT_L2', F(20)), 'store file is behind its chain'],
+      [grant(1_000, B, 'S0', 'RT_S0', F(0)), null],
+      [
+        grant(9_000, B, 'S2', 'RT_S2', F(0) + SEC),
+        'default holds a newer refresh of the store family',
+      ],
+    ];
+    for (const [cur, reason] of cases) {
+      for (const takeover of [false, true]) {
+        global.__caLog = [];
+        namedDefault(cur, B);
+        const storeDir = makeStore(S, {
+          current: F(20),
+          displaced: [],
+          hashes: ['RT_L1', 'RT_L2'],
+        });
+        const replaced = reason == null;
+        assert.equal(
+          await mirrorToDefault(makeSource(B, S), { takeover, storeDir }),
+          replaced || takeover
+        );
+        const want = replaced ? S : cur;
+        assert.equal(
+          fs.readFileSync(defaultToken(), 'utf-8'),
+          want,
+          `${reason} takeover=${takeover}`
+        );
+        if (reason) assert.ok(logText().includes(reason), `${reason} takeover=${takeover}`);
+      }
+    }
+  });
+
   it("a source that is not the store's, or no store to ask, keeps the default", async () => {
     const S = grant(5_000, E, 'S', 'RT_S', F(0));
     const cur = grant(1_000, E, 'OLD', 'RT_OLD', F(-20));

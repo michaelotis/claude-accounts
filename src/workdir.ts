@@ -106,7 +106,8 @@ export function materialize(account: Account, workingDir: string, force = false)
     // newer refreshed token). WITH force, still skip when the GRANT matches, and
     // leave a grant of a family the store has never replaced: a later sign-in, a
     // later refresh of the current family, or a grant with no family anchor; and
-    // leave a dir alone while the store's file is behind its chain. A forced
+    // leave a dir alone while the store's file is behind its chain, unless the
+    // dir holds the file's own family. A forced
     // restock repairs a dir that wears this identity but holds another account's
     // grant, a grant of a family another account's chain knows, or a copy this
     // store has moved past.
@@ -322,6 +323,24 @@ export function readGrantHistory(storeDir: string): string[] {
   return readGrantChain(storeDir).hashes;
 }
 
+/**
+ * True when `set` already holds this store with an anchor of the same family;
+ * otherwise records the store and anchor and returns false. A refresh moves the
+ * anchor by about a second, so keying on the exact anchor would log again for
+ * every refresh of one family.
+ */
+function loggedForFamily(set: Set<string>, storeDir: string, anchor: number | null): boolean {
+  const store = path.normalize(storeDir);
+  for (const key of set) {
+    const sep = key.lastIndexOf('\0');
+    if (key.slice(0, sep) !== store) continue;
+    const prev = key.slice(sep + 1);
+    if (anchor == null ? prev === 'null' : sameAnchor(Number(prev), anchor)) return true;
+  }
+  set.add(`${store}\0${anchor}`);
+  return false;
+}
+
 /** Stores whose regression has been logged, keyed with the anchor they moved back to. */
 const regressionLogged = new Set<string>();
 
@@ -354,9 +373,7 @@ export function observeStoreGrant(storeDir: string, buf: Buffer): void {
         chain.current = a;
         changed = true;
       } else if (a < chain.current - ANCHOR_WINDOW_MS) {
-        const key = `${path.normalize(storeDir)}\0${a}`;
-        if (!regressionLogged.has(key)) {
-          regressionLogged.add(key);
+        if (!loggedForFamily(regressionLogged, storeDir, a)) {
           log(
             `workdir: store of ${path.basename(storeDir)} moved back to an earlier family — ` +
               `not recorded as current`
@@ -420,9 +437,10 @@ export type StoreRelation =
  * current family from a consumed one. The file's own family is judged within
  * itself: a hash the store has held or an older refresh is `known` (restocked
  * from the file), a later refresh a `continuation` (carried into the file; the
- * chain's current family stays where it is). A grant without
- * an anchor is `legacy` and matches nothing; an unreadable store takes a grant
- * that has an anchor and an expiry.
+ * chain's current family stays where it is). A grant within the window of both
+ * the file's family and the chain's stays `behind`. A grant without an anchor is
+ * `legacy` and matches nothing; an unreadable store takes a grant that has an
+ * anchor and an expiry.
  * Pure: no clock, no mtime. `unrelated` is only ever set by a caller whose
  * tripwire refused the grant.
  */
@@ -436,7 +454,7 @@ export function relateToStore(dirTok: Buffer, storeTok: Buffer, chain: GrantChai
   if (a == null || s == null) return 'legacy';
   if (chain.current != null && s < chain.current - ANCHOR_WINDOW_MS) {
     if (a > chain.current + ANCHOR_WINDOW_MS) return 'sign-in';
-    if (sameAnchor(a, s)) {
+    if (sameAnchor(a, s) && !sameAnchor(a, chain.current)) {
       if (chain.hashes.includes(grantHash(dirTok)) || dirExp == null || dirExp <= storeExp) {
         return 'known';
       }
@@ -770,10 +788,8 @@ export async function refreshStore(account: Account, workingDir: string): Promis
           (relation === 'same' && inExp != null && (curExp == null || inExp > curExp));
         const who = account.email ?? account.name;
         if (!write) {
-          if (relation === 'behind') {
-            const key = `${path.normalize(account.dir)}\0${anchorOf(cur)}`;
-            if (behindLogged.has(key)) return;
-            behindLogged.add(key);
+          if (relation === 'behind' && loggedForFamily(behindLogged, account.dir, anchorOf(cur))) {
+            return;
           }
           log(
             relation === 'known'

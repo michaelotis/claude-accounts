@@ -225,11 +225,7 @@ describe('the poller rotating a store token', () => {
       }
       const rotated = JSON.parse(cred(other).toString()).claudeAiOauth.refreshToken;
       assert.notEqual(rotated, 'rt-Y0', 'the poller rotated the store token');
-      const chainPath = path.join(other, '.grant-chain.json');
-      if (fs.existsSync(chainPath)) {
-        const chain = chainFile(other);
-        assert.deepEqual([chain.current, chain.hashes], [null, []], 'nothing of Y is recorded');
-      }
+      assert.ok(!fs.existsSync(path.join(other, '.grant-chain.json')), 'nothing of Y is recorded');
       // B's file carries Y's family through the spread until B signs in; after the
       // sign-in only B's chain could still name Y's family.
       const bSignIn = grant('rt-B9', ANCHOR + 9 * HOUR, T + 479 * MIN);
