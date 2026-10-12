@@ -46,8 +46,10 @@
   version can write an earlier family back into an account store. The new
   version does not record that as the store's current family and leaves such a
   store on that family: windows holding it are restocked from it when older
-  and carry newer refreshes into it, windows on the later sign-in keep what
-  they hold, and a sign-in from any window puts it back on a current family.
+  and carry newer refreshes into it (unless they sit within ten minutes of the
+  later sign-in's family date, where they are kept), windows on any other
+  family, the later sign-in included, keep what they hold, and a sign-in from
+  any window puts it back on a current family.
 
 ## 0.9.22
 
