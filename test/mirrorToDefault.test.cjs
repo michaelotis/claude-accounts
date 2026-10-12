@@ -38,6 +38,7 @@ esbuild.buildSync({
 });
 const {
   mirrorToDefault,
+  snapshotAccount,
   _setMidOauthAbandonMs,
   _setBeforeIdentityWrite,
   _setBeforeMirrorLock,
@@ -55,11 +56,27 @@ function modeOf(file) {
   return fs.statSync(file).mode & 0o777;
 }
 
-/** Production-shaped grant: stable refreshToken per account, distinct accessToken per grant. */
-function grant(expiresAt, email, accessToken) {
-  return JSON.stringify({
-    claudeAiOauth: { accessToken, refreshToken: `RT_${email}`, expiresAt },
-  });
+/**
+ * Production-shaped grant: stable refreshToken per account unless `rt` names a
+ * lineage, and the family anchor (`refreshTokenExpiresAt`) when one is given.
+ */
+function grant(expiresAt, email, accessToken, rt = `RT_${email}`, anchor) {
+  const oauth = { accessToken, refreshToken: rt, expiresAt };
+  if (anchor !== undefined) oauth.refreshTokenExpiresAt = anchor;
+  return JSON.stringify({ claudeAiOauth: oauth });
+}
+
+// Family anchors sit 30 days out and an hour apart per family, like the 24-30
+// day lifetimes sign-ins mint; a refresh keeps its family's anchor within a
+// second, far inside ANCHOR_WINDOW_MS in src/workdir.ts.
+const T = Date.now();
+const SEC = 1_000;
+const HOUR = 60 * 60_000;
+const F = (k) => T + 30 * 24 * HOUR + k * HOUR;
+
+/** The store history's entry for a lineage: sha256 of its fingerprint, as workdir writes it. */
+function rtHash(rt) {
+  return require('crypto').createHash('sha256').update(`rt:${rt}`).digest('hex');
 }
 
 function writeJson(file, obj, mode = 0o600) {
@@ -809,6 +826,219 @@ describe('mirrorToDefault', () => {
     assert.equal(fs.readFileSync(defaultToken(), 'utf-8'), second);
     // Neither call contended with the other for the default dir's lock.
     assert.equal(logText().includes('default dir busy'), false);
+  });
+
+  const E = 'x@ex.com';
+  /**
+   * An account store holding `storeGrant`. A chain object `{current, displaced,
+   * hashes}` (hashes named by refresh token) is written to `.grant-chain.json`;
+   * an array is the r1 `.grant-history.json` list, which u1 still reads.
+   */
+  function makeStore(storeGrant, chain) {
+    const dir = path.join(tmpHome, 'store');
+    fs.rmSync(dir, { recursive: true, force: true });
+    writeJson(path.join(dir, '.credentials.json'), storeGrant);
+    if (Array.isArray(chain)) {
+      writeJson(path.join(dir, '.grant-history.json'), chain.map(rtHash));
+    } else {
+      writeJson(path.join(dir, '.grant-chain.json'), {
+        v: 2,
+        current: chain.current,
+        displaced: chain.displaced,
+        hashes: chain.hashes.map(rtHash),
+      });
+    }
+    return dir;
+  }
+  function namedDefault(tok, email = E) {
+    if (tok) writeJson(defaultToken(), tok);
+    writeJson(homeCfg(), { oauthAccount: { emailAddress: email, displayName: email } });
+  }
+
+  it("the store's current grant replaces an older refresh of its family or a refresh of an earlier one", async () => {
+    const S = grant(5_000, E, 'S', 'RT_S', F(0));
+    const cases = [
+      // An older refresh of the store's family: same anchor, earlier expiry,
+      // a hash the chain never recorded.
+      ['older refresh', grant(1_000, E, 'S0', 'RT_S0', F(0))],
+      // A refresh of a family a later sign-in replaced: its expiry is later than
+      // the store's, which must not decide.
+      ['earlier family', grant(9_000, E, 'E1', 'RT_E1', F(-20))],
+    ];
+    for (const [label, cur] of cases) {
+      for (const takeover of [false, true]) {
+        global.__caLog = [];
+        namedDefault(cur);
+        const storeDir = makeStore(S, { current: F(0), displaced: [F(-20)], hashes: ['RT_S'] });
+        assert.equal(await mirrorToDefault(makeSource(E, S), { takeover, storeDir }), true);
+        assert.equal(fs.readFileSync(defaultToken(), 'utf-8'), S, `${label} takeover=${takeover}`);
+        assert.ok(!fs.existsSync(path.join(defaultDir(), '.grant-chain.json')));
+      }
+    }
+  });
+
+  it('a later family or a later refresh of the store family in the default is kept', async () => {
+    // Its own email: the passive decline line is throttled per message across
+    // the module, and an earlier case must not be able to swallow it.
+    const K = 'kept@ex.com';
+    const S = grant(5_000, K, 'S', 'RT_S', F(0));
+    const cases = [
+      // A terminal login into ~/.claude: a later family, an earlier expiry.
+      [
+        grant(1_000, K, 'LOGIN', 'RT_LOGIN', F(20)),
+        'default holds a grant the store has never replaced',
+      ],
+      // Claude Code refreshed ~/.claude in place: the store's family, later expiry.
+      [
+        grant(9_000, K, 'S2', 'RT_S2', F(0) + SEC),
+        'default holds a newer refresh of the store family',
+      ],
+    ];
+    for (const [cur, reason] of cases) {
+      for (const takeover of [false, true]) {
+        global.__caLog = [];
+        namedDefault(cur, K);
+        const storeDir = makeStore(S, { current: F(0), displaced: [], hashes: ['RT_S'] });
+        const chainBefore = fs.readFileSync(path.join(storeDir, '.grant-chain.json'));
+        assert.equal(await mirrorToDefault(makeSource(K, S), { takeover, storeDir }), takeover);
+        assert.equal(fs.readFileSync(defaultToken(), 'utf-8'), cur, `takeover=${takeover}`);
+        assert.ok(logText().includes(reason), `${reason} takeover=${takeover}`);
+        // The mirror reads the chain and never writes it.
+        assert.deepEqual(fs.readFileSync(path.join(storeDir, '.grant-chain.json')), chainBefore);
+      }
+    }
+  });
+
+  it("a store file behind its chain: the chain's family is kept, the file's own family is judged within it", async () => {
+    // The chain moved to F(20) (L1, then L2); an older version wrote S, of the
+    // displaced family F(0), back into the file.
+    const B = 'behind@ex.com';
+    const S = grant(5_000, B, 'S', 'RT_S', F(0));
+    const cases = [
+      [grant(5_000, B, 'L2', 'RT_L2', F(20)), 'store file is behind its chain'],
+      [grant(1_000, B, 'S0', 'RT_S0', F(0)), null],
+      [
+        grant(9_000, B, 'S2', 'RT_S2', F(0) + SEC),
+        'default holds a newer refresh of the store family',
+      ],
+    ];
+    for (const [cur, reason] of cases) {
+      for (const takeover of [false, true]) {
+        global.__caLog = [];
+        namedDefault(cur, B);
+        const storeDir = makeStore(S, {
+          current: F(20),
+          displaced: [],
+          hashes: ['RT_L1', 'RT_L2'],
+        });
+        const replaced = reason == null;
+        assert.equal(
+          await mirrorToDefault(makeSource(B, S), { takeover, storeDir }),
+          replaced || takeover
+        );
+        const want = replaced ? S : cur;
+        assert.equal(
+          fs.readFileSync(defaultToken(), 'utf-8'),
+          want,
+          `${reason} takeover=${takeover}`
+        );
+        if (reason) assert.ok(logText().includes(reason), `${reason} takeover=${takeover}`);
+      }
+    }
+  });
+
+  it("a source that is not the store's, or no store to ask, keeps the default", async () => {
+    const S = grant(5_000, E, 'S', 'RT_S', F(0));
+    const cur = grant(1_000, E, 'OLD', 'RT_OLD', F(-20));
+    const fork = grant(9_000, E, 'FORK', 'RT_FORK', F(0));
+    for (const [takeover, withStore] of [
+      [false, true],
+      [true, true],
+      [false, false],
+      [true, false],
+    ]) {
+      namedDefault(cur);
+      const storeDir = withStore
+        ? makeStore(S, { current: F(0), displaced: [F(-20)], hashes: ['RT_OLD', 'RT_S'] })
+        : undefined;
+      assert.equal(await mirrorToDefault(makeSource(E, fork), { takeover, storeDir }), takeover);
+      assert.equal(fs.readFileSync(defaultToken(), 'utf-8'), cur, `${takeover} ${withStore}`);
+    }
+    assert.ok(logText().includes("source grant is not the store's"));
+    assert.ok(logText().includes('default holds a grant of another lineage'));
+  });
+
+  it('an r1 history array is still read: a default grant it lists is replaced', async () => {
+    // Same family, and a later expiry than the store's: only the hash the r1
+    // list holds makes it a copy the store has moved past.
+    const S = grant(5_000, E, 'S', 'RT_S', F(0));
+    const old = grant(9_000, E, 'OLD', 'RT_OLD', F(0));
+    for (const takeover of [false, true]) {
+      namedDefault(old);
+      const storeDir = makeStore(S, ['RT_OLD', 'RT_S']);
+      assert.equal(await mirrorToDefault(makeSource(E, S), { takeover, storeDir }), true);
+      assert.equal(fs.readFileSync(defaultToken(), 'utf-8'), S, `takeover=${takeover}`);
+    }
+  });
+
+  it('a terminal login into ~/.claude survives the mid-OAuth re-check', async () => {
+    const storeGrant = grant(9_000, E, 'S', 'RT_S', F(0));
+    for (const withStore of [true, false]) {
+      disposeMirrorTimers();
+      _setMidOauthAbandonMs(50);
+      global.__caLog = [];
+      fs.rmSync(defaultToken(), { force: true });
+      namedDefault(null);
+      const storeDir = withStore
+        ? makeStore(storeGrant, { current: F(0), displaced: [], hashes: ['RT_S'] })
+        : undefined;
+      assert.equal(await mirrorToDefault(makeSource(E, storeGrant), { storeDir }), false);
+      const login = grant(1_000, E, 'LOGIN', 'RT_LOGIN', F(20));
+      writeJson(defaultToken(), login);
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline && !logText().includes('re-check for')) {
+        if (fs.readFileSync(defaultToken(), 'utf-8') !== login) break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.equal(fs.readFileSync(defaultToken(), 'utf-8'), login, `withStore=${withStore}`);
+    }
+  });
+
+  describe('snapshotAccount', () => {
+    const OTHER = 'other@ex.com';
+    function otherStore({ current, displaced = [], fileAnchor }) {
+      const dir = path.join(tmpHome, '.claude-other');
+      writeJson(path.join(dir, '.claude.json'), {
+        oauthAccount: { emailAddress: OTHER, displayName: OTHER },
+      });
+      writeJson(path.join(dir, '.credentials.json'), grant(5_000, OTHER, 'O', 'RT_O', fileAnchor));
+      writeJson(path.join(dir, '.grant-chain.json'), { v: 2, current, displaced, hashes: [] });
+      return dir;
+    }
+    const target = () => path.join(tmpHome, '.claude-x');
+
+    it("refuses a grant whose family another account's chain or file knows", () => {
+      const other = otherStore({ current: F(0), displaced: [F(-20)], fileAnchor: F(-40) });
+      // Within the window of the other chain's current, a displaced family, and
+      // its credential file's family; no grant matches byte-wise.
+      for (const a of [F(0) + SEC, F(-20) - 2 * SEC, F(-40) + 5 * 60_000]) {
+        const src = makeSource(E, grant(9_000, E, 'N', `RT_N${a}`, a));
+        assert.throws(
+          () => snapshotAccount(src, target(), { email: E }),
+          (err) => err.message.includes('Refusing to save') && err.message.includes(other),
+          `anchor ${a}`
+        );
+        assert.equal(fs.existsSync(path.join(target(), '.credentials.json')), false);
+      }
+    });
+
+    it('mints a store from a grant of a family no other account knows', () => {
+      otherStore({ current: F(0), displaced: [F(-20)], fileAnchor: F(-40) });
+      const tok = grant(9_000, E, 'N', 'RT_N', F(20));
+      const src = makeSource(E, tok);
+      snapshotAccount(src, target(), { email: E });
+      assert.equal(fs.readFileSync(path.join(target(), '.credentials.json'), 'utf-8'), tok);
+    });
   });
 
   it('does not log a success line when the token write throws', async () => {

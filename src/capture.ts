@@ -4,7 +4,15 @@ import * as os from 'os';
 import { AuthStatus } from './cli';
 import { AccountIdentity, readIdentity } from './accounts';
 import { writeFileAtomic, copyFileAtomic, withLockAsync } from './fsSafe';
-import { foreignTokenConflict, tokenExpiry } from './workdir';
+import {
+  anchorOf,
+  foreignAnchorConflict,
+  foreignTokenConflict,
+  readGrantChain,
+  relateToStore,
+  sameCredential,
+  tokenExpiry,
+} from './workdir';
 import { emailsEqual } from './workspaceRoutes';
 import { log } from './log';
 
@@ -31,7 +39,12 @@ export function snapshotAccount(
   // belongs to a DIFFERENT account. Without this, a working dir whose identity
   // drifted from its token (or a restore-forgotten of an email whose dir holds a
   // foreign token) would snapshot one account's credential under another's name.
-  const conflict = foreignTokenConflict(targetDir, fs.readFileSync(srcCreds), status.email);
+  const srcToken = fs.readFileSync(srcCreds);
+  // The family form: a grant whose sign-in another account's chain knows is that
+  // account's, even when no copy of it matches byte-wise.
+  const conflict =
+    foreignTokenConflict(targetDir, srcToken, status.email) ??
+    foreignAnchorConflict(targetDir, anchorOf(srcToken), status.email);
   if (conflict) {
     throw new Error(
       `Refusing to save ${status.email ?? 'this account'} from ${sourceDir}: that token already ` +
@@ -252,12 +265,13 @@ export function defaultSourceDir(): string {
  *
  * `~/.claude` follows the last explicitly chosen account (Switch Account, Save, a
  * real in-window /login). Passive reconcile only refills an empty default or
- * refreshes the same account with a newer grant — never flips between saved
- * accounts. A named token-less default is refilled only by that account, counting
- * five minutes from when this process first saw the token missing (so a live
- * `claude /login` that still names the account is not overwritten). The default
- * tracks the newest grant: any byte change is a candidate, and byte-identical is
- * the only skip. A token is
+ * refreshes the same account — never flips between saved accounts. A named
+ * token-less default is refilled only by that account, counting five minutes
+ * from when this process first saw the token missing (so a live `claude /login`
+ * that still names the account is not overwritten). A same-account grant lands
+ * only as a refresh of the default's own lineage, or as the store's current
+ * grant over one that store has held and moved past (`storeDir`); a grant the
+ * store has never held stays. A token is
  * never stamped without the identity read from the same source dir (token first,
  * then identity). An unreadable ~/.claude.json is never overwritten. Remove the
  * extension at ANY instant, and Claude Code carries on as that last chosen
@@ -275,7 +289,7 @@ export function defaultSourceDir(): string {
  */
 export function mirrorToDefault(
   sourceDir: string,
-  opts: { takeover?: boolean } = {}
+  opts: { takeover?: boolean; storeDir?: string } = {}
 ): Promise<boolean> {
   const defaultDir = defaultSourceDir();
   if (isDefaultDir(sourceDir)) return Promise.resolve(false); // already is the default
@@ -291,7 +305,7 @@ export function mirrorToDefault(
   const epoch = disposeEpoch;
   const prior = mirrorQueue.get(defaultDir);
   const run = (prior ? prior.catch(() => false) : Promise.resolve(false)).then(() =>
-    mirrorOnce(defaultDir, sourceDir, !!opts.takeover, epoch)
+    mirrorOnce(defaultDir, sourceDir, !!opts.takeover, epoch, opts.storeDir)
   );
   mirrorQueue.set(defaultDir, run);
   void run
@@ -309,7 +323,8 @@ async function mirrorOnce(
   defaultDir: string,
   sourceDir: string,
   takeover: boolean,
-  epoch: number
+  epoch: number,
+  storeDir: string | undefined
 ): Promise<boolean> {
   try {
     // Token first, then identity, both from sourceDir: the pair stamped into
@@ -352,7 +367,7 @@ async function mirrorOnce(
     beforeMirrorLock?.();
     const { result, locked } = await withLockAsync(
       path.join(defaultDir, '.credentials.json.lock'),
-      () => mirrorUnderLock(defaultDir, incoming, identity, takeover, sourceDir, epoch),
+      () => mirrorUnderLock(defaultDir, incoming, identity, takeover, sourceDir, epoch, storeDir),
       {
         // withLockAsync's own defaults are tuned for the long history merge;
         // these are the caps this path has always used.
@@ -384,7 +399,8 @@ function mirrorUnderLock(
   identity: AccountIdentity,
   takeover: boolean,
   sourceDir: string,
-  epoch: number
+  epoch: number,
+  storeDir: string | undefined
 ): boolean {
   const dstToken = path.join(defaultDir, '.credentials.json');
   let current: Buffer | undefined;
@@ -426,21 +442,15 @@ function mirrorUnderLock(
   };
 
   if (takeover) {
-    const inExp = tokenExpiry(incoming);
-    const curExp = current ? tokenExpiry(current) : null;
+    const keep =
+      current && !current.equals(incoming) && emailsEqual(h.email, identity.email)
+        ? sameEmailKeepReason(incoming, current, storeDir)
+        : null;
     if (current && current.equals(incoming)) {
       // Byte-identical is the only skip — a same-account access-token rotation
-      // must still land; the default tracks the newest grant.
-    } else if (
-      current &&
-      emailsEqual(h.email, identity.email) &&
-      inExp != null &&
-      curExp != null &&
-      inExp < curExp
-    ) {
-      log(
-        `mirror (takeover): default already holds a newer grant for ${identity.email} — keeping it`
-      );
+      // must still land.
+    } else if (keep) {
+      log(`mirror (takeover): ${keep} for ${identity.email} — keeping the default's grant`);
     } else {
       writeToken(`mirror (takeover): default now runs ${identity.email} from ${sourceDir}`);
     }
@@ -479,7 +489,14 @@ function mirrorUnderLock(
           false
         );
         if (!tokenlessTimerArmed.has(key)) {
-          scheduleReCheck(key, sourceDir, h.email, MID_OAUTH_ABANDON_MS - elapsed + 1000, epoch);
+          scheduleReCheck(
+            key,
+            sourceDir,
+            h.email,
+            MID_OAUTH_ABANDON_MS - elapsed + 1000,
+            epoch,
+            storeDir
+          );
         }
         return false;
       }
@@ -514,9 +531,7 @@ function mirrorUnderLock(
     );
     return false;
   } else {
-    const inExp = tokenExpiry(incoming);
-    const curExp = tokenExpiry(current);
-    if (inExp == null) {
+    if (tokenExpiry(incoming) == null) {
       lastMirrorSkipReason = 'incoming grant has no parseable expiry';
       logDecision(
         `mirror: incoming grant for ${identity.email} has no parseable expiry — not refreshing`,
@@ -524,18 +539,58 @@ function mirrorUnderLock(
       );
       return false;
     }
-    if (!(curExp == null || inExp > curExp)) {
-      lastMirrorSkipReason = 'incoming grant is not newer';
-      logDecision(
-        `mirror: incoming grant for ${identity.email} is not newer — keeping default`,
-        false
-      );
+    const keep = sameEmailKeepReason(incoming, current, storeDir);
+    if (keep) {
+      lastMirrorSkipReason = keep;
+      logDecision(`mirror: ${keep} for ${identity.email} — keeping default`, false);
       return false;
     }
     writeToken(`mirror: refreshed default grant for ${identity.email}`);
   }
 
   return stampHomeIdentity(identity, takeover, tokenWritten, dstToken);
+}
+
+/**
+ * Why a same-email default keeps its grant over `incoming`, or null to write.
+ * Expiry alone never decides across families: a refresh of a replaced sign-in
+ * carries a later expiry than a sign-in made before it. So the default takes an
+ * in-place refresh of its own grant, or the store's current grant when the
+ * default holds an older refresh of the store's family or a refresh of an
+ * earlier family. A later family — a terminal login into ~/.claude — or a later
+ * refresh of the store's family stays, and with no store to ask, any grant of
+ * another lineage stays. The store's chain is read here, never written.
+ */
+function sameEmailKeepReason(
+  incoming: Buffer,
+  current: Buffer,
+  storeDir: string | undefined
+): string | null {
+  if (sameCredential(incoming, current)) {
+    const inExp = tokenExpiry(incoming);
+    const curExp = tokenExpiry(current);
+    if (inExp != null && (curExp == null || inExp > curExp)) return null;
+    return 'incoming grant is not newer';
+  }
+  if (storeDir === undefined) return 'default holds a grant of another lineage';
+  let storeTok: Buffer | undefined;
+  try {
+    storeTok = fs.readFileSync(path.join(storeDir, '.credentials.json'));
+  } catch {
+    /* unreadable store: the incoming grant cannot be shown to be its own */
+  }
+  if (!storeTok || !sameCredential(incoming, storeTok)) return "source grant is not the store's";
+  switch (relateToStore(current, storeTok, readGrantChain(storeDir))) {
+    case 'known':
+    case 'fork':
+      return null;
+    case 'continuation':
+      return 'default holds a newer refresh of the store family';
+    case 'behind':
+      return 'store file is behind its chain';
+    default:
+      return 'default holds a grant the store has never replaced';
+  }
 }
 
 /**
@@ -684,7 +739,8 @@ function scheduleReCheck(
   sourceDir: string,
   email: string,
   delay: number,
-  epoch: number
+  epoch: number,
+  storeDir: string | undefined
 ): void {
   if (epoch !== disposeEpoch) return;
   tokenlessTimerArmed.add(key);
@@ -692,7 +748,7 @@ function scheduleReCheck(
     const idx = tokenlessTimers.indexOf(t);
     if (idx !== -1) tokenlessTimers.splice(idx, 1);
     tokenlessTimerArmed.delete(key);
-    void runReCheck(key, sourceDir, email, epoch);
+    void runReCheck(key, sourceDir, email, epoch, storeDir);
   }, delay);
   if (typeof t.unref === 'function') t.unref();
   tokenlessTimers.push(t);
@@ -702,10 +758,11 @@ async function runReCheck(
   key: string,
   sourceDir: string,
   email: string,
-  epoch: number
+  epoch: number,
+  storeDir: string | undefined
 ): Promise<void> {
   if (epoch !== disposeEpoch) return;
-  const ok = await mirrorToDefault(sourceDir);
+  const ok = await mirrorToDefault(sourceDir, { storeDir });
   if (ok) return;
   // Disposed while the mirror was awaited: retrying would re-arm a timer for a
   // window that is going away.
@@ -720,7 +777,7 @@ async function runReCheck(
       `mirror: re-check for ${email} could not run (${reason}) — will try once more`,
       false
     );
-    scheduleReCheck(key, sourceDir, email, RECHECK_RETRY_MS, epoch);
+    scheduleReCheck(key, sourceDir, email, RECHECK_RETRY_MS, epoch, storeDir);
   } else {
     logDecision(
       `mirror: re-check for ${email} could not run (${reason}) — giving up until the next reconcile`,

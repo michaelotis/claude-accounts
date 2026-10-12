@@ -7,6 +7,7 @@ import { isDeepStrictEqual } from 'util';
 import { Account, readIdentity, hasCredentials } from './accounts';
 import { isReservedClaudeDirName } from './sidecars';
 import { log } from './log';
+import { emailsEqual } from './workspaceRoutes';
 import { writeFileAtomic, copyFileAtomic, withLockAsync } from './fsSafe';
 
 /**
@@ -102,15 +103,36 @@ export function materialize(account: Account, workingDir: string, force = false)
   if (exists && !hasCredentials(workingDir) && !force) return false; // emptied by a logout
   if (hasCredentials(workingDir) && readIdentity(workingDir)?.email === account.email) {
     // Same account already. Without force, never churn (the dir's copy may hold a
-    // newer refreshed token). WITH force, still skip only when the GRANT also
-    // matches — a forced restock must overwrite a dir that wears this account's
-    // identity but holds a DIFFERENT (foreign/mismatched) token, or a re-assert
-    // could never repair such a mix.
+    // newer refreshed token). WITH force, still skip when the GRANT matches, and
+    // leave a grant of a family the store has never replaced: a later sign-in, a
+    // later refresh of the current family, or a grant with no family anchor; and
+    // leave a dir alone while the store's file is behind its chain, unless the
+    // dir holds an older copy of the file's own family. A forced
+    // restock repairs a dir that wears this identity but holds another account's
+    // grant, a grant of a family another account's chain knows, or a copy this
+    // store has moved past.
     if (!force) return false;
     try {
       const dirTok = fs.readFileSync(path.join(workingDir, '.credentials.json'));
       const storeTok = fs.readFileSync(path.join(account.dir, '.credentials.json'));
       if (sameCredential(dirTok, storeTok)) return false;
+      const relation = relateToStore(dirTok, storeTok, readGrantChain(account.dir));
+      if (
+        (relation === 'continuation' ||
+          relation === 'sign-in' ||
+          relation === 'legacy' ||
+          relation === 'behind') &&
+        tokenExpiry(dirTok) != null &&
+        foreignTokenConflict(account.dir, dirTok, account.email) == null &&
+        foreignAnchorConflict(account.dir, anchorOf(dirTok), account.email) == null
+      ) {
+        log(
+          relation === 'behind'
+            ? `workdir: ${workingDir}: store file of ${account.name} is behind its chain — left in place`
+            : `workdir: ${workingDir} holds a grant ${account.name}'s store has never held — left in place`
+        );
+        return false;
+      }
     } catch {
       return false; // can't compare — leave the dir as-is rather than risk churn
     }
@@ -193,23 +215,337 @@ export function tokenExpiry(buf: Buffer): number | null {
   }
 }
 
+/** How many grant hashes a store remembers; older ones fall off the front. */
+const GRANT_HISTORY_MAX = 4096;
+
+/** How many displaced family anchors a store remembers, one per sign-in it replaced. */
+const DISPLACED_MAX = 256;
+
 /**
- * True when `candidate` is a STRICTLY-OLDER, DIFFERENT grant than `reference` —
- * i.e. `reference` is the fresher of two grants for one account.
- *
- * Used by reconcile to refuse propagating a stale grant: when two windows run the
- * same account, each holds a copy of the store's grant; when either refreshes,
- * Anthropic rotates the refresh token, so the copies diverge into a newer grant
- * (the one that refreshed) and one or more older, now-dead ones. "Same account,
- * different refresh token, older expiry" is exactly that stale copy — and never a
- * legitimate state to mirror into ~/.claude. The same-lineage case (`sameCredential`,
- * e.g. an access-token refresh in place) is NOT stale; nor is an equal/newer expiry.
+ * Two anchors this close belong to one token family. A refresh keeps the anchor
+ * within about a second; two sign-ins have landed hours apart on every probe, so
+ * ten minutes absorbs a clock step without merging two sign-ins.
  */
-export function isStaleAgainstStore(candidate: Buffer, reference: Buffer): boolean {
-  if (sameCredential(candidate, reference)) return false;
-  const c = tokenExpiry(candidate);
-  const r = tokenExpiry(reference);
-  return c != null && r != null && r > c;
+export const ANCHOR_WINDOW_MS = 10 * 60_000;
+
+/** A credential file written this recently may be a sign-in still in progress. */
+export const LOGIN_BURST_MS = 10_000;
+
+/** The r1 hash list. Read for its hashes; only windows on an older version write it. */
+export function grantHistoryPath(storeDir: string): string {
+  return path.join(storeDir, '.grant-history.json');
+}
+
+/**
+ * The store's chain: the anchor of the family it currently holds, the anchors
+ * of families it moved past, and the hashes of every grant it has held. Its own
+ * file, so an older window rewriting the r1 list as an array cannot erase it.
+ */
+export function grantChainPath(storeDir: string): string {
+  return path.join(storeDir, '.grant-chain.json');
+}
+
+export interface GrantChain {
+  current: number | null;
+  displaced: number[];
+  hashes: string[];
+}
+
+/** sha256 of a grant's fingerprint — what the history stores, never the secret. */
+export function grantHash(buf: Buffer): string {
+  return crypto.createHash('sha256').update(credentialFingerprint(buf)).digest('hex');
+}
+
+/**
+ * The grant's family anchor: `refreshTokenExpiresAt`, which every refresh of one
+ * sign-in carries unchanged and each new sign-in sets later. Null when absent.
+ */
+export function anchorOf(buf: Buffer): number | null {
+  try {
+    const d = JSON.parse(buf.toString('utf-8')) as {
+      claudeAiOauth?: { refreshTokenExpiresAt?: unknown };
+    };
+    const a = d.claudeAiOauth?.refreshTokenExpiresAt;
+    return typeof a === 'number' && Number.isFinite(a) ? a : null;
+  } catch {
+    return null;
+  }
+}
+
+/** True when two anchors name one family; a missing anchor matches nothing. */
+export function sameAnchor(a: number | null, b: number | null): boolean {
+  if (a == null || b == null) return false;
+  return Math.abs(a - b) <= ANCHOR_WINDOW_MS;
+}
+
+const isFiniteNumber = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x);
+
+/** The store's chain, with any r1 hash list merged in; empty when neither exists. */
+export function readGrantChain(storeDir: string): GrantChain {
+  let current: number | null = null;
+  let displaced: number[] = [];
+  let hashes: string[] = [];
+  try {
+    const d = JSON.parse(fs.readFileSync(grantChainPath(storeDir), 'utf-8')) as {
+      current?: unknown;
+      displaced?: unknown;
+      hashes?: unknown;
+    };
+    if (d && typeof d === 'object') {
+      if (isFiniteNumber(d.current)) current = d.current;
+      if (Array.isArray(d.displaced)) displaced = d.displaced.filter(isFiniteNumber);
+      if (Array.isArray(d.hashes)) {
+        hashes = d.hashes.filter((h): h is string => typeof h === 'string');
+      }
+    }
+  } catch {
+    /* no chain yet */
+  }
+  try {
+    const legacy = JSON.parse(fs.readFileSync(grantHistoryPath(storeDir), 'utf-8')) as unknown;
+    if (Array.isArray(legacy)) {
+      const seen = new Set(hashes);
+      for (const h of legacy) {
+        if (typeof h === 'string' && !seen.has(h)) {
+          seen.add(h);
+          hashes.push(h);
+        }
+      }
+    }
+  } catch {
+    /* no r1 list */
+  }
+  return { current, displaced, hashes };
+}
+
+/** The hashes of every grant this store has held (newest last); [] when unknown. */
+export function readGrantHistory(storeDir: string): string[] {
+  return readGrantChain(storeDir).hashes;
+}
+
+/**
+ * True when `set` already holds this store with an anchor of the same family;
+ * otherwise records the store and anchor and returns false. A refresh moves the
+ * anchor by about a second, so keying on the exact anchor would log again for
+ * every refresh of one family.
+ */
+function loggedForFamily(set: Set<string>, storeDir: string, anchor: number | null): boolean {
+  const store = path.normalize(storeDir);
+  for (const key of set) {
+    const sep = key.lastIndexOf('\0');
+    if (key.slice(0, sep) !== store) continue;
+    const prev = key.slice(sep + 1);
+    if (anchor == null ? prev === 'null' : sameAnchor(Number(prev), anchor)) return true;
+  }
+  set.add(`${store}\0${anchor}`);
+  return false;
+}
+
+/** Stores whose regression has been logged, keyed with the anchor they moved back to. */
+const regressionLogged = new Set<string>();
+
+/**
+ * Notes the grant the store holds. Its hash joins the list; its family becomes
+ * current when it is later than the current one, which moves to the displaced
+ * list. `current` never moves back: an earlier family in the store's file means
+ * a window on an older version wrote it, and the store is left behind its chain
+ * until a sign-in of a later family. Hashes and anchors only, and nothing is
+ * written when nothing changed.
+ */
+export function observeStoreGrant(storeDir: string, buf: Buffer): void {
+  try {
+    const chain = readGrantChain(storeDir);
+    let changed = false;
+    const hash = grantHash(buf);
+    if (!chain.hashes.includes(hash)) {
+      chain.hashes.push(hash);
+      changed = true;
+    }
+    const a = anchorOf(buf);
+    if (a != null) {
+      if (chain.current == null) {
+        chain.current = a;
+        changed = true;
+      } else if (a > chain.current + ANCHOR_WINDOW_MS) {
+        const prev = chain.current;
+        chain.displaced = chain.displaced.filter((d) => d !== prev);
+        chain.displaced.push(prev);
+        chain.current = a;
+        changed = true;
+      } else if (a < chain.current - ANCHOR_WINDOW_MS) {
+        if (!loggedForFamily(regressionLogged, storeDir, a)) {
+          log(
+            `workdir: store of ${path.basename(storeDir)} moved back to an earlier family — ` +
+              `not recorded as current`
+          );
+        }
+      }
+    }
+    if (!changed) return;
+    writeFileAtomic(
+      grantChainPath(storeDir),
+      JSON.stringify({
+        v: 2,
+        current: chain.current,
+        displaced: chain.displaced.slice(-DISPLACED_MAX),
+        hashes: chain.hashes.slice(-GRANT_HISTORY_MAX),
+      }),
+      { mode: 0o600 }
+    );
+  } catch (err) {
+    log(`workdir: could not record grant chain in ${storeDir}: ${(err as Error).message}`);
+  }
+}
+
+/** Stores whose file behind their chain has been logged, keyed with the file's anchor. */
+const behindLogged = new Set<string>();
+
+/** Stores whose foreign grant has been logged as kept out of their chain. */
+const foreignObservationLogged = new Set<string>();
+
+/**
+ * Logs, once per store, that its file holds another account's grant and so was
+ * not observed: recording that family would make the other account's own grants
+ * read as foreign here until it signs in again.
+ */
+export function noteForeignStoreGrant(storeDir: string): void {
+  const key = path.normalize(storeDir);
+  if (foreignObservationLogged.has(key)) return;
+  foreignObservationLogged.add(key);
+  log(
+    `workdir: store of ${path.basename(storeDir)} holds another account's grant — ` +
+      `not recorded in its chain`
+  );
+}
+
+export type StoreRelation =
+  'same' | 'known' | 'continuation' | 'fork' | 'sign-in' | 'behind' | 'legacy' | 'unrelated';
+
+/**
+ * How a window's grant relates to its store's, by family order.
+ *
+ * A refreshed dead lineage is file-identical to a sign-in except for its family
+ * anchor, which a refresh keeps and a sign-in sets later. So the window's anchor
+ * is compared with the store's reference family (the later of the chain's
+ * current family and the store file's): a later family is a sign-in, an earlier
+ * one a fork of a family the store moved past. Within the reference family, a
+ * hash the store has held or an older refresh is `known`, a later refresh a
+ * `continuation`. A store file that has fallen behind its chain (an older
+ * version wrote an earlier family back) is left for a sign-in: a grant of a
+ * later family than the chain is a sign-in, and a grant of any other family but
+ * the file's own is `behind`, since the file cannot tell a live grant of the
+ * current family from a consumed one. The file's own family is judged within
+ * itself: a hash the store has held or an older refresh is `known` (restocked
+ * from the file), a later refresh a `continuation` (carried into the file; the
+ * chain's current family stays where it is). A grant within the window of both
+ * the file's family and the chain's stays `behind`. A grant without an anchor is
+ * `legacy` and matches nothing; an unreadable store takes a grant that has an
+ * anchor and an expiry.
+ * Pure: no clock, no mtime. `unrelated` is only ever set by a caller whose
+ * tripwire refused the grant.
+ */
+export function relateToStore(dirTok: Buffer, storeTok: Buffer, chain: GrantChain): StoreRelation {
+  if (sameCredential(dirTok, storeTok)) return 'same';
+  const a = anchorOf(dirTok);
+  const dirExp = tokenExpiry(dirTok);
+  const storeExp = tokenExpiry(storeTok);
+  if (storeExp == null) return dirExp != null && a != null ? 'sign-in' : 'legacy';
+  const s = anchorOf(storeTok);
+  if (a == null || s == null) return 'legacy';
+  if (chain.current != null && s < chain.current - ANCHOR_WINDOW_MS) {
+    if (a > chain.current + ANCHOR_WINDOW_MS) return 'sign-in';
+    if (sameAnchor(a, s) && !sameAnchor(a, chain.current)) {
+      if (chain.hashes.includes(grantHash(dirTok)) || dirExp == null || dirExp <= storeExp) {
+        return 'known';
+      }
+      return 'continuation';
+    }
+    return 'behind';
+  }
+  const ref = chain.current != null ? Math.max(chain.current, s) : s;
+  if (a > ref + ANCHOR_WINDOW_MS) return 'sign-in';
+  if (a < ref - ANCHOR_WINDOW_MS) return 'fork';
+  if (chain.hashes.includes(grantHash(dirTok))) return 'known';
+  if (dirExp != null && dirExp > storeExp) return 'continuation';
+  return 'known';
+}
+
+export type HealVerdict = 'adopt' | 'restock' | 'keep';
+
+export interface HealDecision {
+  verdict: HealVerdict;
+  reason: string;
+}
+
+/**
+ * What reconcile does with a window grant once it is related to the store. A
+ * sign-in or a continuation is adopted; a known copy or a fork is restocked,
+ * whatever its expiry; anything else is kept, a grant of a store behind its
+ * chain included (that store is left for a sign-in). A file written in the last
+ * few seconds is left alone: a sign-in is a burst of writes, and judging its
+ * middle would undo it.
+ */
+export function healVerdict(
+  relation: StoreRelation | null,
+  selfHeal: boolean,
+  dirMtimeMs: number | null,
+  nowMs: number
+): HealDecision {
+  switch (relation) {
+    case 'same':
+    case 'legacy':
+    case 'unrelated':
+    case 'behind':
+      return { verdict: 'keep', reason: relation };
+    case 'continuation':
+    case 'sign-in':
+      return { verdict: 'adopt', reason: relation };
+    case 'known':
+    case 'fork':
+      if (!selfHeal) return { verdict: 'keep', reason: 'selfHeal-off' };
+      if (dirMtimeMs == null) return { verdict: 'keep', reason: 'unreadable-mtime' };
+      if (nowMs - dirMtimeMs < LOGIN_BURST_MS) return { verdict: 'keep', reason: 'burst' };
+      return { verdict: 'restock', reason: relation };
+    default:
+      return { verdict: 'keep', reason: 'unjudged' };
+  }
+}
+
+/**
+ * The activation step's half of the self-heal. It runs synchronously before
+ * Claude Code reads the env (see windowWorkingDir), so a copy the store has moved
+ * past is replaced before the process can refresh it into a fork. It reads the
+ * chain and never writes it: chain writes happen under the store lock only.
+ */
+export function healAtActivation(account: Account, dir: string, opts: { selfHeal: boolean }): void {
+  try {
+    const file = path.join(dir, '.credentials.json');
+    if (!fs.existsSync(file)) return;
+    if (!opts.selfHeal) return;
+    if (!hasCredentials(dir) || !emailsEqual(readIdentity(dir)?.email, account.email)) return;
+    const dirTok = fs.readFileSync(file);
+    const storeTok = fs.readFileSync(path.join(account.dir, '.credentials.json'));
+    const relation = relateToStore(dirTok, storeTok, readGrantChain(account.dir));
+    if (relation !== 'known' && relation !== 'fork') return;
+    const storeForeign = foreignTokenConflict(account.dir, storeTok, account.email);
+    if (storeForeign) {
+      log(`workdir: store grant of ${account.name} also lives in ${storeForeign} — not restocked`);
+      return;
+    }
+    const familyForeign = foreignAnchorConflict(account.dir, anchorOf(storeTok), account.email);
+    if (familyForeign) {
+      log(
+        `workdir: store grant of ${account.name} is of a family ${familyForeign} also holds — ` +
+          `not restocked`
+      );
+      return;
+    }
+    if (restockTokenOnly(storeTok, dir, dirTok)) {
+      log(`workdir: ${dir} restocked at activation (${relation})`);
+    }
+  } catch (err) {
+    log(`workdir: activation heal of ${dir} failed: ${(err as Error).message}`);
+  }
 }
 
 /**
@@ -322,25 +658,74 @@ export function foreignTokenConflict(
 }
 
 /**
+ * The family form of the tripwire: the path of another account store whose
+ * chain (current or displaced) or credential file carries a family within the
+ * anchor window of `anchor` under a different or unreadable identity, or null.
+ * A family belongs to one sign-in of one account, so finding it under another
+ * name is the contamination signature even when no grant matches byte-wise.
+ * Same-email stores never conflict; a missing anchor matches nothing.
+ */
+export function foreignAnchorConflict(
+  targetStoreDir: string,
+  anchor: number | null,
+  targetEmail?: string
+): string | null {
+  if (anchor == null) return null;
+  const home = os.homedir();
+  const wantEmail = (readIdentity(targetStoreDir)?.email ?? targetEmail)?.trim().toLowerCase();
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(home, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const e of entries) {
+    if (!e.isDirectory() || !/^\.claude[-_]/.test(e.name)) continue;
+    if (isReservedClaudeDirName(e.name)) continue;
+    const dir = path.join(home, e.name);
+    if (path.normalize(dir) === path.normalize(targetStoreDir)) continue;
+    const otherEmail = readIdentity(dir)?.email?.trim().toLowerCase();
+    if (wantEmail && otherEmail && wantEmail === otherEmail) continue;
+    const chain = readGrantChain(dir);
+    const anchors = [chain.current, ...chain.displaced];
+    try {
+      anchors.push(anchorOf(fs.readFileSync(path.join(dir, '.credentials.json'))));
+    } catch {
+      /* no token here */
+    }
+    if (anchors.some((x) => sameAnchor(x, anchor))) return dir;
+  }
+  return null;
+}
+
+/** What one refreshStore pass concluded; `deferred` when the store lock was busy. */
+export interface StoreRefresh {
+  relation: StoreRelation | null;
+  wrote: boolean;
+  deferred: boolean;
+}
+
+/**
  * Copies a working dir's (possibly refreshed) token back into the account's
  * store, so the store never falls far behind the credential actually in use.
  * Only the token: the store's config is the account's own and shouldn't be
  * churned by every window that runs it.
  *
  * Refuses when the incoming token already belongs to a DIFFERENT account (the
- * contamination tripwire): a working dir whose identity has drifted from its
- * token would otherwise write one account's credential into another's store.
+ * contamination tripwire), by grant or by family: a working dir whose identity
+ * has drifted from its token would otherwise write one account's credential
+ * into another's store.
  */
-export async function refreshStore(account: Account, workingDir: string): Promise<void> {
+export async function refreshStore(account: Account, workingDir: string): Promise<StoreRefresh> {
   const src = path.join(workingDir, '.credentials.json');
   const dst = path.join(account.dir, '.credentials.json');
+  const out: StoreRefresh = { relation: null, wrote: false, deferred: false };
   try {
-    if (!fs.existsSync(src)) return;
-    const incoming = fs.readFileSync(src);
+    if (!fs.existsSync(src)) return out;
     // Serialize the read-compare-write on the store's credentials — the SAME lock
-    // ensureFreshToken (usage.ts) takes when it rotates a store token — so newest-
-    // wins is a real compare-and-set, not a lock-free RMW that could publish an
-    // older grant over a concurrently-written newer one. Async lock: it awaits
+    // ensureFreshToken (usage.ts) takes when it rotates a store token — so the
+    // judgment is a real compare-and-set, not a lock-free RMW that could publish
+    // an older grant over a concurrently-written newer one. Async lock: it awaits
     // between attempts (never a synchronous Atomics.wait), so it can't freeze the
     // extension host even while ensureFreshToken holds this lock across a
     // multi-second OAuth refresh. skipIfUnacquired: never write unlocked on a stale
@@ -349,50 +734,95 @@ export async function refreshStore(account: Account, workingDir: string): Promis
     const { locked } = await withLockAsync(
       `${dst}.lock`,
       () => {
+        let incoming: Buffer;
+        try {
+          incoming = fs.readFileSync(src);
+        } catch {
+          return; // emptied since the check — a logout, nothing to carry
+        }
+        let cur = Buffer.alloc(0);
         if (fs.existsSync(dst)) {
-          const cur = fs.readFileSync(dst);
-          if (cur.equals(incoming)) return;
-          // Never regress the store — same lineage or not. A grant is adopted only
-          // when it is VALID (parseable expiry) AND either the store's current
-          // grant is unparseable or the incoming is strictly newer. A same-lineage
-          // in-place access refresh has a newer expiry, so it still writes through;
-          // an OLDER same-lineage copy (another window's lagging duplicate) is
-          // refused — with every window now watching the store (0.9.9), a
-          // write-through of older copies would let two idle windows re-trigger
-          // each other and flap the store indefinitely. Refusing keeps the store
-          // quiescent (a refused write changes nothing, so no watcher re-fires)
-          // while a valid grant can still repair an unparseable store.
-          const inExp = tokenExpiry(incoming);
-          const curExp = tokenExpiry(cur);
-          const adopt = inExp != null && (curExp == null || inExp > curExp);
-          if (!adopt) {
-            log(
-              `workdir: kept store of ${account.email ?? account.name} — incoming grant is not confirmably newer`
-            );
+          cur = fs.readFileSync(dst);
+          // The store's grant goes into its chain before anything replaces it, so
+          // a copy of it left in another dir is recognised later as one the store
+          // has moved past, and a family the store's file moved to becomes current.
+          if (
+            (foreignTokenConflict(account.dir, cur, account.email) ??
+              foreignAnchorConflict(account.dir, anchorOf(cur), account.email)) == null
+          ) {
+            observeStoreGrant(account.dir, cur);
+          } else {
+            noteForeignStoreGrant(account.dir);
+          }
+          if (cur.equals(incoming)) {
+            out.relation = 'same';
             return;
           }
         }
-        const conflict = foreignTokenConflict(account.dir, incoming, account.email);
+        const conflict =
+          foreignTokenConflict(account.dir, incoming, account.email) ??
+          foreignAnchorConflict(account.dir, anchorOf(incoming), account.email);
         if (conflict) {
+          out.relation = 'unrelated';
           log(
             `workdir: REFUSED store refresh of ${account.name} — that token already belongs to ` +
               `${conflict} (cross-account contamination guard)`
           );
           return;
         }
+        // Never regress the store, and never take in a grant only because it looks
+        // newer: a refreshed dead lineage looks exactly like a sign-in except for
+        // its family. A later family is a sign-in and is taken in; an earlier one,
+        // or a copy of the current one the store has held or moved past, stays out
+        // (with every window watching the store, write-through of older copies
+        // would flap it). The store's own grant refreshed in place is written
+        // through when its expiry is later.
+        const chain = readGrantChain(account.dir);
+        const relation = relateToStore(incoming, cur, chain);
+        out.relation = relation;
+        const inExp = tokenExpiry(incoming);
+        const curExp = tokenExpiry(cur);
+        const write =
+          relation === 'continuation' ||
+          relation === 'sign-in' ||
+          (relation === 'same' && inExp != null && (curExp == null || inExp > curExp));
+        const who = account.email ?? account.name;
+        if (!write) {
+          if (relation === 'behind' && loggedForFamily(behindLogged, account.dir, anchorOf(cur))) {
+            return;
+          }
+          log(
+            relation === 'known'
+              ? `workdir: ${who}: incoming grant is a known older copy — kept store`
+              : relation === 'same'
+                ? `workdir: ${who}: incoming grant is not newer than the store's — kept store`
+                : relation === 'fork'
+                  ? `workdir: ${who}: incoming grant is a refresh of a family a later sign-in ` +
+                    `replaced — kept store`
+                  : relation === 'behind'
+                    ? `workdir: ${who}: store file is behind its chain — kept both; ` +
+                      `a sign-in restores it`
+                    : `workdir: ${who}: incoming grant has no family anchor — kept both`
+          );
+          return;
+        }
         fs.mkdirSync(account.dir, { recursive: true, mode: 0o700 });
         // Unique-temp atomic write: a half-written store is worse than a stale one.
         writeFileAtomic(dst, incoming, { mode: 0o600 });
-        log(`workdir: refreshed store of ${account.email ?? account.name}`);
+        observeStoreGrant(account.dir, incoming);
+        out.wrote = true;
+        log(`workdir: refreshed store of ${who} (${relation})`);
       },
       { capMs: 3_000, skipIfUnacquired: true }
     );
     if (!locked) {
+      out.deferred = true;
       log(`workdir: store of ${account.email ?? account.name} is busy — deferred refresh`);
     }
   } catch (err) {
     log(`workdir: could not refresh store of ${account.name}: ${(err as Error).message}`);
   }
+  return out;
 }
 
 /** Every working dir on disk — used to sign an account out of all of them. */

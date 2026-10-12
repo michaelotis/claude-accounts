@@ -25,8 +25,15 @@ import {
   linkUserSettings,
   linkUserAssets,
   foreignTokenConflict,
+  foreignAnchorConflict,
   sameCredential,
-  isStaleAgainstStore,
+  healVerdict,
+  anchorOf,
+  sameAnchor,
+  readGrantChain,
+  grantHash,
+  LOGIN_BURST_MS,
+  type HealDecision,
 } from './workdir';
 import { log } from './log';
 import { probeTurnForWindow, type TurnProbe } from './turnWatcher';
@@ -112,6 +119,15 @@ export class SetupWizard {
    * grant in memory until its next restart, and we never reload for it.
    */
   onStaleRestock?: (email?: string) => void;
+
+  /**
+   * The `claudeAccounts.selfHeal` setting. Off stops reconcile from restocking
+   * a window's credential file from its store, whether the file holds an older
+   * refresh of the store's family or a refresh of a family a later sign-in
+   * replaced; what reaches the store is decided by refreshStore either way.
+   * Injected by the extension so the wizard needs no vscode config to test.
+   */
+  selfHealEnabled: () => boolean = () => true;
 
   /**
    * Is a turn running in this window? One look at this window's own transcripts,
@@ -281,7 +297,7 @@ export class SetupWizard {
       // holding different ones would take turns rewriting the shared file.
       ensureIdentity(known.dir, observed);
       await this.binding.bind(known);
-      await mirrorToDefault(sourceDir, { takeover: true });
+      await mirrorToDefault(sourceDir, { takeover: true, storeDir: known.dir });
       if (!opts.quiet) {
         vscode.window.showInformationMessage(`${status.email} — this window is bound to it.`);
       }
@@ -311,7 +327,7 @@ export class SetupWizard {
     target.email = status.email;
     await this.registry.add(target);
     await this.binding.bind(target);
-    await mirrorToDefault(sourceDir, { takeover: true });
+    await mirrorToDefault(sourceDir, { takeover: true, storeDir: target.dir });
     if (!opts.quiet) {
       vscode.window.showInformationMessage(`Saved ${status.email} — this window is bound to it.`);
     }
@@ -326,6 +342,31 @@ export class SetupWizard {
    * so two runs in flight would save the same account twice.
    */
   private reconciling?: Promise<void>;
+
+  /**
+   * One pending re-run after a heal judgment that could not conclude: a file
+   * still inside its write burst, or a store lock held by another writer. The
+   * watcher fires only on a fingerprint change, so nothing else would look again.
+   * Bounded: a file rewritten on every pass, or a lock that is never free, stops
+   * re-arming after HEAL_RETRY_MAX tries and waits for the watcher or a focus.
+   */
+  private healRetry?: NodeJS.Timeout;
+  private healRetries = 0;
+  private static readonly HEAL_RETRY_MAX = 6;
+
+  private armHealRetry(): void {
+    if (this.healRetries >= SetupWizard.HEAL_RETRY_MAX) {
+      log(`reconcile: heal re-run limit reached — waiting for the watcher or the next focus`);
+      return;
+    }
+    this.healRetries++;
+    if (this.healRetry) clearTimeout(this.healRetry);
+    this.healRetry = setTimeout(() => {
+      this.healRetry = undefined;
+      return this.reconcile();
+    }, LOGIN_BURST_MS + 500);
+    this.healRetry.unref?.();
+  }
 
   async reconcile(opts: { atActivation?: boolean } = {}): Promise<void> {
     if (this.reconciling) return this.reconciling;
@@ -420,9 +461,42 @@ export class SetupWizard {
       //     This is how a user RECOVERS a contaminated account, so it must run before
       //     the contaminated-store prompt (0): otherwise a real /login is short-
       //     circuited by the prompt and never lands (the exact way recovery got stuck).
-      //     A fresh grant cannot be another account's, so capturing it is safe;
-      //     captureCurrentAccount reuses/restores by email, heals the store, and binds.
+      //     No store holds it byte-wise, but the bound account's chain may still
+      //     know it: a copy the bound store held earlier is the bound account's
+      //     grant under a bled identity, and a grant of one of its families is a
+      //     refresh of the bound account's sign-in, never a login as another. The
+      //     first is restamped; the second is left as it is, since restamping on
+      //     family alone could hide a real login that collided inside the window.
+      //     Anything else is captured; captureCurrentAccount reuses/restores by
+      //     email, runs both tripwires and the family order on the store, and binds.
       if (dirTok && !owner) {
+        if (bound) {
+          const boundChain = readGrantChain(bound.dir);
+          if (boundChain.hashes.includes(grantHash(dirTok))) {
+            this.restampToBound(
+              dir,
+              bound,
+              boundEmail,
+              email,
+              `reconcile: identity drift ${boundEmail} → ${email} over a grant ${boundEmail}'s ` +
+                `store has held — restamped in place, no capture`
+            );
+            return;
+          }
+          const a = anchorOf(dirTok);
+          const families = [
+            boundChain.current,
+            ...boundChain.displaced,
+            boundTok ? anchorOf(boundTok) : null,
+          ];
+          if (a != null && families.some((f) => sameAnchor(a, f))) {
+            log(
+              `reconcile: identity drift ${boundEmail} → ${email} over a grant of ${boundEmail}'s ` +
+                `own family — kept both, not captured`
+            );
+            return;
+          }
+        }
         log(`reconcile: in-window sign-in as ${email} (fresh grant) — capturing`);
         const captured = await this.captureCurrentAccount({
           quiet: true,
@@ -458,23 +532,14 @@ export class SetupWizard {
       //     This is what stops a bleed from flickering the account or looping a
       //     reload, even if Claude Code keeps re-stamping from the shared home file.
       if (bound && dirTok && boundTok && sameCredential(dirTok, boundTok)) {
-        const id =
-          readIdentity(bound.dir) ??
-          (boundEmail ? { email: boundEmail, displayName: boundEmail } : undefined);
-        if (id) {
-          if (stampIdentity(dir, id)) {
-            log(
-              `reconcile: identity-only drift ${boundEmail} → ${email} (token unchanged) — ` +
-                `restamped in place, no reload`
-            );
-          } else {
-            log(
-              `reconcile: identity-only drift ${boundEmail} → ${email} but ${dir}/.claude.json is unreadable — drift NOT repaired`
-            );
-          }
-        } else {
-          log(`reconcile: identity-only drift but bound identity unreadable — left dir as-is`);
-        }
+        this.restampToBound(
+          dir,
+          bound,
+          boundEmail,
+          email,
+          `reconcile: identity-only drift ${boundEmail} → ${email} (token unchanged) — ` +
+            `restamped in place, no reload`
+        );
         return;
       }
 
@@ -511,7 +576,7 @@ export class SetupWizard {
         );
         materialize(bound, dir, true);
         if (emailsEqual(readIdentity(dir)?.email, boundEmail)) {
-          await mirrorToDefault(dir);
+          await mirrorToDefault(dir, { storeDir: bound.dir });
           if (!this.recentlyReloaded()) {
             await this.requestWindowReload(
               `Restored ${boundEmail ?? bound.name} for this window.`,
@@ -570,16 +635,43 @@ export class SetupWizard {
       // this window could push a just-superseded grant over ~/.claude during a
       // concurrent rotation; the window that holds the live grant keeps ~/.claude
       // fresh, exactly as before 0.9.9.
-      await refreshStore(account, dir);
+      const refreshed = await refreshStore(account, dir);
       const storeTok = this.readToken(account.dir);
-      if (ndTok && storeTok && isStaleAgainstStore(ndTok, storeTok)) {
+      let decision: HealDecision | undefined;
+      if (ndTok && storeTok) {
+        let mtimeMs: number | null = null;
+        try {
+          mtimeMs = fs.statSync(path.join(dir, '.credentials.json')).mtimeMs;
+        } catch {
+          /* unreadable — neither old nor new, so never restocked */
+        }
+        // A deferred refresh judged nothing; re-judging here would act on a
+        // relation the store lock never saw.
+        decision = refreshed.deferred
+          ? { verdict: 'keep', reason: 'deferred' }
+          : healVerdict(refreshed.relation, this.selfHealEnabled(), mtimeMs, Date.now());
+        log(`reconcile: heal verdict=${decision.verdict} reason=${decision.reason} for ${email}`);
+        if (decision.reason === 'burst' || decision.reason === 'deferred') this.armHealRetry();
+        else this.healRetries = 0;
+      }
+      const verdict = decision?.verdict;
+      if (ndTok && storeTok && verdict === 'restock') {
         // Defence in depth against the dual-home blind spot: never pull a store
         // grant that also lives in ANOTHER account's store (a contaminated store
-        // must not spread through the heal path).
+        // must not spread through the heal path), nor one of a family another
+        // account's store knows.
         const storeForeign = foreignTokenConflict(account.dir, storeTok, email);
+        const familyForeign = storeForeign
+          ? null
+          : foreignAnchorConflict(account.dir, anchorOf(storeTok), email);
         if (storeForeign) {
           log(
             `reconcile: store grant for ${email} also lives in ${storeForeign} — refusing to restock`
+          );
+        } else if (familyForeign) {
+          log(
+            `reconcile: store grant for ${email} belongs to a family ${familyForeign} also holds — ` +
+              `refusing to restock`
           );
         } else if (restockTokenOnly(storeTok, dir, ndTok)) {
           // A running Claude Code may hold the dead grant in memory until its next
@@ -590,8 +682,15 @@ export class SetupWizard {
         } else {
           log(`reconcile: dir grant is stale vs store and restock was not applied`);
         }
-      } else {
-        await mirrorToDefault(dir);
+      } else if (
+        verdict === undefined ||
+        verdict === 'adopt' ||
+        (ndTok && storeTok && sameCredential(ndTok, storeTok))
+      ) {
+        // A kept grant that differs from the store is a known older copy (or a
+        // sign-in still being written): mirroring it could push a superseded
+        // grant over ~/.claude.
+        await mirrorToDefault(dir, { storeDir: account.dir });
       }
     }
     // Propagate newly-added home MCP servers into already-stocked windows.
@@ -632,6 +731,33 @@ export class SetupWizard {
         `Signed in as ${email} — reloading so Claude Code fully switches to it.`,
         { reason: `account changed to ${email} outside Switch Account` }
       );
+    }
+  }
+
+  /**
+   * Puts the bound account's identity back on a dir that still runs it, logging
+   * `restamped` when the stamp lands. No follow, no store write, no reload.
+   */
+  private restampToBound(
+    dir: string,
+    bound: Account,
+    boundEmail: string | undefined,
+    email: string,
+    restamped: string
+  ): void {
+    const id =
+      readIdentity(bound.dir) ??
+      (boundEmail ? { email: boundEmail, displayName: boundEmail } : undefined);
+    if (id) {
+      if (stampIdentity(dir, id)) {
+        log(restamped);
+      } else {
+        log(
+          `reconcile: identity-only drift ${boundEmail} → ${email} but ${dir}/.claude.json is unreadable — drift NOT repaired`
+        );
+      }
+    } else {
+      log(`reconcile: identity-only drift but bound identity unreadable — left dir as-is`);
     }
   }
 
@@ -867,14 +993,14 @@ export class SetupWizard {
             half = `identity is ${identityDesc}`;
           }
           log(`switch: ${email} did not stock ${wd} (${half}) — default dir left as is`);
-        } else if (!(await mirrorToDefault(wd, { takeover: true }))) {
+        } else if (!(await mirrorToDefault(wd, { takeover: true, storeDir: account.dir }))) {
           log(`switch: default dir did not follow ${email} (see mirror lines above)`);
         }
       }
     } else {
       // Workspace-route correction is automatic — stay passive so it cannot
       // flip ~/.claude to the pin without an explicit user choice.
-      await mirrorToDefault(wd);
+      await mirrorToDefault(wd, { storeDir: account.dir });
     }
     await this.requestWindowReload(opts.notice, {
       userInitiated: opts.userInitiated !== false,

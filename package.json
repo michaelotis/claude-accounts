@@ -2,7 +2,7 @@
   "name": "claude-accounts",
   "displayName": "Claude Accounts + Usage",
   "description": "Multi-account Claude Code for WSL/Linux (per-window isolation + shared history) with live usage: 5h, 7d, Fable/Opus/Sonnet — workspace extension, never binds to a Windows Claude binary.",
-  "version": "0.9.22",
+  "version": "0.9.23",
   "publisher": "michaelotis",
   "icon": "images/icon.png",
   "repository": {
@@ -186,6 +186,11 @@
               }
             }
           }
+        },
+        "claudeAccounts.selfHeal": {
+          "type": "boolean",
+          "default": true,
+          "description": "Restock a window whose credential file holds a copy its account store has moved past: an older refresh of the account's current sign-in, or any refresh of a sign-in a later one replaced (file only, no reload). Off: reconcile leaves the window's file alone. Not gated by this setting: the copy made when a folder route or a manual save binds the window, which also replaces such a copy. A sign-in made in the window reaches the store when it is later than the store's current one."
         }
       }
     }
